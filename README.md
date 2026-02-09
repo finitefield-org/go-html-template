@@ -70,5 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Status
 
-Go `html/template` の全機能（文脈依存エスケープ、メソッド解決、組み込み関数の完全互換など）を完全再現したものではなく、
-「同等の使い方」で実用しやすい主要機能を Rust で提供する実装です。
+主要な `html/template` ワークフロー（テンプレート構文、関数パイプライン、文脈依存エスケープ、parse時コンテキスト解析、危険URL遮断、safe型、主要ヘルパー関数）は実装済みです。
+
+一方で、Go `html/template` との完全な1:1互換はまだ目標外です。特に以下は未完全です。
+
+- Go の `Error` / `ErrorCode` 体系の完全互換（現状は Rust 向け `TemplateError`）
+- `parse.Tree` / `AddParseTree` など、Go 固有 API の完全再現
+- 仕様の細部（全エッジケースのエラーメッセージや挙動）の完全一致
