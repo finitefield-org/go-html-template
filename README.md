@@ -5,17 +5,30 @@ Go の `html/template` に近い使い方を Rust で提供するクレートで
 ## Features
 
 - `Template::new(...).parse(...).execute(...)` の API
+- `delims` / `clone_template` / `option(missingkey=...)`
 - `{{.}}`, `{{.Field}}`, `{{$}}`, `{{$.Field}}`
 - `{{$x := ...}}`, `{{$x = ...}}`, `{{$x}}`, `{{$x.Field}}`
 - `{{if}}`, `{{else}}`, `{{else if}}`, `{{end}}`
-- `{{range}} ... {{else}} ... {{end}}` / `{{range $i, $v := ...}}`
-- `{{with}} ... {{else}} ... {{end}}`
+- `{{range}} ... {{else}} ... {{end}}` / `{{range $i, $v := ...}}` / `{{range $i, $v = ...}}`
+- `{{with}} ... {{else}} ... {{end}}` / `{{else with ...}}`
 - `{{define "name"}} ... {{end}}` と `{{template "name" .}}`
 - `{{block "name" .}} default {{end}}`
+- `{{break}}` / `{{continue}}`（`range` 内）
 - パイプライン (`{{.Name | upper}}`)
-- 文脈依存エスケープ（HTML本文 / 属性値 / URL属性 / `<script>`）
-- `safe_html` / `html` / `urlquery` / `len` / `index` / `not` / `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `and` / `or` / `print`
-- `parse_files` / `parse_glob`
+- メソッド解決（`Template::add_method` / `{{.Obj.Method}}` / `{{.Obj.Method "arg"}}`）
+- 文脈依存エスケープ（HTML本文 / 属性値 / URL属性 / `<script>` / `<style>`）
+- parse時コンテキスト解析（分岐文脈整合、テンプレート呼び出し文脈、終端文脈の静的検証）
+- URL属性の危険スキーム（`javascript:` など）を遮断
+- namespaced / `data-` / `xmlns:*` 属性の Go 互換寄り文脈判定
+- HTML コメント（`<!-- ... -->`）のテンプレートソース除去
+- `safe_html` / `html` / `js` / `urlquery` / `len` / `index` / `slice` / `not` / `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `and` / `or` / `print` / `printf` / `println` / `call`
+- safe 型: `safe_html` / `safe_html_attr` / `safe_js` / `safe_css` / `safe_url` / `safe_srcset`
+- Go 互換型: `HTML` / `HTMLAttr` / `JS` / `JSStr` / `CSS` / `URL` / `Srcset`（`Value` へ変換可）
+- `Option` 相当: `missingkey=default|invalid|zero|error`
+- `parse_files` / `parse_glob` / `parse_fs`（method + top-level helper）
+- 実行後の `parse*` / `clone_template` を禁止（Go 互換寄り制約）
+- top-level helper: `must`, `parse_files`, `parse_glob`, `parse_fs`
+- escape helper: `HTMLEscape*`, `JSEscape*`, `URLQueryEscaper`, `IsTrue`
 
 ## Usage
 

@@ -1,9 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -31,11 +33,59 @@ pub enum TemplateError {
 pub enum Value {
     Json(JsonValue),
     SafeHtml(String),
+    SafeHtmlAttr(String),
+    SafeJs(String),
+    SafeCss(String),
+    SafeUrl(String),
+    SafeSrcset(String),
+    FunctionRef(String),
+    Missing,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HTML(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HTMLAttr(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JS(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JSStr(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CSS(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct URL(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Srcset(pub String);
 
 impl Value {
     pub fn safe_html<S: Into<String>>(value: S) -> Self {
         Self::SafeHtml(value.into())
+    }
+
+    pub fn safe_html_attr<S: Into<String>>(value: S) -> Self {
+        Self::SafeHtmlAttr(value.into())
+    }
+
+    pub fn safe_js<S: Into<String>>(value: S) -> Self {
+        Self::SafeJs(value.into())
+    }
+
+    pub fn safe_css<S: Into<String>>(value: S) -> Self {
+        Self::SafeCss(value.into())
+    }
+
+    pub fn safe_url<S: Into<String>>(value: S) -> Self {
+        Self::SafeUrl(value.into())
+    }
+
+    pub fn safe_srcset<S: Into<String>>(value: S) -> Self {
+        Self::SafeSrcset(value.into())
     }
 
     fn from_serializable<T: Serialize>(data: &T) -> Result<Self> {
@@ -45,6 +95,13 @@ impl Value {
     fn truthy(&self) -> bool {
         match self {
             Value::SafeHtml(value) => !value.is_empty(),
+            Value::SafeHtmlAttr(value) => !value.is_empty(),
+            Value::SafeJs(value) => !value.is_empty(),
+            Value::SafeCss(value) => !value.is_empty(),
+            Value::SafeUrl(value) => !value.is_empty(),
+            Value::SafeSrcset(value) => !value.is_empty(),
+            Value::FunctionRef(_) => true,
+            Value::Missing => false,
             Value::Json(value) => match value {
                 JsonValue::Null => false,
                 JsonValue::Bool(v) => *v,
@@ -69,6 +126,13 @@ impl Value {
     pub fn to_plain_string(&self) -> String {
         match self {
             Value::SafeHtml(value) => value.clone(),
+            Value::SafeHtmlAttr(value) => value.clone(),
+            Value::SafeJs(value) => value.clone(),
+            Value::SafeCss(value) => value.clone(),
+            Value::SafeUrl(value) => value.clone(),
+            Value::SafeSrcset(value) => value.clone(),
+            Value::FunctionRef(name) => format!("<function:{name}>"),
+            Value::Missing => "<no value>".to_string(),
             Value::Json(value) => match value {
                 JsonValue::Null => String::new(),
                 JsonValue::Bool(v) => v.to_string(),
@@ -86,10 +150,16 @@ impl Value {
                 .enumerate()
                 .map(|(index, value)| (Value::from(index as u64), Value::Json(value.clone())))
                 .collect::<Vec<_>>(),
-            Value::Json(JsonValue::Object(items)) => items
-                .iter()
-                .map(|(key, value)| (Value::from(key.as_str()), Value::Json(value.clone())))
-                .collect::<Vec<_>>(),
+            Value::Json(JsonValue::Object(items)) => {
+                let mut keys = items.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys.into_iter()
+                    .map(|key| {
+                        let value = items.get(&key).cloned().unwrap_or(JsonValue::Null);
+                        (Value::from(key.as_str()), Value::Json(value))
+                    })
+                    .collect::<Vec<_>>()
+            }
             Value::Json(JsonValue::String(value)) => value
                 .chars()
                 .enumerate()
@@ -100,8 +170,58 @@ impl Value {
                     )
                 })
                 .collect::<Vec<_>>(),
-            _ => Vec::new(),
+            Value::FunctionRef(_)
+            | Value::Missing
+            | Value::SafeHtml(_)
+            | Value::SafeHtmlAttr(_)
+            | Value::SafeJs(_)
+            | Value::SafeCss(_)
+            | Value::SafeUrl(_)
+            | Value::SafeSrcset(_)
+            | Value::Json(_) => Vec::new(),
         }
+    }
+}
+
+impl From<HTML> for Value {
+    fn from(value: HTML) -> Self {
+        Value::SafeHtml(value.0)
+    }
+}
+
+impl From<HTMLAttr> for Value {
+    fn from(value: HTMLAttr) -> Self {
+        Value::SafeHtmlAttr(value.0)
+    }
+}
+
+impl From<JS> for Value {
+    fn from(value: JS) -> Self {
+        Value::SafeJs(value.0)
+    }
+}
+
+impl From<JSStr> for Value {
+    fn from(value: JSStr) -> Self {
+        Value::SafeJs(value.0)
+    }
+}
+
+impl From<CSS> for Value {
+    fn from(value: CSS) -> Self {
+        Value::SafeCss(value.0)
+    }
+}
+
+impl From<URL> for Value {
+    fn from(value: URL) -> Self {
+        Value::SafeUrl(value.0)
+    }
+}
+
+impl From<Srcset> for Value {
+    fn from(value: Srcset) -> Self {
+        Value::SafeSrcset(value.0)
     }
 }
 
@@ -152,13 +272,34 @@ impl From<f64> for Value {
 
 pub type Function = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync + 'static>;
 pub type FuncMap = HashMap<String, Function>;
+pub type Method = Arc<dyn Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static>;
+pub type MethodMap = HashMap<String, Method>;
 type ScopeStack = Vec<HashMap<String, Value>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderFlow {
+    Normal,
+    Break,
+    Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingKeyMode {
+    Default,
+    Zero,
+    Error,
+}
 
 #[derive(Clone)]
 pub struct Template {
     name: String,
     templates: HashMap<String, Vec<Node>>,
     funcs: FuncMap,
+    methods: MethodMap,
+    missing_key_mode: MissingKeyMode,
+    left_delim: String,
+    right_delim: String,
+    executed: Arc<AtomicBool>,
 }
 
 impl Template {
@@ -167,6 +308,11 @@ impl Template {
             name: name.into(),
             templates: HashMap::new(),
             funcs: builtin_funcs(),
+            methods: HashMap::new(),
+            missing_key_mode: MissingKeyMode::Default,
+            left_delim: "{{".to_string(),
+            right_delim: "}}".to_string(),
+            executed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -187,9 +333,80 @@ impl Template {
         self
     }
 
+    pub fn methods(mut self, methods: MethodMap) -> Self {
+        self.methods.extend(methods);
+        self
+    }
+
+    pub fn add_method<F>(mut self, name: impl Into<String>, method: F) -> Self
+    where
+        F: Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        self.methods.insert(name.into(), Arc::new(method));
+        self
+    }
+
+    pub fn delims(mut self, left: impl Into<String>, right: impl Into<String>) -> Self {
+        self.left_delim = left.into();
+        self.right_delim = right.into();
+        self
+    }
+
+    pub fn clone_template(&self) -> Result<Self> {
+        if self.left_delim.is_empty() || self.right_delim.is_empty() {
+            return Err(TemplateError::Parse(
+                "template delimiters must not be empty".to_string(),
+            ));
+        }
+        self.ensure_not_executed()?;
+
+        let mut clone = self.clone();
+        clone.executed = Arc::new(AtomicBool::new(false));
+        Ok(clone)
+    }
+
+    pub fn option(mut self, option: &str) -> Result<Self> {
+        self.apply_option(option)?;
+        Ok(self)
+    }
+
+    pub fn options<I, S>(mut self, options: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for option in options {
+            self.apply_option(option.as_ref())?;
+        }
+        Ok(self)
+    }
+
+    fn apply_option(&mut self, option: &str) -> Result<()> {
+        let trimmed = option.trim();
+        let Some(value) = trimmed.strip_prefix("missingkey=") else {
+            return Err(TemplateError::Parse(format!(
+                "unsupported option `{trimmed}`"
+            )));
+        };
+
+        self.missing_key_mode = match value {
+            "default" | "invalid" => MissingKeyMode::Default,
+            "zero" => MissingKeyMode::Zero,
+            "error" => MissingKeyMode::Error,
+            _ => {
+                return Err(TemplateError::Parse(format!(
+                    "unsupported missingkey option `{value}`"
+                )));
+            }
+        };
+        Ok(())
+    }
+
     pub fn parse(mut self, text: &str) -> Result<Self> {
+        self.ensure_not_executed()?;
         let root = self.name.clone();
         self.parse_named(&root, text)?;
+        self.reanalyze_contexts()?;
         Ok(self)
     }
 
@@ -198,6 +415,7 @@ impl Template {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
+        self.ensure_not_executed()?;
         let mut parsed_any = false;
         for path in paths {
             let path = path.as_ref();
@@ -223,15 +441,27 @@ impl Template {
             ));
         }
 
+        self.reanalyze_contexts()?;
         Ok(self)
     }
 
     pub fn parse_glob(self, pattern: &str) -> Result<Self> {
+        self.ensure_not_executed()?;
         let mut paths = Vec::new();
         for entry in glob::glob(pattern)? {
             paths.push(entry?);
         }
         paths.sort();
+        self.parse_files(paths)
+    }
+
+    pub fn parse_fs<I, S>(self, patterns: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ensure_not_executed()?;
+        let paths = expand_glob_patterns(patterns)?;
         self.parse_files(paths)
     }
 
@@ -249,23 +479,45 @@ impl Template {
         name: &str,
         data: &T,
     ) -> Result<()> {
+        self.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut scopes = vec![HashMap::new()];
-        self.render_named(name, &root, &root, &mut scopes, &mut rendered)?;
+        let flow = self.render_named(name, &root, &root, &mut scopes, &mut rendered, false)?;
+        if !matches!(flow, RenderFlow::Normal) {
+            return Err(TemplateError::Render(
+                "break/continue action is not inside range".to_string(),
+            ));
+        }
         writer.write_all(rendered.as_bytes())?;
         Ok(())
     }
 
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
+        self.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut scopes = vec![HashMap::new()];
-        self.render_named(name, &root, &root, &mut scopes, &mut rendered)?;
+        let flow = self.render_named(name, &root, &root, &mut scopes, &mut rendered, false)?;
+        if !matches!(flow, RenderFlow::Normal) {
+            return Err(TemplateError::Render(
+                "break/continue action is not inside range".to_string(),
+            ));
+        }
         Ok(rendered)
     }
 
-    pub fn lookup(&self, name: &str) -> bool {
+    pub fn lookup(&self, name: &str) -> Option<Self> {
+        if self.templates.contains_key(name) {
+            let mut clone = self.clone();
+            clone.name = name.to_string();
+            Some(clone)
+        } else {
+            None
+        }
+    }
+
+    pub fn has_template(&self, name: &str) -> bool {
         self.templates.contains_key(name)
     }
 
@@ -275,8 +527,26 @@ impl Template {
         names
     }
 
+    pub fn defined_templates_string(&self) -> String {
+        let names = self.defined_templates();
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!("; defined templates are: {}", names.join(", "))
+        }
+    }
+
+    pub fn templates(&self) -> Vec<Self> {
+        let names = self.defined_templates();
+        names
+            .into_iter()
+            .filter_map(|name| self.lookup(&name))
+            .collect::<Vec<_>>()
+    }
+
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
-        let tokens = tokenize(text)?;
+        let preprocessed = strip_html_comments(text);
+        let tokens = tokenize(&preprocessed, &self.left_delim, &self.right_delim)?;
         let mut index = 0;
         let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
         if let Some(stop) = stop {
@@ -319,6 +589,47 @@ impl Template {
         Ok(())
     }
 
+    fn ensure_not_executed(&self) -> Result<()> {
+        if self.executed.load(AtomicOrdering::SeqCst) {
+            return Err(TemplateError::Parse(
+                "template cannot be parsed or cloned after execution".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reanalyze_contexts(&mut self) -> Result<()> {
+        if !self.templates.contains_key(&self.name) {
+            return Err(TemplateError::Parse(format!(
+                "template `{}` is not defined",
+                self.name
+            )));
+        }
+
+        let mut analyzer = ParseContextAnalyzer::new(self.templates.clone());
+        let root_start = ContextState::html_text();
+        let root_end = analyzer.analyze_template(&self.name, root_start)?;
+        if !root_end.is_text_context() {
+            return Err(TemplateError::Parse(format!(
+                "template `{}` ends in a non-text context",
+                self.name
+            )));
+        }
+
+        // Analyze unreferenced templates with HTML start context so
+        // execute_template(name, ...) has stable precomputed escaping.
+        let mut names = self.templates.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if !analyzer.has_analysis(&name) {
+                let _ = analyzer.analyze_template(&name, ContextState::html_text())?;
+            }
+        }
+
+        self.templates = analyzer.finish();
+        Ok(())
+    }
+
     fn render_named(
         &self,
         name: &str,
@@ -326,12 +637,13 @@ impl Template {
         dot: &Value,
         scopes: &mut ScopeStack,
         output: &mut String,
-    ) -> Result<()> {
+        in_range: bool,
+    ) -> Result<RenderFlow> {
         let nodes = self
             .templates
             .get(name)
             .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
-        self.render_nodes(nodes, root, dot, scopes, output)
+        self.render_nodes(nodes, root, dot, scopes, output, in_range)
     }
 
     fn render_nodes(
@@ -341,14 +653,14 @@ impl Template {
         dot: &Value,
         scopes: &mut ScopeStack,
         output: &mut String,
-    ) -> Result<()> {
+        in_range: bool,
+    ) -> Result<RenderFlow> {
         for node in nodes {
             match node {
                 Node::Text(text) => output.push_str(text),
-                Node::Expr(expr) => {
+                Node::Expr { expr, mode } => {
                     let value = self.eval_expr(expr, root, dot, scopes)?;
-                    let mode = infer_escape_mode(output);
-                    output.push_str(&escape_value_for_mode(&value, mode)?);
+                    output.push_str(&escape_value_for_mode(&value, *mode)?);
                 }
                 Node::SetVar {
                     name,
@@ -370,16 +682,25 @@ impl Template {
                     let condition_value = self.eval_expr(condition, root, dot, scopes)?;
                     if condition_value.truthy() {
                         push_scope(scopes);
-                        self.render_nodes(then_branch, root, dot, scopes, output)?;
+                        let flow =
+                            self.render_nodes(then_branch, root, dot, scopes, output, in_range)?;
                         pop_scope(scopes);
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     } else {
                         push_scope(scopes);
-                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        let flow =
+                            self.render_nodes(else_branch, root, dot, scopes, output, in_range)?;
                         pop_scope(scopes);
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     }
                 }
                 Node::Range {
                     vars,
+                    declare_vars,
                     iterable,
                     body,
                     else_branch,
@@ -388,19 +709,38 @@ impl Template {
                     let items = iterable_value.iter_pairs();
                     if items.is_empty() {
                         push_scope(scopes);
-                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        let flow =
+                            self.render_nodes(else_branch, root, dot, scopes, output, true)?;
                         pop_scope(scopes);
+                        match flow {
+                            RenderFlow::Normal | RenderFlow::Break | RenderFlow::Continue => {}
+                        }
                     } else {
                         for (key, item) in items {
                             push_scope(scopes);
                             if vars.len() == 1 {
-                                declare_variable(scopes, &vars[0], item.clone());
+                                if *declare_vars {
+                                    declare_variable(scopes, &vars[0], item.clone());
+                                } else {
+                                    assign_variable(scopes, &vars[0], item.clone())?;
+                                }
                             } else if vars.len() == 2 {
-                                declare_variable(scopes, &vars[0], key);
-                                declare_variable(scopes, &vars[1], item.clone());
+                                if *declare_vars {
+                                    declare_variable(scopes, &vars[0], key);
+                                    declare_variable(scopes, &vars[1], item.clone());
+                                } else {
+                                    assign_variable(scopes, &vars[0], key)?;
+                                    assign_variable(scopes, &vars[1], item.clone())?;
+                                }
                             }
-                            self.render_nodes(body, root, &item, scopes, output)?;
+                            let flow =
+                                self.render_nodes(body, root, &item, scopes, output, true)?;
                             pop_scope(scopes);
+                            match flow {
+                                RenderFlow::Normal => {}
+                                RenderFlow::Continue => continue,
+                                RenderFlow::Break => break,
+                            }
                         }
                     }
                 }
@@ -412,12 +752,20 @@ impl Template {
                     let value = self.eval_expr(value, root, dot, scopes)?;
                     if value.truthy() {
                         push_scope(scopes);
-                        self.render_nodes(body, root, &value, scopes, output)?;
+                        let flow =
+                            self.render_nodes(body, root, &value, scopes, output, in_range)?;
                         pop_scope(scopes);
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     } else {
                         push_scope(scopes);
-                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        let flow =
+                            self.render_nodes(else_branch, root, dot, scopes, output, in_range)?;
                         pop_scope(scopes);
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     }
                 }
                 Node::TemplateCall { name, data } => {
@@ -426,7 +774,17 @@ impl Template {
                         None => dot.clone(),
                     };
                     let mut template_scopes = vec![HashMap::new()];
-                    self.render_named(name, root, &next_dot, &mut template_scopes, output)?;
+                    let flow = self.render_named(
+                        name,
+                        root,
+                        &next_dot,
+                        &mut template_scopes,
+                        output,
+                        in_range,
+                    )?;
+                    if !matches!(flow, RenderFlow::Normal) {
+                        return Ok(flow);
+                    }
                 }
                 Node::Block { name, data, body } => {
                     let next_dot = match data {
@@ -436,18 +794,48 @@ impl Template {
 
                     if self.templates.contains_key(name) {
                         let mut template_scopes = vec![HashMap::new()];
-                        self.render_named(name, root, &next_dot, &mut template_scopes, output)?;
+                        let flow = self.render_named(
+                            name,
+                            root,
+                            &next_dot,
+                            &mut template_scopes,
+                            output,
+                            in_range,
+                        )?;
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     } else {
                         push_scope(scopes);
-                        self.render_nodes(body, root, &next_dot, scopes, output)?;
+                        let flow =
+                            self.render_nodes(body, root, &next_dot, scopes, output, in_range)?;
                         pop_scope(scopes);
+                        if !matches!(flow, RenderFlow::Normal) {
+                            return Ok(flow);
+                        }
                     }
                 }
                 Node::Define { .. } => {}
+                Node::Break => {
+                    if in_range {
+                        return Ok(RenderFlow::Break);
+                    }
+                    return Err(TemplateError::Render(
+                        "break action is not inside range".to_string(),
+                    ));
+                }
+                Node::Continue => {
+                    if in_range {
+                        return Ok(RenderFlow::Continue);
+                    }
+                    return Err(TemplateError::Render(
+                        "continue action is not inside range".to_string(),
+                    ));
+                }
             }
         }
 
-        Ok(())
+        Ok(RenderFlow::Normal)
     }
 
     fn eval_expr(
@@ -482,10 +870,29 @@ impl Template {
                         evaluated_args.push(value);
                     }
 
-                    let function = self.funcs.get(name).ok_or_else(|| {
-                        TemplateError::Render(format!("function `{name}` is not registered"))
-                    })?;
-                    piped = Some(function(&evaluated_args)?);
+                    if name == "call" {
+                        piped = Some(self.eval_call_function(&evaluated_args)?);
+                    } else {
+                        let function = self.funcs.get(name).ok_or_else(|| {
+                            TemplateError::Render(format!("function `{name}` is not registered"))
+                        })?;
+                        piped = Some(function(&evaluated_args)?);
+                    }
+                }
+                Command::Invoke { callee, args } => {
+                    let mut evaluated_args = args
+                        .iter()
+                        .map(|arg| self.eval_term(arg, root, dot, scopes))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    if index > 0 {
+                        let value = piped.take().ok_or_else(|| {
+                            TemplateError::Render("pipeline is missing input value".to_string())
+                        })?;
+                        evaluated_args.push(value);
+                    }
+                    piped =
+                        Some(self.eval_method_call(callee, &evaluated_args, root, dot, scopes)?);
                 }
             }
         }
@@ -501,26 +908,251 @@ impl Template {
         scopes: &ScopeStack,
     ) -> Result<Value> {
         match term {
-            Term::DotPath(path) => Ok(lookup_path(dot, path)),
-            Term::RootPath(path) => Ok(lookup_path(root, path)),
+            Term::DotPath(path) => {
+                lookup_path_with_methods(dot, path, &self.methods, self.missing_key_mode)
+            }
+            Term::RootPath(path) => {
+                lookup_path_with_methods(root, path, &self.methods, self.missing_key_mode)
+            }
             Term::Literal(value) => Ok(value.clone()),
             Term::Variable { name, path } => {
                 let variable = lookup_variable(scopes, name).ok_or_else(|| {
                     TemplateError::Render(format!("variable `${name}` could not be resolved"))
                 })?;
-                Ok(lookup_path(&variable, path))
+                lookup_path_with_methods(&variable, path, &self.methods, self.missing_key_mode)
             }
-            Term::Identifier(name) => lookup_identifier(dot, root, name).ok_or_else(|| {
-                TemplateError::Render(format!("identifier `{name}` could not be resolved"))
-            }),
+            Term::Identifier(name) => {
+                if let Some(value) =
+                    lookup_identifier(dot, root, name, &self.methods, self.missing_key_mode)?
+                {
+                    Ok(value)
+                } else if self.funcs.contains_key(name) {
+                    Ok(Value::FunctionRef(name.clone()))
+                } else {
+                    Err(TemplateError::Render(format!(
+                        "identifier `{name}` could not be resolved"
+                    )))
+                }
+            }
         }
     }
+
+    fn eval_method_call(
+        &self,
+        callee: &Term,
+        args: &[Value],
+        root: &Value,
+        dot: &Value,
+        scopes: &ScopeStack,
+    ) -> Result<Value> {
+        match callee {
+            Term::DotPath(path) => self.call_path_method(dot, path, args),
+            Term::RootPath(path) => self.call_path_method(root, path, args),
+            Term::Variable { name, path } => {
+                let variable = lookup_variable(scopes, name).ok_or_else(|| {
+                    TemplateError::Render(format!("variable `${name}` could not be resolved"))
+                })?;
+                self.call_path_method(&variable, path, args)
+            }
+            Term::Identifier(name) => {
+                if let Some(method) = self.methods.get(name) {
+                    return method(dot, args);
+                }
+                Err(TemplateError::Render(format!(
+                    "callee `{name}` is not a callable method"
+                )))
+            }
+            Term::Literal(_) => Err(TemplateError::Render(
+                "literal values are not callable".to_string(),
+            )),
+        }
+    }
+
+    fn call_path_method(&self, base: &Value, path: &[String], args: &[Value]) -> Result<Value> {
+        if path.is_empty() {
+            return Err(TemplateError::Render("path is not callable".to_string()));
+        }
+
+        let (method_name, receiver_path) = split_last_path(path);
+        let receiver =
+            lookup_path_with_methods(base, receiver_path, &self.methods, self.missing_key_mode)?;
+        let method = self.methods.get(method_name).ok_or_else(|| {
+            TemplateError::Render(format!("method `{method_name}` is not registered"))
+        })?;
+        method(&receiver, args)
+    }
+
+    fn eval_call_function(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(TemplateError::Render(
+                "call expects at least one argument".to_string(),
+            ));
+        }
+
+        let name = match &args[0] {
+            Value::FunctionRef(name) => name.clone(),
+            Value::Json(JsonValue::String(name)) => name.clone(),
+            other => {
+                return Err(TemplateError::Render(format!(
+                    "call expects function reference or function name, got `{}`",
+                    other.to_plain_string()
+                )));
+            }
+        };
+
+        let function = self
+            .funcs
+            .get(&name)
+            .ok_or_else(|| TemplateError::Render(format!("function `{name}` is not registered")))?;
+        function(&args[1..])
+    }
+}
+
+pub fn must(result: Result<Template>) -> Template {
+    match result {
+        Ok(template) => template,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+pub fn parse_files<I, P>(paths: I) -> Result<Template>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let paths = paths
+        .into_iter()
+        .map(|path| path.as_ref().to_path_buf())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(TemplateError::Parse(
+            "parse_files requires at least one path".to_string(),
+        ));
+    }
+
+    let name = template_name_from_path(&paths[0])?;
+    Template::new(name).parse_files(paths)
+}
+
+pub fn parse_glob(pattern: &str) -> Result<Template> {
+    let paths = expand_glob_patterns([pattern])?;
+    let name = template_name_from_path(&paths[0])?;
+    Template::new(name).parse_files(paths)
+}
+
+pub fn parse_fs<I, S>(patterns: I) -> Result<Template>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let paths = expand_glob_patterns(patterns)?;
+    let name = template_name_from_path(&paths[0])?;
+    Template::new(name).parse_files(paths)
+}
+
+fn template_name_from_path(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|part| part.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            TemplateError::Parse(format!("invalid template file name: {}", path.display()))
+        })
+}
+
+pub fn is_true(value: &Value) -> (bool, bool) {
+    if matches!(value, Value::Missing) {
+        return (false, false);
+    }
+    (value.truthy(), true)
+}
+
+pub fn html_escape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(escape_html(&String::from_utf8_lossy(bytes)).as_bytes())
+}
+
+pub fn html_escape_string(value: &str) -> String {
+    escape_html(value)
+}
+
+pub fn html_escaper(args: &[Value]) -> String {
+    let mut combined = String::new();
+    for arg in args {
+        combined.push_str(&arg.to_plain_string());
+    }
+    escape_html(&combined)
+}
+
+pub fn js_escape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    writer.write_all(js_escape_string(&String::from_utf8_lossy(bytes)).as_bytes())
+}
+
+pub fn js_escape_string(value: &str) -> String {
+    escape_js_string_fragment(value, '"')
+}
+
+pub fn js_escaper(args: &[Value]) -> String {
+    let mut combined = String::new();
+    for arg in args {
+        combined.push_str(&arg.to_plain_string());
+    }
+    js_escape_string(&combined)
+}
+
+pub fn url_query_escaper(args: &[Value]) -> String {
+    let mut combined = String::new();
+    for arg in args {
+        combined.push_str(&arg.to_plain_string());
+    }
+    percent_encode_url(&combined)
+}
+
+#[allow(non_snake_case)]
+pub fn HTMLEscape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    html_escape(writer, bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn HTMLEscapeString(value: &str) -> String {
+    html_escape_string(value)
+}
+
+#[allow(non_snake_case)]
+pub fn HTMLEscaper(args: &[Value]) -> String {
+    html_escaper(args)
+}
+
+#[allow(non_snake_case)]
+pub fn JSEscape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    js_escape(writer, bytes)
+}
+
+#[allow(non_snake_case)]
+pub fn JSEscapeString(value: &str) -> String {
+    js_escape_string(value)
+}
+
+#[allow(non_snake_case)]
+pub fn JSEscaper(args: &[Value]) -> String {
+    js_escaper(args)
+}
+
+#[allow(non_snake_case)]
+pub fn URLQueryEscaper(args: &[Value]) -> String {
+    url_query_escaper(args)
+}
+
+#[allow(non_snake_case)]
+pub fn IsTrue(value: &Value) -> (bool, bool) {
+    is_true(value)
 }
 
 #[derive(Clone, Debug)]
 enum Node {
     Text(String),
-    Expr(Expr),
+    Expr {
+        expr: Expr,
+        mode: EscapeMode,
+    },
     SetVar {
         name: String,
         value: Expr,
@@ -533,6 +1165,7 @@ enum Node {
     },
     Range {
         vars: Vec<String>,
+        declare_vars: bool,
         iterable: Expr,
         body: Vec<Node>,
         else_branch: Vec<Node>,
@@ -555,6 +1188,8 @@ enum Node {
         name: String,
         body: Vec<Node>,
     },
+    Break,
+    Continue,
 }
 
 #[derive(Clone, Debug)]
@@ -566,6 +1201,7 @@ struct Expr {
 enum Command {
     Value(Term),
     Call { name: String, args: Vec<Term> },
+    Invoke { callee: Term, args: Vec<Term> },
 }
 
 #[derive(Clone, Debug)]
@@ -587,6 +1223,467 @@ enum Token {
 struct StopAction {
     keyword: String,
     tail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ContextState {
+    mode: EscapeMode,
+    in_open_tag: bool,
+}
+
+impl ContextState {
+    fn html_text() -> Self {
+        Self {
+            mode: EscapeMode::Html,
+            in_open_tag: false,
+        }
+    }
+
+    fn from_rendered(rendered: &str) -> Self {
+        let mode = infer_escape_mode(rendered);
+        let in_open_tag = matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(rendered);
+        Self { mode, in_open_tag }
+    }
+
+    fn is_text_context(&self) -> bool {
+        matches!(self.mode, EscapeMode::Html) && !self.in_open_tag
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContextTracker {
+    rendered: String,
+}
+
+impl ContextTracker {
+    fn from_state(state: ContextState) -> Self {
+        Self {
+            rendered: seed_rendered_for_state(&state),
+        }
+    }
+
+    fn state(&self) -> ContextState {
+        ContextState::from_rendered(&self.rendered)
+    }
+
+    fn mode(&self) -> EscapeMode {
+        self.state().mode
+    }
+
+    fn append_text(&mut self, text: &str) {
+        self.rendered.push_str(text);
+        self.normalize();
+    }
+
+    fn append_expr_placeholder(&mut self, mode: EscapeMode) {
+        self.rendered.push_str(placeholder_for_mode(mode));
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        let state = self.state();
+        self.rendered = seed_rendered_for_state(&state);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum AnalysisFlowKind {
+    Normal,
+    Break,
+    Continue,
+}
+
+#[derive(Clone, Debug)]
+struct AnalysisFlow {
+    kind: AnalysisFlowKind,
+    tracker: ContextTracker,
+}
+
+impl AnalysisFlow {
+    fn normal(tracker: ContextTracker) -> Self {
+        Self {
+            kind: AnalysisFlowKind::Normal,
+            tracker,
+        }
+    }
+
+    fn with_kind(kind: AnalysisFlowKind, tracker: ContextTracker) -> Self {
+        Self { kind, tracker }
+    }
+}
+
+struct ParseContextAnalyzer {
+    raw_templates: HashMap<String, Vec<Node>>,
+    analyzed_templates: HashMap<String, Vec<Node>>,
+    start_states: HashMap<String, ContextState>,
+    end_states: HashMap<String, ContextState>,
+    in_progress: HashSet<String>,
+}
+
+impl ParseContextAnalyzer {
+    fn new(raw_templates: HashMap<String, Vec<Node>>) -> Self {
+        Self {
+            raw_templates,
+            analyzed_templates: HashMap::new(),
+            start_states: HashMap::new(),
+            end_states: HashMap::new(),
+            in_progress: HashSet::new(),
+        }
+    }
+
+    fn has_analysis(&self, name: &str) -> bool {
+        self.analyzed_templates.contains_key(name)
+    }
+
+    fn finish(self) -> HashMap<String, Vec<Node>> {
+        self.analyzed_templates
+    }
+
+    fn analyze_template(&mut self, name: &str, start_state: ContextState) -> Result<ContextState> {
+        if let Some(existing) = self.start_states.get(name) {
+            if existing != &start_state {
+                return Err(TemplateError::Parse(format!(
+                    "cannot compute output context for template `{name}`"
+                )));
+            }
+
+            if let Some(end) = self.end_states.get(name) {
+                return Ok(end.clone());
+            }
+
+            if self.in_progress.contains(name) {
+                return Err(TemplateError::Parse(format!(
+                    "cannot compute output context for recursive template `{name}`"
+                )));
+            }
+        }
+
+        let raw_nodes = self
+            .raw_templates
+            .get(name)
+            .cloned()
+            .ok_or_else(|| TemplateError::Parse(format!("no such template `{name}`")))?;
+
+        self.start_states
+            .insert(name.to_string(), start_state.clone());
+        self.in_progress.insert(name.to_string());
+
+        let analysis = (|| -> Result<(Vec<Node>, ContextState)> {
+            let mut nodes = raw_nodes;
+            let start_tracker = ContextTracker::from_state(start_state);
+            let flows = self.analyze_nodes(&mut nodes, start_tracker, false)?;
+
+            let mut normal_states = HashSet::new();
+            for flow in &flows {
+                if flow.kind == AnalysisFlowKind::Normal {
+                    normal_states.insert(flow.tracker.state());
+                }
+            }
+
+            if normal_states.len() != 1 {
+                return Err(TemplateError::Parse(format!(
+                    "cannot compute output context for template `{name}`"
+                )));
+            }
+
+            for flow in &flows {
+                if flow.kind != AnalysisFlowKind::Normal {
+                    return Err(TemplateError::Parse(
+                        "break/continue action is not inside range".to_string(),
+                    ));
+                }
+            }
+
+            let end_state = normal_states
+                .into_iter()
+                .next()
+                .unwrap_or_else(ContextState::html_text);
+            Ok((nodes, end_state))
+        })();
+
+        self.in_progress.remove(name);
+
+        let (nodes, end_state) = analysis?;
+        self.analyzed_templates.insert(name.to_string(), nodes);
+        self.end_states.insert(name.to_string(), end_state.clone());
+        Ok(end_state)
+    }
+
+    fn analyze_nodes(
+        &mut self,
+        nodes: &mut [Node],
+        start_tracker: ContextTracker,
+        in_range: bool,
+    ) -> Result<Vec<AnalysisFlow>> {
+        let mut flows = vec![AnalysisFlow::normal(start_tracker)];
+
+        for node in nodes {
+            let mut next_flows = Vec::new();
+            for flow in flows {
+                if flow.kind != AnalysisFlowKind::Normal {
+                    next_flows.push(flow);
+                    continue;
+                }
+
+                let mut produced = self.analyze_node(node, flow.tracker, in_range)?;
+                next_flows.append(&mut produced);
+            }
+            flows = dedup_analysis_flows(next_flows);
+        }
+
+        Ok(flows)
+    }
+
+    fn analyze_node(
+        &mut self,
+        node: &mut Node,
+        mut tracker: ContextTracker,
+        in_range: bool,
+    ) -> Result<Vec<AnalysisFlow>> {
+        match node {
+            Node::Text(text) => {
+                tracker.append_text(text);
+                Ok(vec![AnalysisFlow::normal(tracker)])
+            }
+            Node::Expr { mode, .. } => {
+                let escape_mode = tracker.mode();
+                *mode = escape_mode;
+                tracker.append_expr_placeholder(escape_mode);
+                Ok(vec![AnalysisFlow::normal(tracker)])
+            }
+            Node::SetVar { .. } | Node::Define { .. } => Ok(vec![AnalysisFlow::normal(tracker)]),
+            Node::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_flows = self.analyze_nodes(then_branch, tracker.clone(), in_range)?;
+                let else_flows = self.analyze_nodes(else_branch, tracker, in_range)?;
+                ensure_branch_normal_context("if", &then_flows, &else_flows)?;
+                let mut merged = then_flows;
+                merged.extend(else_flows);
+                Ok(dedup_analysis_flows(merged))
+            }
+            Node::With {
+                body, else_branch, ..
+            } => {
+                let body_flows = self.analyze_nodes(body, tracker.clone(), in_range)?;
+                let else_flows = self.analyze_nodes(else_branch, tracker, in_range)?;
+                ensure_branch_normal_context("with", &body_flows, &else_flows)?;
+                let mut merged = body_flows;
+                merged.extend(else_flows);
+                Ok(dedup_analysis_flows(merged))
+            }
+            Node::Range {
+                body, else_branch, ..
+            } => {
+                let range_start = tracker.clone();
+                let range_start_state = range_start.state();
+                let body_flows = self.analyze_nodes(body, range_start.clone(), true)?;
+                let else_flows = self.analyze_nodes(else_branch, range_start.clone(), true)?;
+
+                let mut output_flows = Vec::new();
+                let mut natural_exit = true;
+
+                for flow in body_flows {
+                    match flow.kind {
+                        AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {
+                            if flow.tracker.state() != range_start_state {
+                                return Err(TemplateError::Parse(
+                                    "on range loop re-entry: context mismatch".to_string(),
+                                ));
+                            }
+                        }
+                        AnalysisFlowKind::Break => {
+                            output_flows.push(AnalysisFlow::normal(flow.tracker));
+                            natural_exit = false;
+                        }
+                    }
+                }
+
+                if natural_exit || output_flows.is_empty() {
+                    output_flows.push(AnalysisFlow::normal(range_start.clone()));
+                }
+
+                for flow in else_flows {
+                    match flow.kind {
+                        AnalysisFlowKind::Normal => output_flows.push(flow),
+                        AnalysisFlowKind::Break => {
+                            output_flows.push(AnalysisFlow::normal(flow.tracker))
+                        }
+                        AnalysisFlowKind::Continue => {
+                            return Err(TemplateError::Parse(
+                                "on range loop re-entry: context mismatch".to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                ensure_single_normal_context("range", &output_flows)?;
+                Ok(dedup_analysis_flows(output_flows))
+            }
+            Node::TemplateCall { name, .. } => {
+                let start_state = tracker.state();
+                let end_state = self.analyze_template(name, start_state)?;
+                Ok(vec![AnalysisFlow::normal(ContextTracker::from_state(
+                    end_state,
+                ))])
+            }
+            Node::Block { name, body, .. } => {
+                if self.raw_templates.contains_key(name) {
+                    let start_state = tracker.state();
+                    let end_state = self.analyze_template(name, start_state)?;
+                    Ok(vec![AnalysisFlow::normal(ContextTracker::from_state(
+                        end_state,
+                    ))])
+                } else {
+                    self.analyze_nodes(body, tracker, in_range)
+                }
+            }
+            Node::Break => {
+                if !in_range {
+                    return Err(TemplateError::Parse(
+                        "break action is not inside range".to_string(),
+                    ));
+                }
+                Ok(vec![AnalysisFlow::with_kind(
+                    AnalysisFlowKind::Break,
+                    tracker,
+                )])
+            }
+            Node::Continue => {
+                if !in_range {
+                    return Err(TemplateError::Parse(
+                        "continue action is not inside range".to_string(),
+                    ));
+                }
+                Ok(vec![AnalysisFlow::with_kind(
+                    AnalysisFlowKind::Continue,
+                    tracker,
+                )])
+            }
+        }
+    }
+}
+
+fn dedup_analysis_flows(flows: Vec<AnalysisFlow>) -> Vec<AnalysisFlow> {
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+
+    for flow in flows {
+        let state = flow.tracker.state();
+        if seen.insert((flow.kind, state.clone())) {
+            deduped.push(AnalysisFlow::with_kind(
+                flow.kind,
+                ContextTracker::from_state(state),
+            ));
+        }
+    }
+
+    deduped
+}
+
+fn ensure_branch_normal_context(
+    branch_name: &str,
+    left: &[AnalysisFlow],
+    right: &[AnalysisFlow],
+) -> Result<()> {
+    let mut normal_states = HashSet::new();
+    for flow in left.iter().chain(right.iter()) {
+        if flow.kind == AnalysisFlowKind::Normal {
+            normal_states.insert(flow.tracker.state());
+        }
+    }
+
+    if normal_states.len() > 1 {
+        return Err(TemplateError::Parse(format!(
+            "{{{{{branch_name}}}}} branches end in different contexts"
+        )));
+    }
+
+    Ok(())
+}
+
+fn ensure_single_normal_context(block_name: &str, flows: &[AnalysisFlow]) -> Result<()> {
+    let mut normal_states = HashSet::new();
+    for flow in flows {
+        if flow.kind == AnalysisFlowKind::Normal {
+            normal_states.insert(flow.tracker.state());
+        }
+    }
+
+    if normal_states.len() > 1 {
+        return Err(TemplateError::Parse(format!(
+            "{{{{{block_name}}}}} branches end in different contexts"
+        )));
+    }
+
+    Ok(())
+}
+
+fn placeholder_for_mode(mode: EscapeMode) -> &'static str {
+    match mode {
+        EscapeMode::Html
+        | EscapeMode::AttrQuoted { .. }
+        | EscapeMode::AttrUnquoted { .. }
+        | EscapeMode::ScriptString { .. }
+        | EscapeMode::StyleExpr
+        | EscapeMode::StyleString { .. } => "x",
+        EscapeMode::ScriptExpr => "0",
+    }
+}
+
+fn attr_name_for_kind(kind: AttrKind) -> &'static str {
+    match kind {
+        AttrKind::Normal => "title",
+        AttrKind::Url => "href",
+        AttrKind::Js => "onclick",
+        AttrKind::Css => "style",
+    }
+}
+
+fn seed_rendered_for_state(state: &ContextState) -> String {
+    match state.mode {
+        EscapeMode::Html => {
+            if state.in_open_tag {
+                "<x".to_string()
+            } else {
+                String::new()
+            }
+        }
+        EscapeMode::AttrQuoted { kind, quote } => {
+            format!("<a {}={quote}x", attr_name_for_kind(kind))
+        }
+        EscapeMode::AttrUnquoted { kind } => format!("<a {}=x", attr_name_for_kind(kind)),
+        EscapeMode::ScriptExpr => "<script>".to_string(),
+        EscapeMode::ScriptString { quote } => format!("<script>{quote}"),
+        EscapeMode::StyleExpr => "<style>".to_string(),
+        EscapeMode::StyleString { quote } => format!("<style>{quote}"),
+    }
+}
+
+fn is_in_unclosed_tag_context(rendered: &str) -> bool {
+    let Some(last_lt) = rendered.rfind('<') else {
+        return false;
+    };
+    let last_gt = rendered.rfind('>');
+    if let Some(last_gt) = last_gt {
+        if last_gt > last_lt {
+            return false;
+        }
+    }
+
+    let fragment = &rendered[last_lt + 1..];
+    if fragment.is_empty() {
+        return true;
+    }
+
+    let first = fragment.chars().next().unwrap_or_default();
+    if first == '/' || first == '!' || first == '?' {
+        return false;
+    }
+
+    true
 }
 
 fn builtin_funcs() -> FuncMap {
@@ -634,6 +1731,58 @@ fn builtin_funcs() -> FuncMap {
     );
 
     funcs.insert(
+        "printf".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.is_empty() {
+                return Ok(Value::from(String::new()));
+            }
+            let format = args[0].to_plain_string();
+            let rendered = format_printf(&format, &args[1..]);
+            Ok(Value::from(rendered))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "println".to_string(),
+        Arc::new(|args: &[Value]| {
+            let rendered = args
+                .iter()
+                .map(Value::to_plain_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(Value::from(format!("{rendered}\n")))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "js".to_string(),
+        Arc::new(|args: &[Value]| {
+            let encoded = if args.len() == 1 {
+                value_to_json_string(&args[0])?
+            } else {
+                let mut combined = String::new();
+                for arg in args {
+                    combined.push_str(&arg.to_plain_string());
+                }
+                serde_json::to_string(&combined)?
+            };
+            Ok(Value::safe_html(sanitize_json_for_script(&encoded)))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "slice".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.is_empty() {
+                return Err(TemplateError::Render(
+                    "slice expects at least one argument".to_string(),
+                ));
+            }
+            slice_value(&args[0], &args[1..])
+        }) as Function,
+    );
+
+    funcs.insert(
         "len".to_string(),
         Arc::new(|args: &[Value]| {
             if args.len() != 1 {
@@ -644,6 +1793,11 @@ fn builtin_funcs() -> FuncMap {
             let value = &args[0];
             let len = match value {
                 Value::SafeHtml(v) => v.len(),
+                Value::SafeHtmlAttr(v) => v.len(),
+                Value::SafeJs(v) => v.len(),
+                Value::SafeCss(v) => v.len(),
+                Value::SafeUrl(v) => v.len(),
+                Value::SafeSrcset(v) => v.len(),
                 Value::Json(JsonValue::Array(v)) => v.len(),
                 Value::Json(JsonValue::Object(v)) => v.len(),
                 Value::Json(JsonValue::String(v)) => v.len(),
@@ -682,7 +1836,7 @@ fn builtin_funcs() -> FuncMap {
             let first = &args[0];
             let matches = args[1..]
                 .iter()
-                .all(|candidate| values_equal(first, candidate));
+                .any(|candidate| values_equal(first, candidate));
             Ok(Value::from(matches))
         }) as Function,
     );
@@ -814,6 +1968,11 @@ fn builtin_funcs() -> FuncMap {
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::SafeHtml(a), Value::SafeHtml(b)) => a == b,
+        (Value::SafeHtmlAttr(a), Value::SafeHtmlAttr(b)) => a == b,
+        (Value::SafeJs(a), Value::SafeJs(b)) => a == b,
+        (Value::SafeCss(a), Value::SafeCss(b)) => a == b,
+        (Value::SafeUrl(a), Value::SafeUrl(b)) => a == b,
+        (Value::SafeSrcset(a), Value::SafeSrcset(b)) => a == b,
         (Value::SafeHtml(a), Value::Json(JsonValue::String(b))) => a == b,
         (Value::Json(JsonValue::String(a)), Value::SafeHtml(b)) => a == b,
         (Value::Json(a), Value::Json(b)) => a == b,
@@ -853,6 +2012,11 @@ fn numeric_value(value: &Value) -> Option<f64> {
 fn string_value(value: &Value) -> Option<String> {
     match value {
         Value::SafeHtml(text) => Some(text.clone()),
+        Value::SafeHtmlAttr(text) => Some(text.clone()),
+        Value::SafeJs(text) => Some(text.clone()),
+        Value::SafeCss(text) => Some(text.clone()),
+        Value::SafeUrl(text) => Some(text.clone()),
+        Value::SafeSrcset(text) => Some(text.clone()),
         Value::Json(JsonValue::String(text)) => Some(text.clone()),
         _ => None,
     }
@@ -895,6 +2059,17 @@ fn index_value(container: &Value, index: &Value) -> Result<Value> {
             })?;
             Ok(Value::from(value.to_string()))
         }
+        Value::SafeHtmlAttr(text)
+        | Value::SafeJs(text)
+        | Value::SafeCss(text)
+        | Value::SafeUrl(text)
+        | Value::SafeSrcset(text) => {
+            let index = index_to_usize(index)?;
+            let value = text.chars().nth(index).ok_or_else(|| {
+                TemplateError::Render(format!("string index out of range: {index}"))
+            })?;
+            Ok(Value::from(value.to_string()))
+        }
         _ => Err(TemplateError::Render(
             "index supports array, map, or string".to_string(),
         )),
@@ -928,14 +2103,253 @@ fn index_to_usize(value: &Value) -> Result<usize> {
     }
 }
 
-fn lookup_path(base: &Value, path: &[String]) -> Value {
+fn value_to_json_string(value: &Value) -> Result<String> {
+    match value {
+        Value::Json(json) => Ok(serde_json::to_string(json)?),
+        Value::SafeHtml(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeHtmlAttr(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeJs(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeCss(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeUrl(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeSrcset(text) => Ok(serde_json::to_string(text)?),
+        Value::FunctionRef(name) => Ok(serde_json::to_string(&format!("<function:{name}>"))?),
+        Value::Missing => Ok(serde_json::to_string("<no value>")?),
+    }
+}
+
+fn format_printf(format: &str, args: &[Value]) -> String {
+    let chars: Vec<char> = format.chars().collect();
+    let mut rendered = String::new();
+    let mut i = 0usize;
+    let mut arg_index = 0usize;
+
+    while i < chars.len() {
+        if chars[i] != '%' {
+            rendered.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= chars.len() {
+            rendered.push('%');
+            break;
+        }
+
+        if chars[i] == '%' {
+            rendered.push('%');
+            i += 1;
+            continue;
+        }
+
+        let verb = chars[i];
+        i += 1;
+        let argument = args.get(arg_index);
+        if argument.is_some() {
+            arg_index += 1;
+        }
+
+        match (verb, argument) {
+            (_, None) => rendered.push_str("%!missing"),
+            ('v', Some(value)) | ('s', Some(value)) => rendered.push_str(&value.to_plain_string()),
+            ('q', Some(value)) => {
+                let quoted = serde_json::to_string(&value.to_plain_string())
+                    .unwrap_or_else(|_| "\"\"".to_string());
+                rendered.push_str(&quoted);
+            }
+            ('d', Some(value)) => rendered.push_str(&format_printf_integer(value)),
+            ('f', Some(value)) => rendered.push_str(&format_printf_float(value)),
+            ('t', Some(value)) => rendered.push_str(&format_printf_bool(value)),
+            (_, Some(value)) => {
+                rendered.push('%');
+                rendered.push(verb);
+                rendered.push_str(&value.to_plain_string());
+            }
+        }
+    }
+
+    if arg_index < args.len() {
+        for value in &args[arg_index..] {
+            rendered.push_str("%!(EXTRA ");
+            rendered.push_str(&value.to_plain_string());
+            rendered.push(')');
+        }
+    }
+
+    rendered
+}
+
+fn format_printf_integer(value: &Value) -> String {
+    match value {
+        Value::Json(JsonValue::Number(number)) => {
+            if let Some(i) = number.as_i64() {
+                i.to_string()
+            } else if let Some(u) = number.as_u64() {
+                u.to_string()
+            } else if let Some(f) = number.as_f64() {
+                (f as i64).to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Json(JsonValue::Bool(value)) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::Json(JsonValue::String(value)) => value
+            .parse::<i64>()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string()),
+        Value::SafeHtml(value)
+        | Value::SafeHtmlAttr(value)
+        | Value::SafeJs(value)
+        | Value::SafeCss(value)
+        | Value::SafeUrl(value)
+        | Value::SafeSrcset(value) => value
+            .parse::<i64>()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string()),
+        Value::FunctionRef(_) | Value::Missing | Value::Json(_) => "0".to_string(),
+    }
+}
+
+fn format_printf_float(value: &Value) -> String {
+    match value {
+        Value::Json(JsonValue::Number(number)) => number
+            .as_f64()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        Value::Json(JsonValue::String(value)) => value
+            .parse::<f64>()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string()),
+        Value::SafeHtml(value)
+        | Value::SafeHtmlAttr(value)
+        | Value::SafeJs(value)
+        | Value::SafeCss(value)
+        | Value::SafeUrl(value)
+        | Value::SafeSrcset(value) => value
+            .parse::<f64>()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "0".to_string()),
+        Value::Json(JsonValue::Bool(value)) => {
+            if *value {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        Value::FunctionRef(_) | Value::Missing | Value::Json(_) => "0".to_string(),
+    }
+}
+
+fn format_printf_bool(value: &Value) -> String {
+    if value.truthy() {
+        "true".to_string()
+    } else {
+        "false".to_string()
+    }
+}
+
+fn slice_value(base: &Value, indexes: &[Value]) -> Result<Value> {
+    match base {
+        Value::Json(JsonValue::Array(items)) => {
+            let bounds = compute_slice_bounds(items.len(), indexes)?;
+            Ok(Value::Json(JsonValue::Array(
+                items[bounds.low..bounds.high].to_vec(),
+            )))
+        }
+        Value::Json(JsonValue::String(text)) => {
+            let chars = text.chars().collect::<Vec<_>>();
+            let bounds = compute_slice_bounds(chars.len(), indexes)?;
+            let sliced = chars[bounds.low..bounds.high].iter().collect::<String>();
+            Ok(Value::from(sliced))
+        }
+        Value::SafeHtml(text) => {
+            let chars = text.chars().collect::<Vec<_>>();
+            let bounds = compute_slice_bounds(chars.len(), indexes)?;
+            let sliced = chars[bounds.low..bounds.high].iter().collect::<String>();
+            Ok(Value::safe_html(sliced))
+        }
+        Value::SafeHtmlAttr(text)
+        | Value::SafeJs(text)
+        | Value::SafeCss(text)
+        | Value::SafeUrl(text)
+        | Value::SafeSrcset(text) => {
+            let chars = text.chars().collect::<Vec<_>>();
+            let bounds = compute_slice_bounds(chars.len(), indexes)?;
+            let sliced = chars[bounds.low..bounds.high].iter().collect::<String>();
+            Ok(Value::from(sliced))
+        }
+        _ => Err(TemplateError::Render(
+            "slice supports array, string, or safe_html".to_string(),
+        )),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SliceBounds {
+    low: usize,
+    high: usize,
+}
+
+fn compute_slice_bounds(length: usize, indexes: &[Value]) -> Result<SliceBounds> {
+    if indexes.len() > 3 {
+        return Err(TemplateError::Render(
+            "slice supports up to three indexes".to_string(),
+        ));
+    }
+
+    let low = if let Some(value) = indexes.first() {
+        index_to_usize(value)?
+    } else {
+        0
+    };
+
+    let high = if let Some(value) = indexes.get(1) {
+        index_to_usize(value)?
+    } else {
+        length
+    };
+
+    if low > high || high > length {
+        return Err(TemplateError::Render(format!(
+            "invalid slice bounds [{low}:{high}] for length {length}"
+        )));
+    }
+
+    if let Some(max_value) = indexes.get(2) {
+        let max = index_to_usize(max_value)?;
+        if high > max || max > length {
+            return Err(TemplateError::Render(format!(
+                "invalid slice max index {max} for length {length}"
+            )));
+        }
+    }
+
+    Ok(SliceBounds { low, high })
+}
+
+pub fn lookup_path(base: &Value, path: &[String]) -> Value {
     if path.is_empty() {
         return base.clone();
     }
 
     let mut current = match base {
         Value::Json(value) => value,
-        Value::SafeHtml(_) => return Value::Json(JsonValue::Null),
+        Value::SafeHtml(_)
+        | Value::SafeHtmlAttr(_)
+        | Value::SafeJs(_)
+        | Value::SafeCss(_)
+        | Value::SafeUrl(_)
+        | Value::SafeSrcset(_)
+        | Value::FunctionRef(_)
+        | Value::Missing => {
+            return Value::Json(JsonValue::Null);
+        }
     };
 
     for segment in path {
@@ -960,8 +2374,85 @@ fn lookup_path(base: &Value, path: &[String]) -> Value {
     Value::Json(current.clone())
 }
 
-fn lookup_identifier(dot: &Value, root: &Value, name: &str) -> Option<Value> {
-    lookup_object_key(dot, name).or_else(|| lookup_object_key(root, name))
+fn lookup_path_with_methods(
+    base: &Value,
+    path: &[String],
+    methods: &MethodMap,
+    missing_key_mode: MissingKeyMode,
+) -> Result<Value> {
+    if path.is_empty() {
+        return Ok(base.clone());
+    }
+
+    let mut current = base.clone();
+    for segment in path {
+        current = lookup_single_segment(&current, segment, methods, missing_key_mode)?;
+    }
+    Ok(current)
+}
+
+fn lookup_single_segment(
+    current: &Value,
+    segment: &str,
+    methods: &MethodMap,
+    missing_key_mode: MissingKeyMode,
+) -> Result<Value> {
+    let direct = match current {
+        Value::Json(JsonValue::Object(map)) => map.get(segment).cloned().map(Value::Json),
+        Value::Json(JsonValue::Array(items)) => segment
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| items.get(index))
+            .cloned()
+            .map(Value::Json),
+        _ => None,
+    };
+
+    if let Some(value) = direct {
+        return Ok(value);
+    }
+
+    if let Some(method) = methods.get(segment) {
+        return method(current, &[]);
+    }
+
+    match current {
+        Value::Json(JsonValue::Object(_)) => missing_value_for_key(segment, missing_key_mode),
+        _ => Ok(Value::Json(JsonValue::Null)),
+    }
+}
+
+fn lookup_identifier(
+    dot: &Value,
+    root: &Value,
+    name: &str,
+    methods: &MethodMap,
+    _missing_key_mode: MissingKeyMode,
+) -> Result<Option<Value>> {
+    if let Some(value) = lookup_object_key(dot, name).or_else(|| lookup_object_key(root, name)) {
+        return Ok(Some(value));
+    }
+
+    if let Some(method) = methods.get(name) {
+        return Ok(Some(method(dot, &[])?));
+    }
+
+    Ok(None)
+}
+
+fn missing_value_for_key(key: &str, mode: MissingKeyMode) -> Result<Value> {
+    match mode {
+        MissingKeyMode::Default => Ok(Value::Missing),
+        MissingKeyMode::Zero => Ok(Value::Json(JsonValue::Null)),
+        MissingKeyMode::Error => Err(TemplateError::Render(format!(
+            "map has no entry for key `{key}`"
+        ))),
+    }
+}
+
+fn split_last_path(path: &[String]) -> (&str, &[String]) {
+    let split_index = path.len() - 1;
+    (path[split_index].as_str(), &path[..split_index])
 }
 
 fn lookup_variable(scopes: &ScopeStack, name: &str) -> Option<Value> {
@@ -1013,25 +2504,75 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
-fn tokenize(source: &str) -> Result<Vec<Token>> {
+fn strip_html_comments(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = source[cursor..].find("<!--") {
+        let start = cursor + start_rel;
+        output.push_str(&source[cursor..start]);
+
+        let comment_body_start = start + 4;
+        if let Some(end_rel) = source[comment_body_start..].find("-->") {
+            cursor = comment_body_start + end_rel + 3;
+        } else {
+            cursor = source.len();
+            break;
+        }
+    }
+
+    if cursor < source.len() {
+        output.push_str(&source[cursor..]);
+    }
+
+    output
+}
+
+fn expand_glob_patterns<I, S>(patterns: I) -> Result<Vec<std::path::PathBuf>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        for entry in glob::glob(pattern.as_ref())? {
+            paths.push(entry?);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(TemplateError::Parse(
+            "glob pattern matched no files".to_string(),
+        ));
+    }
+    Ok(paths)
+}
+
+fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Token>> {
+    if left_delim.is_empty() || right_delim.is_empty() {
+        return Err(TemplateError::Parse(
+            "template delimiters must not be empty".to_string(),
+        ));
+    }
+
     let mut tokens = Vec::new();
     let mut cursor = 0usize;
 
-    while let Some(start_offset) = source[cursor..].find("{{") {
+    while let Some(start_offset) = source[cursor..].find(left_delim) {
         let start = cursor + start_offset;
         if start > cursor {
             tokens.push(Token::Text(source[cursor..start].to_string()));
         }
 
-        let mut action_start = start + 2;
+        let mut action_start = start + left_delim.len();
         if source[action_start..].starts_with('-') {
             action_start += 1;
             trim_last_text_whitespace(&mut tokens);
         }
 
-        let end_offset = source[action_start..]
-            .find("}}")
-            .ok_or_else(|| TemplateError::Parse("unclosed action (missing `}}`)".to_string()))?;
+        let end_offset = source[action_start..].find(right_delim).ok_or_else(|| {
+            TemplateError::Parse(format!("unclosed action (missing `{right_delim}`)"))
+        })?;
         let end = action_start + end_offset;
 
         let mut action = source[action_start..end].trim().to_string();
@@ -1042,7 +2583,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>> {
         }
 
         tokens.push(Token::Action(action));
-        cursor = end + 2;
+        cursor = end + right_delim.len();
 
         if trim_right {
             while cursor < source.len() {
@@ -1128,11 +2669,12 @@ fn parse_nodes(
                             ));
                         }
                         *index += 1;
-                        let (vars, iterable) = parse_range_clause(tail)?;
+                        let (vars, iterable, declare_vars) = parse_range_clause(tail)?;
                         let (body, else_branch) =
                             parse_optional_else_block(tokens, index, "range")?;
                         nodes.push(Node::Range {
                             vars,
+                            declare_vars,
                             iterable,
                             body,
                             else_branch,
@@ -1146,12 +2688,8 @@ fn parse_nodes(
                         }
                         *index += 1;
                         let value = parse_expression(tail)?;
-                        let (body, else_branch) = parse_optional_else_block(tokens, index, "with")?;
-                        nodes.push(Node::With {
-                            value,
-                            body,
-                            else_branch,
-                        });
+                        let parsed = parse_with_from_value(tokens, index, value)?;
+                        nodes.push(parsed);
                     }
                     "define" => {
                         let name = parse_quoted_name(tail)?;
@@ -1193,6 +2731,24 @@ fn parse_nodes(
                             }
                         }
                     }
+                    "break" => {
+                        if !tail.is_empty() {
+                            return Err(TemplateError::Parse(
+                                "break does not accept arguments".to_string(),
+                            ));
+                        }
+                        nodes.push(Node::Break);
+                        *index += 1;
+                    }
+                    "continue" => {
+                        if !tail.is_empty() {
+                            return Err(TemplateError::Parse(
+                                "continue does not accept arguments".to_string(),
+                            ));
+                        }
+                        nodes.push(Node::Continue);
+                        *index += 1;
+                    }
                     "else" | "end" => {
                         return Err(TemplateError::Parse(format!("unexpected `{head}`")));
                     }
@@ -1201,7 +2757,10 @@ fn parse_nodes(
                             nodes.push(set_var);
                         } else {
                             let expr = parse_expression(action)?;
-                            nodes.push(Node::Expr(expr));
+                            nodes.push(Node::Expr {
+                                expr,
+                                mode: EscapeMode::Html,
+                            });
                         }
                         *index += 1;
                     }
@@ -1271,6 +2830,64 @@ fn parse_if_from_condition(tokens: &[Token], index: &mut usize, condition: Expr)
     })
 }
 
+fn parse_with_from_value(tokens: &[Token], index: &mut usize, value: Expr) -> Result<Node> {
+    let (body, stop) = parse_nodes(tokens, index, &["else", "end"])?;
+    let mut else_branch = Vec::new();
+
+    match stop {
+        Some(stop) if stop.keyword == "end" => {}
+        Some(stop) if stop.keyword == "else" => {
+            if stop.tail.is_empty() {
+                let (parsed_else, end) = parse_nodes(tokens, index, &["end"])?;
+                match end {
+                    Some(end) if end.keyword == "end" => {
+                        else_branch = parsed_else;
+                    }
+                    _ => {
+                        return Err(TemplateError::Parse(
+                            "with block is missing closing `end`".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                let (head, tail) = split_head(&stop.tail);
+                if head == "with" {
+                    if tail.is_empty() {
+                        return Err(TemplateError::Parse(
+                            "else with requires an expression".to_string(),
+                        ));
+                    }
+                    let else_with_value = parse_expression(tail)?;
+                    let nested = parse_with_from_value(tokens, index, else_with_value)?;
+                    else_branch.push(nested);
+                } else {
+                    return Err(TemplateError::Parse(format!(
+                        "unsupported else clause `{}`",
+                        stop.tail
+                    )));
+                }
+            }
+        }
+        Some(stop) => {
+            return Err(TemplateError::Parse(format!(
+                "unexpected control action `{}` in with block",
+                stop.keyword
+            )));
+        }
+        None => {
+            return Err(TemplateError::Parse(
+                "with block is missing `end`".to_string(),
+            ));
+        }
+    }
+
+    Ok(Node::With {
+        value,
+        body,
+        else_branch,
+    })
+}
+
 fn parse_optional_else_block(
     tokens: &[Token],
     index: &mut usize,
@@ -1326,7 +2943,7 @@ fn parse_template_call(input: &str) -> Result<(String, Option<Expr>)> {
     Ok((name, data))
 }
 
-fn parse_range_clause(input: &str) -> Result<(Vec<String>, Expr)> {
+fn parse_range_clause(input: &str) -> Result<(Vec<String>, Expr, bool)> {
     if let Some(index) = find_unquoted_operator(input, ":=") {
         let variables = input[..index].trim();
         let expression = input[index + 2..].trim();
@@ -1338,10 +2955,24 @@ fn parse_range_clause(input: &str) -> Result<(Vec<String>, Expr)> {
 
         let vars = parse_variable_list(variables, 2)?;
         let iterable = parse_expression(expression)?;
-        return Ok((vars, iterable));
+        return Ok((vars, iterable, true));
     }
 
-    Ok((Vec::new(), parse_expression(input)?))
+    if let Some(index) = find_unquoted_operator(input, "=") {
+        let variables = input[..index].trim();
+        let expression = input[index + 1..].trim();
+        if variables.is_empty() || expression.is_empty() {
+            return Err(TemplateError::Parse(
+                "range variable assignment must be `<vars> = <expr>`".to_string(),
+            ));
+        }
+
+        let vars = parse_variable_list(variables, 2)?;
+        let iterable = parse_expression(expression)?;
+        return Ok((vars, iterable, false));
+    }
+
+    Ok((Vec::new(), parse_expression(input)?, true))
 }
 
 fn parse_variable_assignment_action(action: &str) -> Result<Option<Node>> {
@@ -1483,12 +3114,16 @@ fn parse_expression(input: &str) -> Result<Expr> {
                 args,
             });
         } else {
-            if terms.len() != 1 {
-                return Err(TemplateError::Parse(format!(
-                    "invalid expression segment `{segment}`"
-                )));
+            if terms.len() == 1 {
+                commands.push(Command::Value(parse_term(&terms[0])?));
+            } else {
+                let callee = parse_term(&terms[0])?;
+                let args = terms[1..]
+                    .iter()
+                    .map(|term| parse_term(term))
+                    .collect::<Result<Vec<_>>>()?;
+                commands.push(Command::Invoke { callee, args });
             }
-            commands.push(Command::Value(parse_term(&terms[0])?));
         }
     }
 
@@ -1780,59 +3415,138 @@ fn parse_string_literal_prefix(input: &str) -> Result<(String, usize)> {
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AttrKind {
+    Normal,
+    Url,
+    Js,
+    Css,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EscapeMode {
     Html,
-    AttrQuoted { url_like: bool },
-    AttrUnquoted { url_like: bool },
-    Script,
+    AttrQuoted { kind: AttrKind, quote: char },
+    AttrUnquoted { kind: AttrKind },
+    ScriptExpr,
+    ScriptString { quote: char },
+    StyleExpr,
+    StyleString { quote: char },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TagValueContext {
     attr_name: String,
     quoted: bool,
+    quote: Option<char>,
 }
 
 fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
-    if let Value::SafeHtml(raw) = value {
-        return Ok(raw.clone());
+    match (value, mode) {
+        (Value::SafeHtml(raw), EscapeMode::Html) => return Ok(raw.clone()),
+        (Value::SafeHtmlAttr(raw), EscapeMode::AttrQuoted { .. })
+        | (Value::SafeHtmlAttr(raw), EscapeMode::AttrUnquoted { .. }) => return Ok(raw.clone()),
+        (Value::SafeJs(raw), EscapeMode::ScriptExpr)
+        | (Value::SafeJs(raw), EscapeMode::ScriptString { .. })
+        | (
+            Value::SafeJs(raw),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Js, ..
+            },
+        )
+        | (Value::SafeJs(raw), EscapeMode::AttrUnquoted { kind: AttrKind::Js }) => {
+            return Ok(raw.clone());
+        }
+        (Value::SafeCss(raw), EscapeMode::StyleExpr)
+        | (Value::SafeCss(raw), EscapeMode::StyleString { .. })
+        | (
+            Value::SafeCss(raw),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Css,
+                ..
+            },
+        )
+        | (
+            Value::SafeCss(raw),
+            EscapeMode::AttrUnquoted {
+                kind: AttrKind::Css,
+            },
+        ) => {
+            return Ok(raw.clone());
+        }
+        (
+            Value::SafeUrl(raw),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Url,
+                ..
+            },
+        )
+        | (
+            Value::SafeUrl(raw),
+            EscapeMode::AttrUnquoted {
+                kind: AttrKind::Url,
+            },
+        ) => {
+            return Ok(raw.clone());
+        }
+        (
+            Value::SafeSrcset(raw),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Url,
+                ..
+            },
+        )
+        | (
+            Value::SafeSrcset(raw),
+            EscapeMode::AttrUnquoted {
+                kind: AttrKind::Url,
+            },
+        ) => {
+            return Ok(raw.clone());
+        }
+        _ => {}
     }
 
     match mode {
         EscapeMode::Html => Ok(escape_html(&value.to_plain_string())),
-        EscapeMode::AttrQuoted { url_like } => {
-            let text = if url_like {
-                percent_encode_url(&value.to_plain_string())
-            } else {
-                value.to_plain_string()
-            };
+        EscapeMode::AttrQuoted { kind, quote } => {
+            let text = transform_attr_value(&value.to_plain_string(), kind, Some(quote));
             Ok(escape_html(&text))
         }
-        EscapeMode::AttrUnquoted { url_like } => {
-            let text = if url_like {
-                percent_encode_url(&value.to_plain_string())
-            } else {
-                value.to_plain_string()
-            };
+        EscapeMode::AttrUnquoted { kind } => {
+            let text = transform_attr_value(&value.to_plain_string(), kind, None);
             Ok(escape_attr_unquoted(&text))
         }
-        EscapeMode::Script => escape_script_value(value),
+        EscapeMode::ScriptExpr => escape_script_value(value),
+        EscapeMode::ScriptString { quote } => {
+            Ok(escape_js_string_fragment(&value.to_plain_string(), quote))
+        }
+        EscapeMode::StyleExpr => Ok(escape_css_text(&value.to_plain_string())),
+        EscapeMode::StyleString { quote } => {
+            Ok(escape_css_string_fragment(&value.to_plain_string(), quote))
+        }
     }
 }
 
 fn infer_escape_mode(rendered: &str) -> EscapeMode {
     if let Some(context) = current_tag_value_context(rendered) {
-        let url_like = is_url_attribute(&context.attr_name);
+        let kind = attr_kind(&context.attr_name);
         return if context.quoted {
-            EscapeMode::AttrQuoted { url_like }
+            EscapeMode::AttrQuoted {
+                kind,
+                quote: context.quote.unwrap_or('"'),
+            }
         } else {
-            EscapeMode::AttrUnquoted { url_like }
+            EscapeMode::AttrUnquoted { kind }
         };
     }
 
-    if in_script_text_context(rendered) {
-        return EscapeMode::Script;
+    if let Some(mode) = script_escape_mode(rendered) {
+        return mode;
+    }
+
+    if let Some(mode) = style_escape_mode(rendered) {
+        return mode;
     }
 
     EscapeMode::Html
@@ -1915,6 +3629,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
             return Some(TagValueContext {
                 attr_name,
                 quoted: false,
+                quote: None,
             });
         }
 
@@ -1931,6 +3646,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
                     return Some(TagValueContext {
                         attr_name,
                         quoted: true,
+                        quote: Some(quote),
                     });
                 }
                 return None;
@@ -1947,6 +3663,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
                     return Some(TagValueContext {
                         attr_name,
                         quoted: false,
+                        quote: None,
                     });
                 }
                 return None;
@@ -1964,52 +3681,262 @@ fn is_url_attribute(attr_name: &str) -> bool {
     )
 }
 
-fn in_script_text_context(rendered: &str) -> bool {
-    let lower = rendered.to_ascii_lowercase();
-    let mut cursor = 0usize;
-    let mut in_script = false;
-
-    while cursor < lower.len() {
-        if !in_script {
-            let Some(relative) = lower[cursor..].find("<script") else {
-                break;
-            };
-            let index = cursor + relative;
-            let rest = &lower[index + "<script".len()..];
-            let Some(next) = rest.chars().next() else {
-                break;
-            };
-            if !(next.is_whitespace() || next == '>' || next == '/') {
-                cursor = index + "<script".len();
-                continue;
-            }
-
-            let Some(close_relative) = lower[index..].find('>') else {
-                break;
-            };
-            cursor = index + close_relative + 1;
-            in_script = true;
-        } else {
-            let Some(relative) = lower[cursor..].find("</script") else {
-                return true;
-            };
-            let index = cursor + relative;
-            let Some(close_relative) = lower[index..].find('>') else {
-                return true;
-            };
-            cursor = index + close_relative + 1;
-            in_script = false;
-        }
+fn normalize_attr_name_for_context(attr_name: &str) -> (String, bool) {
+    let lower = attr_name.to_ascii_lowercase();
+    if lower == "xmlns" || lower.starts_with("xmlns:") {
+        return (lower, true);
     }
 
-    in_script
+    if let Some((namespace, local)) = lower.split_once(':') {
+        if namespace == "xmlns" {
+            return (lower, true);
+        }
+        // Go html/template strips regular namespaces but keeps data- prefix
+        // when both namespace and data- are present (e.g. my:data-href).
+        return (local.to_string(), false);
+    }
+
+    if let Some(stripped) = lower.strip_prefix("data-") {
+        return (stripped.to_string(), false);
+    }
+
+    (lower, false)
+}
+
+fn attr_kind(attr_name: &str) -> AttrKind {
+    let (normalized, xmlns_attr) = normalize_attr_name_for_context(attr_name);
+    if xmlns_attr || is_url_attribute(&normalized) {
+        AttrKind::Url
+    } else if normalized.starts_with("on") {
+        AttrKind::Js
+    } else if normalized == "style" {
+        AttrKind::Css
+    } else {
+        AttrKind::Normal
+    }
+}
+
+fn transform_attr_value(value: &str, kind: AttrKind, quote: Option<char>) -> String {
+    match kind {
+        AttrKind::Normal => value.to_string(),
+        AttrKind::Url => normalize_url_for_attribute(value),
+        AttrKind::Js => {
+            let q = quote.unwrap_or('"');
+            escape_js_string_fragment(value, q)
+        }
+        AttrKind::Css => match quote {
+            Some(q) => escape_css_string_fragment(value, q),
+            None => escape_css_text(value),
+        },
+    }
+}
+
+fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
+    let content = current_unclosed_tag_content(rendered, "script")?;
+    if let Some(quote) = current_js_string_quote(content) {
+        return Some(EscapeMode::ScriptString { quote });
+    }
+    Some(EscapeMode::ScriptExpr)
+}
+
+fn style_escape_mode(rendered: &str) -> Option<EscapeMode> {
+    let content = current_unclosed_tag_content(rendered, "style")?;
+    if let Some(quote) = current_css_string_quote(content) {
+        return Some(EscapeMode::StyleString { quote });
+    }
+    Some(EscapeMode::StyleExpr)
+}
+
+fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option<&'a str> {
+    let lower = rendered.to_ascii_lowercase();
+    let open_pattern = format!("<{tag_name}");
+    let close_pattern = format!("</{tag_name}");
+
+    let mut cursor = 0usize;
+    let mut content_start: Option<usize> = None;
+
+    loop {
+        if content_start.is_none() {
+            let Some(relative) = lower[cursor..].find(&open_pattern) else {
+                return None;
+            };
+            let open_index = cursor + relative;
+            let after_open = open_index + open_pattern.len();
+            let next = lower[after_open..].chars().next();
+            if let Some(next) = next {
+                if !(next.is_whitespace() || next == '>' || next == '/') {
+                    cursor = after_open;
+                    continue;
+                }
+            } else {
+                return None;
+            }
+
+            let Some(close_relative) = lower[open_index..].find('>') else {
+                return None;
+            };
+            let start = open_index + close_relative + 1;
+            content_start = Some(start);
+            cursor = start;
+        } else {
+            let Some(relative) = lower[cursor..].find(&close_pattern) else {
+                let start = content_start?;
+                return Some(&rendered[start..]);
+            };
+            let close_index = cursor + relative;
+            let Some(close_end_relative) = lower[close_index..].find('>') else {
+                let start = content_start?;
+                return Some(&rendered[start..]);
+            };
+            cursor = close_index + close_end_relative + 1;
+            content_start = None;
+        }
+    }
+}
+
+fn current_js_string_quote(content: &str) -> Option<char> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '/' && next == Some('/') {
+            line_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == '/' && next == Some('*') {
+            block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' || ch == '`' {
+            quote = Some(ch);
+        }
+        i += 1;
+    }
+
+    quote
+}
+
+fn current_css_string_quote(content: &str) -> Option<char> {
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '/' && next == Some('*') {
+            block_comment = true;
+            i += 2;
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        }
+        i += 1;
+    }
+
+    quote
 }
 
 fn escape_script_value(value: &Value) -> Result<String> {
     match value {
         Value::SafeHtml(raw) => Ok(raw.clone()),
+        Value::SafeHtmlAttr(raw)
+        | Value::SafeJs(raw)
+        | Value::SafeCss(raw)
+        | Value::SafeUrl(raw)
+        | Value::SafeSrcset(raw) => {
+            let encoded = serde_json::to_string(raw)?;
+            Ok(sanitize_json_for_script(&encoded))
+        }
         Value::Json(json) => {
             let encoded = serde_json::to_string(json)?;
+            Ok(sanitize_json_for_script(&encoded))
+        }
+        Value::FunctionRef(name) => {
+            let encoded = serde_json::to_string(&format!("<function:{name}>"))?;
+            Ok(sanitize_json_for_script(&encoded))
+        }
+        Value::Missing => {
+            let encoded = serde_json::to_string("<no value>")?;
             Ok(sanitize_json_for_script(&encoded))
         }
     }
@@ -2022,6 +3949,151 @@ fn sanitize_json_for_script(input: &str) -> String {
         .replace('&', "\\u0026")
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
+}
+
+fn normalize_url_for_attribute(input: &str) -> String {
+    if !is_safe_url(input) {
+        return "#ZgotmplZ".to_string();
+    }
+    encode_url_attribute_value(input)
+}
+
+fn is_safe_url(input: &str) -> bool {
+    let trimmed = input.trim();
+    let mut chars = trimmed.chars().peekable();
+    let mut scheme = String::new();
+
+    while let Some(ch) = chars.peek().copied() {
+        if ch == ':' {
+            if scheme.is_empty() {
+                return true;
+            }
+            let scheme = scheme.to_ascii_lowercase();
+            return !matches!(scheme.as_str(), "javascript" | "vbscript" | "data");
+        }
+        if ch == '/' || ch == '?' || ch == '#' {
+            return true;
+        }
+        if scheme.is_empty() {
+            if ch.is_ascii_alphabetic() {
+                scheme.push(ch);
+                chars.next();
+                continue;
+            }
+            return true;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.' {
+            scheme.push(ch);
+            chars.next();
+            continue;
+        }
+        return true;
+    }
+
+    true
+}
+
+fn encode_url_attribute_value(input: &str) -> String {
+    let mut encoded = String::new();
+    for &byte in input.as_bytes() {
+        if is_safe_url_attr_byte(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(hex_upper((byte >> 4) & 0x0F));
+            encoded.push(hex_upper(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
+fn is_safe_url_attr_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b':'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'@'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b'%'
+        )
+}
+
+fn escape_js_string_fragment(input: &str, quote: char) -> String {
+    let mut escaped = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '<' => escaped.push_str("\\x3C"),
+            '>' => escaped.push_str("\\x3E"),
+            '&' => escaped.push_str("\\x26"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            c if c == quote => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            c if (c as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_css_text(input: &str) -> String {
+    let mut escaped = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | ',' | ':' | ';') {
+            escaped.push(ch);
+        } else {
+            escaped.push_str(&format!("\\{:X} ", ch as u32));
+        }
+    }
+    escaped
+}
+
+fn escape_css_string_fragment(input: &str, quote: char) -> String {
+    let mut escaped = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\A "),
+            '\r' => escaped.push_str("\\D "),
+            '<' => escaped.push_str("\\3C "),
+            '>' => escaped.push_str("\\3E "),
+            c if c == quote => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\{:X} ", c as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn escape_attr_unquoted(input: &str) -> String {
@@ -2357,8 +4429,57 @@ mod tests {
 
         assert_eq!(
             output,
-            "<a href=\"https%3A%2F%2Fexample.com%2Fq%3Fa%3Db%20c%26x%3D%3Cy%3E\">go</a>"
+            "<a href=\"https://example.com/q?a=b%20c&amp;x=%3Cy%3E\">go</a>"
         );
+    }
+
+    #[test]
+    fn url_attribute_blocks_javascript_scheme() {
+        let template = Template::new("url")
+            .parse("<a href=\"{{.URL}}\">go</a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"URL": "javascript:alert(1)"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<a href=\"#ZgotmplZ\">go</a>");
+    }
+
+    #[test]
+    fn namespaced_and_data_attributes_follow_go_like_context_rules() {
+        let template = Template::new("attrs")
+            .parse(
+                "<a my:href=\"{{.A}}\" data-href=\"{{.B}}\" my:data-href=\"{{.C}}\" xmlns:onclick=\"{{.D}}\"></a>",
+            )
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "A": "javascript:alert(1)",
+                "B": "javascript:alert(2)",
+                "C": "javascript:alert(3)",
+                "D": "javascript:alert(4)"
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<a my:href=\"#ZgotmplZ\" data-href=\"#ZgotmplZ\" my:data-href=\"javascript:alert(3)\" xmlns:onclick=\"#ZgotmplZ\"></a>"
+        );
+    }
+
+    #[test]
+    fn html_comments_in_template_source_are_stripped() {
+        let template = Template::new("comments")
+            .parse("<div>a<!--hidden-->{{.X}}<!--{{.Y}}--></div>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<b>", "Y": "ignored"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<div>a&lt;b&gt;</div>");
     }
 
     #[test]
@@ -2378,6 +4499,22 @@ mod tests {
     }
 
     #[test]
+    fn script_string_context_escapes_without_double_quoting() {
+        let template = Template::new("script")
+            .parse("<script>const s = \"{{.S}}\";</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"S": "\"</script><x>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>const s = \"\\\"\\x3C/script\\x3E\\x3Cx\\x3E\";</script>"
+        );
+    }
+
+    #[test]
     fn urlquery_function_matches_percent_encoding_behavior() {
         let template = Template::new("urlquery")
             .parse("{{urlquery .Query}}")
@@ -2388,5 +4525,446 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "a%3Db%20c%26x%3D%3Cy%3E");
+    }
+
+    #[test]
+    fn method_resolution_supports_niladic_method_lookup() {
+        let template = Template::new("method")
+            .add_method("FullName", |receiver: &Value, args: &[Value]| {
+                if !args.is_empty() {
+                    return Err(TemplateError::Render(
+                        "FullName expects no arguments".to_string(),
+                    ));
+                }
+                let first = lookup_path(receiver, &[String::from("First")]).to_plain_string();
+                let last = lookup_path(receiver, &[String::from("Last")]).to_plain_string();
+                Ok(Value::from(format!("{first} {last}")))
+            })
+            .parse("{{.User.FullName}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"User": {"First": "Ada", "Last": "Lovelace"}}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "Ada Lovelace");
+    }
+
+    #[test]
+    fn method_resolution_supports_arguments() {
+        let template = Template::new("method")
+            .add_method("Greet", |receiver: &Value, args: &[Value]| {
+                if args.len() != 1 {
+                    return Err(TemplateError::Render(
+                        "Greet expects one argument".to_string(),
+                    ));
+                }
+                let name = lookup_path(receiver, &[String::from("Name")]).to_plain_string();
+                Ok(Value::from(format!(
+                    "{}:{}",
+                    name,
+                    args[0].to_plain_string()
+                )))
+            })
+            .parse("{{.User.Greet \"world\"}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"User": {"Name": "hello"}}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "hello:world");
+    }
+
+    #[test]
+    fn field_lookup_has_priority_over_method_name() {
+        let template = Template::new("method")
+            .add_method("Name", |_: &Value, _: &[Value]| Ok(Value::from("method")))
+            .parse("{{.User.Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"User": {"Name": "field"}}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "field");
+    }
+
+    #[test]
+    fn missingkey_default_renders_no_value_marker() {
+        let template = Template::new("missing")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "&lt;no value&gt;");
+    }
+
+    #[test]
+    fn missingkey_zero_renders_empty_string() {
+        let template = Template::new("missing")
+            .option("missingkey=zero")
+            .expect("option should succeed")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn missingkey_error_returns_execution_error() {
+        let template = Template::new("missing")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+
+        assert!(error.to_string().contains("map has no entry"));
+    }
+
+    #[test]
+    fn printf_and_println_are_supported() {
+        let template = Template::new("fmt")
+            .parse("{{printf \"%s:%d\" .Name .Age}}|{{println .Name .Age}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "alice", "Age": 20}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "alice:20|alice 20\n");
+    }
+
+    #[test]
+    fn slice_function_supports_string_and_array() {
+        let template = Template::new("slice")
+            .parse("{{slice .S 1 4}}|{{slice .A 1 3}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"S": "abcdef", "A": ["x", "y", "z", "w"]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "bcd|[&quot;y&quot;,&quot;z&quot;]");
+    }
+
+    #[test]
+    fn call_function_invokes_registered_function_value() {
+        let template = Template::new("call")
+            .add_func("join2", |args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render("join2 expects two args".to_string()));
+                }
+                Ok(Value::from(format!(
+                    "{}-{}",
+                    args[0].to_plain_string(),
+                    args[1].to_plain_string()
+                )))
+            })
+            .parse("{{call join2 \"a\" \"b\"}}|{{call \"join2\" \"c\" \"d\"}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "a-b|c-d");
+    }
+
+    #[test]
+    fn js_function_outputs_sanitized_json() {
+        let template = Template::new("js")
+            .parse("{{js .X}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "\"\\u003ctag\\u003e\"");
+    }
+
+    #[test]
+    fn range_supports_assignment_with_equal() {
+        let template = Template::new("range-eq")
+            .parse("{{$i := 0}}{{$v := \"\"}}{{range $i, $v = .Items}}{{$i}}={{$v}};{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": ["a", "b"]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "0=a;1=b;");
+    }
+
+    #[test]
+    fn with_supports_else_with_chain() {
+        let template = Template::new("with")
+            .parse("{{with .A}}A{{else with .B}}B{{else}}C{{end}}")
+            .expect("parse should succeed");
+
+        let out_a = template
+            .execute_to_string(&json!({"A": "x", "B": "y"}))
+            .expect("execute should succeed");
+        let out_b = template
+            .execute_to_string(&json!({"A": null, "B": "y"}))
+            .expect("execute should succeed");
+        let out_c = template
+            .execute_to_string(&json!({"A": null, "B": null}))
+            .expect("execute should succeed");
+
+        assert_eq!(out_a, "A");
+        assert_eq!(out_b, "B");
+        assert_eq!(out_c, "C");
+    }
+
+    #[test]
+    fn break_and_continue_work_inside_range() {
+        let template = Template::new("loop")
+            .parse(
+                "{{range .Items}}{{if eq . \"skip\"}}{{continue}}{{end}}{{if eq . \"stop\"}}{{break}}{{end}}{{.}};{{end}}",
+            )
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": ["a", "skip", "b", "stop", "c"]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "a;b;");
+    }
+
+    #[test]
+    fn break_outside_range_returns_error() {
+        let error = match Template::new("break").parse("{{break}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("break action is not inside range")
+        );
+    }
+
+    #[test]
+    fn delims_allows_custom_action_delimiters() {
+        let template = Template::new("delims")
+            .delims("[[", "]]")
+            .parse("<p>[[.Name]]</p>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "alice"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<p>alice</p>");
+    }
+
+    #[test]
+    fn clone_template_preserves_behavior() {
+        let template = Template::new("clone")
+            .add_func("upper", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("upper expects one arg".to_string()))?;
+                Ok(Value::from(value.to_plain_string().to_uppercase()))
+            })
+            .parse("{{.Name | upper}}")
+            .expect("parse should succeed");
+
+        let cloned = template.clone_template().expect("clone should succeed");
+        let output = cloned
+            .execute_to_string(&json!({"Name": "alice"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "ALICE");
+    }
+
+    #[test]
+    fn clone_template_fails_after_execution() {
+        let template = Template::new("clone")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+
+        let rendered = template
+            .execute_to_string(&json!({"Name": "alice"}))
+            .expect("execute should succeed");
+        assert_eq!(rendered, "alice");
+
+        let error = match template.clone_template() {
+            Ok(_) => panic!("clone should fail after execute"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn parse_fails_after_execution() {
+        let template = Template::new("parse-after-exec")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+
+        let rendered = template
+            .execute_to_string(&json!({"Name": "alice"}))
+            .expect("execute should succeed");
+        assert_eq!(rendered, "alice");
+
+        let error = match template.parse("{{.Other}}") {
+            Ok(_) => panic!("parse should fail after execute"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn range_over_map_is_sorted_by_key() {
+        let template = Template::new("map")
+            .parse("{{range $k, $v := .Map}}{{$k}}={{$v}};{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Map": {"b": 2, "a": 1}}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "a=1;b=2;");
+    }
+
+    #[test]
+    fn safe_types_can_bypass_matching_context_escaping() {
+        let template = Template::new("safe-types")
+            .add_func("to_url", |args: &[Value]| {
+                let input = args.first().map(Value::to_plain_string).unwrap_or_default();
+                Ok(Value::safe_url(input))
+            })
+            .add_func("to_js", |args: &[Value]| {
+                let input = args.first().map(Value::to_plain_string).unwrap_or_default();
+                Ok(Value::safe_js(input))
+            })
+            .add_func("to_css", |args: &[Value]| {
+                let input = args.first().map(Value::to_plain_string).unwrap_or_default();
+                Ok(Value::safe_css(input))
+            })
+            .parse(
+                "<a href=\"{{to_url .U}}\">go</a><script>const s=\"{{to_js .S}}\";</script><style>.x{content:\"{{to_css .C}}\";}</style>",
+            )
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "U": "javascript:alert(1)",
+                "S": "\\\"</script>",
+                "C": "\\\"</style>"
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<a href=\"javascript:alert(1)\">go</a><script>const s=\"\\\"</script>\";</script><style>.x{content:\"\\\"</style>\";}</style>"
+        );
+    }
+
+    #[test]
+    fn method_invoke_can_receive_pipeline_value_as_last_argument() {
+        let template = Template::new("pipeline-method")
+            .add_method("Wrap", |_receiver: &Value, args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render(
+                        "Wrap expects two arguments".to_string(),
+                    ));
+                }
+                Ok(Value::from(format!(
+                    "{}{}",
+                    args[0].to_plain_string(),
+                    args[1].to_plain_string()
+                )))
+            })
+            .parse("{{.Val | .Wrap \"pre-\"}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Val": "x"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "pre-x");
+    }
+
+    #[test]
+    fn eq_matches_if_any_argument_equals_first() {
+        let template = Template::new("eq")
+            .parse("{{eq .A .B .C}}/{{eq .A .B .D}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": 2, "B": 1, "C": 2, "D": 3}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "true/false");
+    }
+
+    #[test]
+    fn parse_time_rejects_branch_context_mismatch() {
+        let error = match Template::new("ambig")
+            .parse("{{if .C}}<a href=\"{{else}}<a title=\"{{end}}{{.X}}\">")
+        {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("branches end in different contexts")
+        );
+    }
+
+    #[test]
+    fn parse_time_rejects_missing_template_reference() {
+        let error = match Template::new("main").parse("<div>{{template \"missing\" .}}</div>") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("no such template"));
+    }
+
+    #[test]
+    fn parse_time_rejects_non_text_end_context() {
+        let error = match Template::new("end").parse("<div title=\"{{.X}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("non-text context"));
+    }
+
+    #[test]
+    fn parse_time_context_is_not_affected_by_prior_runtime_output() {
+        let template = Template::new("stable")
+            .parse("{{safe_html .Prefix}}<a href=\"{{.URL}}\">go</a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "Prefix": "<script>/* attacker controlled */",
+                "URL": "javascript:alert(1)"
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>/* attacker controlled */<a href=\"#ZgotmplZ\">go</a>"
+        );
     }
 }
