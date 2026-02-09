@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -85,17 +86,26 @@ impl Value {
         }
     }
 
-    fn iter_values(&self) -> Vec<Value> {
+    fn iter_pairs(&self) -> Vec<(Value, Value)> {
         match self {
-            Value::Json(JsonValue::Array(items)) => {
-                items.iter().cloned().map(Value::Json).collect::<Vec<_>>()
-            }
-            Value::Json(JsonValue::Object(items)) => {
-                items.values().cloned().map(Value::Json).collect::<Vec<_>>()
-            }
+            Value::Json(JsonValue::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (Value::from(index as u64), Value::Json(value.clone())))
+                .collect::<Vec<_>>(),
+            Value::Json(JsonValue::Object(items)) => items
+                .iter()
+                .map(|(key, value)| (Value::from(key.as_str()), Value::Json(value.clone())))
+                .collect::<Vec<_>>(),
             Value::Json(JsonValue::String(value)) => value
                 .chars()
-                .map(|ch| Value::Json(JsonValue::String(ch.to_string())))
+                .enumerate()
+                .map(|(index, ch)| {
+                    (
+                        Value::from(index as u64),
+                        Value::Json(JsonValue::String(ch.to_string())),
+                    )
+                })
                 .collect::<Vec<_>>(),
             _ => Vec::new(),
         }
@@ -149,6 +159,7 @@ impl From<f64> for Value {
 
 pub type Function = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync + 'static>;
 pub type FuncMap = HashMap<String, Function>;
+type ScopeStack = Vec<HashMap<String, Value>>;
 
 #[derive(Clone)]
 pub struct Template {
@@ -247,7 +258,8 @@ impl Template {
     ) -> Result<()> {
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
-        self.render_named(name, &root, &root, &mut rendered)?;
+        let mut scopes = vec![HashMap::new()];
+        self.render_named(name, &root, &root, &mut scopes, &mut rendered)?;
         writer.write_all(rendered.as_bytes())?;
         Ok(())
     }
@@ -255,7 +267,8 @@ impl Template {
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
-        self.render_named(name, &root, &root, &mut rendered)?;
+        let mut scopes = vec![HashMap::new()];
+        self.render_named(name, &root, &root, &mut scopes, &mut rendered)?;
         Ok(rendered)
     }
 
@@ -289,6 +302,19 @@ impl Template {
                 } => {
                     self.templates.insert(defined_name, body);
                 }
+                Node::Block {
+                    name: block_name,
+                    data,
+                    body,
+                } => {
+                    self.templates
+                        .entry(block_name.clone())
+                        .or_insert_with(|| body.clone());
+                    root_nodes.push(Node::TemplateCall {
+                        name: block_name,
+                        data,
+                    });
+                }
                 other => root_nodes.push(other),
             }
         }
@@ -305,13 +331,14 @@ impl Template {
         name: &str,
         root: &Value,
         dot: &Value,
+        scopes: &mut ScopeStack,
         output: &mut String,
     ) -> Result<()> {
         let nodes = self
             .templates
             .get(name)
             .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
-        self.render_nodes(nodes, root, dot, output)
+        self.render_nodes(nodes, root, dot, scopes, output)
     }
 
     fn render_nodes(
@@ -319,39 +346,67 @@ impl Template {
         nodes: &[Node],
         root: &Value,
         dot: &Value,
+        scopes: &mut ScopeStack,
         output: &mut String,
     ) -> Result<()> {
         for node in nodes {
             match node {
                 Node::Text(text) => output.push_str(text),
                 Node::Expr(expr) => {
-                    let value = self.eval_expr(expr, root, dot)?;
+                    let value = self.eval_expr(expr, root, dot, scopes)?;
                     output.push_str(&value.html_output());
+                }
+                Node::SetVar {
+                    name,
+                    value,
+                    declare,
+                } => {
+                    let evaluated = self.eval_expr(value, root, dot, scopes)?;
+                    if *declare {
+                        declare_variable(scopes, name, evaluated);
+                    } else {
+                        assign_variable(scopes, name, evaluated)?;
+                    }
                 }
                 Node::If {
                     condition,
                     then_branch,
                     else_branch,
                 } => {
-                    let condition_value = self.eval_expr(condition, root, dot)?;
+                    let condition_value = self.eval_expr(condition, root, dot, scopes)?;
                     if condition_value.truthy() {
-                        self.render_nodes(then_branch, root, dot, output)?;
+                        push_scope(scopes);
+                        self.render_nodes(then_branch, root, dot, scopes, output)?;
+                        pop_scope(scopes);
                     } else {
-                        self.render_nodes(else_branch, root, dot, output)?;
+                        push_scope(scopes);
+                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        pop_scope(scopes);
                     }
                 }
                 Node::Range {
+                    vars,
                     iterable,
                     body,
                     else_branch,
                 } => {
-                    let iterable_value = self.eval_expr(iterable, root, dot)?;
-                    let items = iterable_value.iter_values();
+                    let iterable_value = self.eval_expr(iterable, root, dot, scopes)?;
+                    let items = iterable_value.iter_pairs();
                     if items.is_empty() {
-                        self.render_nodes(else_branch, root, dot, output)?;
+                        push_scope(scopes);
+                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        pop_scope(scopes);
                     } else {
-                        for item in items {
-                            self.render_nodes(body, root, &item, output)?;
+                        for (key, item) in items {
+                            push_scope(scopes);
+                            if vars.len() == 1 {
+                                declare_variable(scopes, &vars[0], item.clone());
+                            } else if vars.len() == 2 {
+                                declare_variable(scopes, &vars[0], key);
+                                declare_variable(scopes, &vars[1], item.clone());
+                            }
+                            self.render_nodes(body, root, &item, scopes, output)?;
+                            pop_scope(scopes);
                         }
                     }
                 }
@@ -360,19 +415,39 @@ impl Template {
                     body,
                     else_branch,
                 } => {
-                    let value = self.eval_expr(value, root, dot)?;
+                    let value = self.eval_expr(value, root, dot, scopes)?;
                     if value.truthy() {
-                        self.render_nodes(body, root, &value, output)?;
+                        push_scope(scopes);
+                        self.render_nodes(body, root, &value, scopes, output)?;
+                        pop_scope(scopes);
                     } else {
-                        self.render_nodes(else_branch, root, dot, output)?;
+                        push_scope(scopes);
+                        self.render_nodes(else_branch, root, dot, scopes, output)?;
+                        pop_scope(scopes);
                     }
                 }
                 Node::TemplateCall { name, data } => {
                     let next_dot = match data {
-                        Some(expr) => self.eval_expr(expr, root, dot)?,
+                        Some(expr) => self.eval_expr(expr, root, dot, scopes)?,
                         None => dot.clone(),
                     };
-                    self.render_named(name, root, &next_dot, output)?;
+                    let mut template_scopes = vec![HashMap::new()];
+                    self.render_named(name, root, &next_dot, &mut template_scopes, output)?;
+                }
+                Node::Block { name, data, body } => {
+                    let next_dot = match data {
+                        Some(expr) => self.eval_expr(expr, root, dot, scopes)?,
+                        None => dot.clone(),
+                    };
+
+                    if self.templates.contains_key(name) {
+                        let mut template_scopes = vec![HashMap::new()];
+                        self.render_named(name, root, &next_dot, &mut template_scopes, output)?;
+                    } else {
+                        push_scope(scopes);
+                        self.render_nodes(body, root, &next_dot, scopes, output)?;
+                        pop_scope(scopes);
+                    }
                 }
                 Node::Define { .. } => {}
             }
@@ -381,7 +456,13 @@ impl Template {
         Ok(())
     }
 
-    fn eval_expr(&self, expr: &Expr, root: &Value, dot: &Value) -> Result<Value> {
+    fn eval_expr(
+        &self,
+        expr: &Expr,
+        root: &Value,
+        dot: &Value,
+        scopes: &ScopeStack,
+    ) -> Result<Value> {
         let mut piped: Option<Value> = None;
 
         for (index, command) in expr.commands.iter().enumerate() {
@@ -392,12 +473,12 @@ impl Template {
                             "pipeline command must be a function".to_string(),
                         ));
                     }
-                    piped = Some(self.eval_term(term, root, dot)?);
+                    piped = Some(self.eval_term(term, root, dot, scopes)?);
                 }
                 Command::Call { name, args } => {
                     let mut evaluated_args = args
                         .iter()
-                        .map(|arg| self.eval_term(arg, root, dot))
+                        .map(|arg| self.eval_term(arg, root, dot, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
                     if index > 0 {
@@ -418,11 +499,23 @@ impl Template {
         piped.ok_or_else(|| TemplateError::Render("empty expression".to_string()))
     }
 
-    fn eval_term(&self, term: &Term, root: &Value, dot: &Value) -> Result<Value> {
+    fn eval_term(
+        &self,
+        term: &Term,
+        root: &Value,
+        dot: &Value,
+        scopes: &ScopeStack,
+    ) -> Result<Value> {
         match term {
             Term::DotPath(path) => Ok(lookup_path(dot, path)),
             Term::RootPath(path) => Ok(lookup_path(root, path)),
             Term::Literal(value) => Ok(value.clone()),
+            Term::Variable { name, path } => {
+                let variable = lookup_variable(scopes, name).ok_or_else(|| {
+                    TemplateError::Render(format!("variable `${name}` could not be resolved"))
+                })?;
+                Ok(lookup_path(&variable, path))
+            }
             Term::Identifier(name) => lookup_identifier(dot, root, name).ok_or_else(|| {
                 TemplateError::Render(format!("identifier `{name}` could not be resolved"))
             }),
@@ -434,12 +527,18 @@ impl Template {
 enum Node {
     Text(String),
     Expr(Expr),
+    SetVar {
+        name: String,
+        value: Expr,
+        declare: bool,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Node>,
         else_branch: Vec<Node>,
     },
     Range {
+        vars: Vec<String>,
         iterable: Expr,
         body: Vec<Node>,
         else_branch: Vec<Node>,
@@ -452,6 +551,11 @@ enum Node {
     TemplateCall {
         name: String,
         data: Option<Expr>,
+    },
+    Block {
+        name: String,
+        data: Option<Expr>,
+        body: Vec<Node>,
     },
     Define {
         name: String,
@@ -474,6 +578,7 @@ enum Command {
 enum Term {
     DotPath(Vec<String>),
     RootPath(Vec<String>),
+    Variable { name: String, path: Vec<String> },
     Literal(Value),
     Identifier(String),
 }
@@ -587,6 +692,81 @@ fn builtin_funcs() -> FuncMap {
     );
 
     funcs.insert(
+        "lt".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.len() != 2 {
+                return Err(TemplateError::Render(
+                    "lt expects exactly two arguments".to_string(),
+                ));
+            }
+            Ok(Value::from(
+                compare_values(&args[0], &args[1])? == Ordering::Less,
+            ))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "le".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.len() != 2 {
+                return Err(TemplateError::Render(
+                    "le expects exactly two arguments".to_string(),
+                ));
+            }
+            let ordering = compare_values(&args[0], &args[1])?;
+            Ok(Value::from(
+                ordering == Ordering::Less || ordering == Ordering::Equal,
+            ))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "gt".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.len() != 2 {
+                return Err(TemplateError::Render(
+                    "gt expects exactly two arguments".to_string(),
+                ));
+            }
+            Ok(Value::from(
+                compare_values(&args[0], &args[1])? == Ordering::Greater,
+            ))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "ge".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.len() != 2 {
+                return Err(TemplateError::Render(
+                    "ge expects exactly two arguments".to_string(),
+                ));
+            }
+            let ordering = compare_values(&args[0], &args[1])?;
+            Ok(Value::from(
+                ordering == Ordering::Greater || ordering == Ordering::Equal,
+            ))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "index".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.len() < 2 {
+                return Err(TemplateError::Render(
+                    "index expects at least two arguments".to_string(),
+                ));
+            }
+
+            let mut current = args[0].clone();
+            for key in &args[1..] {
+                current = index_value(&current, key)?;
+            }
+            Ok(current)
+        }) as Function,
+    );
+
+    funcs.insert(
         "and".to_string(),
         Arc::new(|args: &[Value]| {
             if args.is_empty() {
@@ -633,6 +813,113 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+fn compare_values(left: &Value, right: &Value) -> Result<Ordering> {
+    if let (Some(left_number), Some(right_number)) = (numeric_value(left), numeric_value(right)) {
+        return left_number.partial_cmp(&right_number).ok_or_else(|| {
+            TemplateError::Render("comparison with NaN is not supported".to_string())
+        });
+    }
+
+    if let (Some(left_string), Some(right_string)) = (string_value(left), string_value(right)) {
+        return Ok(left_string.cmp(&right_string));
+    }
+
+    if let (Some(left_bool), Some(right_bool)) = (bool_value(left), bool_value(right)) {
+        return Ok(left_bool.cmp(&right_bool));
+    }
+
+    Err(TemplateError::Render(format!(
+        "cannot compare values `{}` and `{}`",
+        left.to_plain_string(),
+        right.to_plain_string()
+    )))
+}
+
+fn numeric_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Json(JsonValue::Number(number)) => number.as_f64(),
+        _ => None,
+    }
+}
+
+fn string_value(value: &Value) -> Option<String> {
+    match value {
+        Value::SafeHtml(text) => Some(text.clone()),
+        Value::Json(JsonValue::String(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn bool_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Json(JsonValue::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn index_value(container: &Value, index: &Value) -> Result<Value> {
+    match container {
+        Value::Json(JsonValue::Array(items)) => {
+            let index = index_to_usize(index)?;
+            let value = items.get(index).ok_or_else(|| {
+                TemplateError::Render(format!("array index out of range: {index}"))
+            })?;
+            Ok(Value::Json(value.clone()))
+        }
+        Value::Json(JsonValue::Object(map)) => {
+            let key = index.to_plain_string();
+            let value = map
+                .get(&key)
+                .ok_or_else(|| TemplateError::Render(format!("map key `{key}` is not present")))?;
+            Ok(Value::Json(value.clone()))
+        }
+        Value::Json(JsonValue::String(text)) => {
+            let index = index_to_usize(index)?;
+            let value = text.chars().nth(index).ok_or_else(|| {
+                TemplateError::Render(format!("string index out of range: {index}"))
+            })?;
+            Ok(Value::from(value.to_string()))
+        }
+        Value::SafeHtml(text) => {
+            let index = index_to_usize(index)?;
+            let value = text.chars().nth(index).ok_or_else(|| {
+                TemplateError::Render(format!("string index out of range: {index}"))
+            })?;
+            Ok(Value::from(value.to_string()))
+        }
+        _ => Err(TemplateError::Render(
+            "index supports array, map, or string".to_string(),
+        )),
+    }
+}
+
+fn index_to_usize(value: &Value) -> Result<usize> {
+    match value {
+        Value::Json(JsonValue::Number(number)) => {
+            if let Some(index) = number.as_u64() {
+                return Ok(index as usize);
+            }
+            if let Some(index) = number.as_i64() {
+                if index < 0 {
+                    return Err(TemplateError::Render(
+                        "index must be non-negative".to_string(),
+                    ));
+                }
+                return Ok(index as usize);
+            }
+            Err(TemplateError::Render(
+                "index must be an integer".to_string(),
+            ))
+        }
+        Value::Json(JsonValue::String(value)) => value
+            .parse::<usize>()
+            .map_err(|_| TemplateError::Render(format!("index `{value}` is not a valid integer"))),
+        _ => Err(TemplateError::Render(
+            "index argument must be an integer".to_string(),
+        )),
+    }
+}
+
 fn lookup_path(base: &Value, path: &[String]) -> Value {
     if path.is_empty() {
         return base.clone();
@@ -667,6 +954,48 @@ fn lookup_path(base: &Value, path: &[String]) -> Value {
 
 fn lookup_identifier(dot: &Value, root: &Value, name: &str) -> Option<Value> {
     lookup_object_key(dot, name).or_else(|| lookup_object_key(root, name))
+}
+
+fn lookup_variable(scopes: &ScopeStack, name: &str) -> Option<Value> {
+    for scope in scopes.iter().rev() {
+        if let Some(value) = scope.get(name) {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn declare_variable(scopes: &mut ScopeStack, name: &str, value: Value) {
+    if scopes.is_empty() {
+        scopes.push(HashMap::new());
+    }
+    if let Some(scope) = scopes.last_mut() {
+        scope.insert(name.to_string(), value);
+    }
+}
+
+fn assign_variable(scopes: &mut ScopeStack, name: &str, value: Value) -> Result<()> {
+    for scope in scopes.iter_mut().rev() {
+        if scope.contains_key(name) {
+            scope.insert(name.to_string(), value);
+            return Ok(());
+        }
+    }
+
+    Err(TemplateError::Render(format!(
+        "variable `${name}` is not declared"
+    )))
+}
+
+fn push_scope(scopes: &mut ScopeStack) {
+    scopes.push(HashMap::new());
+}
+
+fn pop_scope(scopes: &mut ScopeStack) {
+    let _ = scopes.pop();
+    if scopes.is_empty() {
+        scopes.push(HashMap::new());
+    }
 }
 
 fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
@@ -791,10 +1120,11 @@ fn parse_nodes(
                             ));
                         }
                         *index += 1;
-                        let iterable = parse_expression(tail)?;
+                        let (vars, iterable) = parse_range_clause(tail)?;
                         let (body, else_branch) =
                             parse_optional_else_block(tokens, index, "range")?;
                         nodes.push(Node::Range {
+                            vars,
                             iterable,
                             body,
                             else_branch,
@@ -835,12 +1165,36 @@ fn parse_nodes(
                         nodes.push(Node::TemplateCall { name, data });
                         *index += 1;
                     }
+                    "block" => {
+                        if tail.is_empty() {
+                            return Err(TemplateError::Parse(
+                                "block requires a template name".to_string(),
+                            ));
+                        }
+                        let (name, data) = parse_template_call(tail)?;
+                        *index += 1;
+                        let (body, stop) = parse_nodes(tokens, index, &["end"])?;
+                        match stop {
+                            Some(stop) if stop.keyword == "end" => {
+                                nodes.push(Node::Block { name, data, body });
+                            }
+                            _ => {
+                                return Err(TemplateError::Parse(
+                                    "block is missing `end`".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     "else" | "end" => {
                         return Err(TemplateError::Parse(format!("unexpected `{head}`")));
                     }
                     _ => {
-                        let expr = parse_expression(action)?;
-                        nodes.push(Node::Expr(expr));
+                        if let Some(set_var) = parse_variable_assignment_action(action)? {
+                            nodes.push(set_var);
+                        } else {
+                            let expr = parse_expression(action)?;
+                            nodes.push(Node::Expr(expr));
+                        }
                         *index += 1;
                     }
                 }
@@ -962,6 +1316,130 @@ fn parse_template_call(input: &str) -> Result<(String, Option<Expr>)> {
         Some(parse_expression(tail)?)
     };
     Ok((name, data))
+}
+
+fn parse_range_clause(input: &str) -> Result<(Vec<String>, Expr)> {
+    if let Some(index) = find_unquoted_operator(input, ":=") {
+        let variables = input[..index].trim();
+        let expression = input[index + 2..].trim();
+        if variables.is_empty() || expression.is_empty() {
+            return Err(TemplateError::Parse(
+                "range variable declaration must be `<vars> := <expr>`".to_string(),
+            ));
+        }
+
+        let vars = parse_variable_list(variables, 2)?;
+        let iterable = parse_expression(expression)?;
+        return Ok((vars, iterable));
+    }
+
+    Ok((Vec::new(), parse_expression(input)?))
+}
+
+fn parse_variable_assignment_action(action: &str) -> Result<Option<Node>> {
+    let declaration_index = find_unquoted_operator(action, ":=");
+    let (index, declare) = match declaration_index {
+        Some(index) => (index, true),
+        None => match find_unquoted_operator(action, "=") {
+            Some(index) => (index, false),
+            None => return Ok(None),
+        },
+    };
+
+    let variable = action[..index].trim();
+    let expression = if declare {
+        action[index + 2..].trim()
+    } else {
+        action[index + 1..].trim()
+    };
+
+    if variable.is_empty() || expression.is_empty() {
+        return Err(TemplateError::Parse(
+            "variable assignment must be `$name := <expr>` or `$name = <expr>`".to_string(),
+        ));
+    }
+
+    let name = parse_variable_name(variable)?;
+    let value = parse_expression(expression)?;
+    Ok(Some(Node::SetVar {
+        name,
+        value,
+        declare,
+    }))
+}
+
+fn parse_variable_list(input: &str, max_len: usize) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for raw in input.split(',') {
+        names.push(parse_variable_name(raw.trim())?);
+    }
+
+    if names.is_empty() || names.len() > max_len {
+        return Err(TemplateError::Parse(format!(
+            "expected between 1 and {max_len} variables"
+        )));
+    }
+    Ok(names)
+}
+
+fn parse_variable_name(input: &str) -> Result<String> {
+    if !input.starts_with('$') {
+        return Err(TemplateError::Parse(format!(
+            "variable `{input}` must start with `$`"
+        )));
+    }
+    if input == "$" || input.contains('.') {
+        return Err(TemplateError::Parse(format!(
+            "invalid variable name `{input}`"
+        )));
+    }
+
+    let name = &input[1..];
+    if !is_identifier(name) {
+        return Err(TemplateError::Parse(format!(
+            "invalid variable name `{input}`"
+        )));
+    }
+    Ok(name.to_string())
+}
+
+fn find_unquoted_operator(input: &str, operator: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if active_quote == '`' {
+                if ch == '`' {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' || ch == '`' {
+            quote = Some(ch);
+            continue;
+        }
+
+        if input[index..].starts_with(operator) {
+            return Some(index);
+        }
+    }
+
+    None
 }
 
 fn parse_quoted_name(input: &str) -> Result<String> {
@@ -1153,6 +1631,10 @@ fn parse_term(token: &str) -> Result<Term> {
     if let Some(path) = token.strip_prefix('.') {
         return Ok(Term::DotPath(parse_path(path)));
     }
+    if let Some(reference) = token.strip_prefix('$') {
+        let (name, path) = parse_variable_reference(reference)?;
+        return Ok(Term::Variable { name, path });
+    }
 
     if token.starts_with('"') || token.starts_with('\'') || token.starts_with('`') {
         let (text, consumed) = parse_string_literal_prefix(token)?;
@@ -1191,6 +1673,28 @@ fn parse_term(token: &str) -> Result<Term> {
     Err(TemplateError::Parse(format!(
         "unsupported token `{token}` in expression"
     )))
+}
+
+fn parse_variable_reference(reference: &str) -> Result<(String, Vec<String>)> {
+    if reference.is_empty() {
+        return Err(TemplateError::Parse(
+            "invalid variable reference `$`".to_string(),
+        ));
+    }
+
+    let (name, path) = if let Some((name, tail)) = reference.split_once('.') {
+        (name, parse_path(tail))
+    } else {
+        (reference, Vec::new())
+    };
+
+    if !is_identifier(name) {
+        return Err(TemplateError::Parse(format!(
+            "invalid variable reference `${reference}`"
+        )));
+    }
+
+    Ok((name.to_string(), path))
 }
 
 fn parse_path(raw_path: &str) -> Vec<String> {
@@ -1430,5 +1934,99 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<ul><li>x</li><li>&lt;y&gt;</li></ul>");
+    }
+
+    #[test]
+    fn variable_declaration_assignment_and_lookup_work() {
+        let template = Template::new("vars")
+            .parse("{{$x := .Name}}{{$x}}/{{$x = \"bob\"}}{{$x}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "<alice>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "&lt;alice&gt;/bob");
+    }
+
+    #[test]
+    fn variables_are_scoped_to_their_control_block() {
+        let template = Template::new("scope")
+            .parse("{{$x := \"root\"}}{{if true}}{{$x := \"inner\"}}{{end}}{{$x}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "root");
+    }
+
+    #[test]
+    fn range_supports_go_style_variable_declaration() {
+        let template = Template::new("range")
+            .parse("{{range $i, $v := .Items}}{{$i}}={{$v}};{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": ["a", "<b>"]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "0=a;1=&lt;b&gt;;");
+    }
+
+    #[test]
+    fn template_call_does_not_inherit_variables() {
+        let template = Template::new("root")
+            .parse("{{$x := \"root\"}}{{define \"child\"}}{{$x}}{{end}}{{template \"child\" .}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+
+        assert!(error.to_string().contains("variable `$x`"));
+    }
+
+    #[test]
+    fn block_supports_default_and_override_template() {
+        let default_template = Template::new("page")
+            .parse(
+                "{{define \"base\"}}<body>{{block \"content\" .}}Default{{end}}</body>{{end}}{{template \"base\" .}}",
+            )
+            .expect("parse should succeed");
+        let default_output = default_template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(default_output, "<body>Default</body>");
+
+        let overridden_template = Template::new("page")
+            .parse(
+                "{{define \"content\"}}<p>{{.Msg}}</p>{{end}}{{define \"base\"}}<body>{{block \"content\" .}}Default{{end}}</body>{{end}}{{template \"base\" .}}",
+            )
+            .expect("parse should succeed");
+        let overridden_output = overridden_template
+            .execute_to_string(&json!({"Msg": "Hi"}))
+            .expect("execute should succeed");
+        assert_eq!(overridden_output, "<body><p>Hi</p></body>");
+    }
+
+    #[test]
+    fn index_and_comparison_functions_work() {
+        let template = Template::new("funcs")
+            .parse("{{index .Items 1}}|{{index .Map \"k\"}}|{{index .Nested \"a\" 0}}|{{lt .A .B}}/{{ge .B .A}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "Items": ["x", "<y>"],
+                "Map": {"k": "v"},
+                "Nested": {"a": ["<z>"]},
+                "A": 1,
+                "B": 2
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "&lt;y&gt;|v|&lt;z&gt;|true/true");
     }
 }

@@ -6,13 +6,15 @@ Go の `html/template` に近い使い方を Rust で提供するクレートで
 
 - `Template::new(...).parse(...).execute(...)` の API
 - `{{.}}`, `{{.Field}}`, `{{$}}`, `{{$.Field}}`
+- `{{$x := ...}}`, `{{$x = ...}}`, `{{$x}}`, `{{$x.Field}}`
 - `{{if}}`, `{{else}}`, `{{else if}}`, `{{end}}`
-- `{{range}} ... {{else}} ... {{end}}`
+- `{{range}} ... {{else}} ... {{end}}` / `{{range $i, $v := ...}}`
 - `{{with}} ... {{else}} ... {{end}}`
 - `{{define "name"}} ... {{end}}` と `{{template "name" .}}`
+- `{{block "name" .}} default {{end}}`
 - パイプライン (`{{.Name | upper}}`)
 - HTML 自動エスケープ（`& < > " '`）
-- `safe_html` / `html` / `len` / `not` / `eq` / `ne` / `and` / `or` / `print`
+- `safe_html` / `html` / `len` / `index` / `not` / `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `and` / `or` / `print`
 - `parse_files` / `parse_glob`
 
 ## Usage
@@ -55,5 +57,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Status
 
-Go `html/template` の全機能（文脈依存エスケープ、メソッド解決、変数束縛、関数群の完全互換など）を完全再現したものではなく、
+Go `html/template` の全機能（文脈依存エスケープ、メソッド解決、組み込み関数の完全互換など）を完全再現したものではなく、
 「同等の使い方」で実用しやすい主要機能を Rust で提供する実装です。
