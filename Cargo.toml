@@ -1,0 +1,15 @@
+[package]
+name = "go_html_template"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust crate with Go html/template-like API and behavior"
+license = "MIT"
+
+[dependencies]
+glob = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
