@@ -13,8 +13,8 @@ Go の `html/template` に近い使い方を Rust で提供するクレートで
 - `{{define "name"}} ... {{end}}` と `{{template "name" .}}`
 - `{{block "name" .}} default {{end}}`
 - パイプライン (`{{.Name | upper}}`)
-- HTML 自動エスケープ（`& < > " '`）
-- `safe_html` / `html` / `len` / `index` / `not` / `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `and` / `or` / `print`
+- 文脈依存エスケープ（HTML本文 / 属性値 / URL属性 / `<script>`）
+- `safe_html` / `html` / `urlquery` / `len` / `index` / `not` / `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `and` / `or` / `print`
 - `parse_files` / `parse_glob`
 
 ## Usage

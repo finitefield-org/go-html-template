@@ -79,13 +79,6 @@ impl Value {
         }
     }
 
-    fn html_output(&self) -> String {
-        match self {
-            Value::SafeHtml(value) => value.clone(),
-            Value::Json(_) => escape_html(&self.to_plain_string()),
-        }
-    }
-
     fn iter_pairs(&self) -> Vec<(Value, Value)> {
         match self {
             Value::Json(JsonValue::Array(items)) => items
@@ -354,7 +347,8 @@ impl Template {
                 Node::Text(text) => output.push_str(text),
                 Node::Expr(expr) => {
                     let value = self.eval_expr(expr, root, dot, scopes)?;
-                    output.push_str(&value.html_output());
+                    let mode = infer_escape_mode(output);
+                    output.push_str(&escape_value_for_mode(&value, mode)?);
                 }
                 Node::SetVar {
                     name,
@@ -611,6 +605,20 @@ fn builtin_funcs() -> FuncMap {
         Arc::new(|args: &[Value]| {
             let value = args.first().map(Value::to_plain_string).unwrap_or_default();
             Ok(Value::safe_html(escape_html(&value)))
+        }) as Function,
+    );
+
+    funcs.insert(
+        "urlquery".to_string(),
+        Arc::new(|args: &[Value]| {
+            if args.is_empty() {
+                return Ok(Value::from(String::new()));
+            }
+            let mut combined = String::new();
+            for arg in args {
+                combined.push_str(&arg.to_plain_string());
+            }
+            Ok(Value::from(percent_encode_url(&combined)))
         }) as Function,
     );
 
@@ -1772,6 +1780,297 @@ fn parse_string_literal_prefix(input: &str) -> Result<(String, usize)> {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeMode {
+    Html,
+    AttrQuoted { url_like: bool },
+    AttrUnquoted { url_like: bool },
+    Script,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TagValueContext {
+    attr_name: String,
+    quoted: bool,
+}
+
+fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
+    if let Value::SafeHtml(raw) = value {
+        return Ok(raw.clone());
+    }
+
+    match mode {
+        EscapeMode::Html => Ok(escape_html(&value.to_plain_string())),
+        EscapeMode::AttrQuoted { url_like } => {
+            let text = if url_like {
+                percent_encode_url(&value.to_plain_string())
+            } else {
+                value.to_plain_string()
+            };
+            Ok(escape_html(&text))
+        }
+        EscapeMode::AttrUnquoted { url_like } => {
+            let text = if url_like {
+                percent_encode_url(&value.to_plain_string())
+            } else {
+                value.to_plain_string()
+            };
+            Ok(escape_attr_unquoted(&text))
+        }
+        EscapeMode::Script => escape_script_value(value),
+    }
+}
+
+fn infer_escape_mode(rendered: &str) -> EscapeMode {
+    if let Some(context) = current_tag_value_context(rendered) {
+        let url_like = is_url_attribute(&context.attr_name);
+        return if context.quoted {
+            EscapeMode::AttrQuoted { url_like }
+        } else {
+            EscapeMode::AttrUnquoted { url_like }
+        };
+    }
+
+    if in_script_text_context(rendered) {
+        return EscapeMode::Script;
+    }
+
+    EscapeMode::Html
+}
+
+fn current_tag_value_context(rendered: &str) -> Option<TagValueContext> {
+    let last_gt = rendered.rfind('>');
+    let last_lt = rendered.rfind('<')?;
+    if let Some(last_gt) = last_gt {
+        if last_gt > last_lt {
+            return None;
+        }
+    }
+
+    let fragment = &rendered[last_lt + 1..];
+    parse_open_tag_value_context(fragment)
+}
+
+fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
+    let chars: Vec<char> = fragment.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let mut i = 0usize;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return None;
+    }
+    if chars[i] == '/' || chars[i] == '!' || chars[i] == '?' {
+        return None;
+    }
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() || ch == '/' || ch == '>' {
+            break;
+        }
+        i += 1;
+    }
+
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] == '/' || chars[i] == '>' {
+            break;
+        }
+
+        let attr_start = i;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch.is_whitespace() || ch == '=' || ch == '/' || ch == '>' {
+                break;
+            }
+            i += 1;
+        }
+        if i <= attr_start {
+            break;
+        }
+        let attr_name: String = chars[attr_start..i].iter().collect();
+
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != '=' {
+            continue;
+        }
+        i += 1;
+
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return Some(TagValueContext {
+                attr_name,
+                quoted: false,
+            });
+        }
+
+        let quote = chars[i];
+        if quote == '"' || quote == '\'' {
+            i += 1;
+            let value_start = i;
+            while i < chars.len() && chars[i] != quote {
+                i += 1;
+            }
+            if i >= chars.len() {
+                let partial: String = chars[value_start..].iter().collect();
+                if partial.is_empty() || !partial.ends_with("}}") {
+                    return Some(TagValueContext {
+                        attr_name,
+                        quoted: true,
+                    });
+                }
+                return None;
+            }
+            i += 1;
+        } else {
+            let value_start = i;
+            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
+                i += 1;
+            }
+            if i >= chars.len() {
+                let partial: String = chars[value_start..].iter().collect();
+                if partial.is_empty() || !partial.ends_with("}}") {
+                    return Some(TagValueContext {
+                        attr_name,
+                        quoted: false,
+                    });
+                }
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+fn is_url_attribute(attr_name: &str) -> bool {
+    matches!(
+        attr_name.to_ascii_lowercase().as_str(),
+        "href" | "src" | "action" | "formaction" | "poster" | "data" | "srcset"
+    )
+}
+
+fn in_script_text_context(rendered: &str) -> bool {
+    let lower = rendered.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    let mut in_script = false;
+
+    while cursor < lower.len() {
+        if !in_script {
+            let Some(relative) = lower[cursor..].find("<script") else {
+                break;
+            };
+            let index = cursor + relative;
+            let rest = &lower[index + "<script".len()..];
+            let Some(next) = rest.chars().next() else {
+                break;
+            };
+            if !(next.is_whitespace() || next == '>' || next == '/') {
+                cursor = index + "<script".len();
+                continue;
+            }
+
+            let Some(close_relative) = lower[index..].find('>') else {
+                break;
+            };
+            cursor = index + close_relative + 1;
+            in_script = true;
+        } else {
+            let Some(relative) = lower[cursor..].find("</script") else {
+                return true;
+            };
+            let index = cursor + relative;
+            let Some(close_relative) = lower[index..].find('>') else {
+                return true;
+            };
+            cursor = index + close_relative + 1;
+            in_script = false;
+        }
+    }
+
+    in_script
+}
+
+fn escape_script_value(value: &Value) -> Result<String> {
+    match value {
+        Value::SafeHtml(raw) => Ok(raw.clone()),
+        Value::Json(json) => {
+            let encoded = serde_json::to_string(json)?;
+            Ok(sanitize_json_for_script(&encoded))
+        }
+    }
+}
+
+fn sanitize_json_for_script(input: &str) -> String {
+    input
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+fn escape_attr_unquoted(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&#34;"),
+            '\'' => escaped.push_str("&#39;"),
+            '`' => escaped.push_str("&#96;"),
+            '=' => escaped.push_str("&#61;"),
+            ' ' => escaped.push_str("&#32;"),
+            '\n' => escaped.push_str("&#10;"),
+            '\r' => escaped.push_str("&#13;"),
+            '\t' => escaped.push_str("&#9;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn percent_encode_url(input: &str) -> String {
+    let mut encoded = String::new();
+    for &byte in input.as_bytes() {
+        if is_unreserved_url_byte(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(hex_upper((byte >> 4) & 0x0F));
+            encoded.push(hex_upper(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
+fn is_unreserved_url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn hex_upper(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => '0',
+    }
+}
+
 fn escape_html(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -2028,5 +2327,66 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "&lt;y&gt;|v|&lt;z&gt;|true/true");
+    }
+
+    #[test]
+    fn attribute_context_uses_attribute_escaping() {
+        let template = Template::new("attr")
+            .parse("<div data-v={{.Value}} title=\"{{.Title}}\"></div>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Value": "a b=<x>", "Title": "\"q\" & <t>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<div data-v=a&#32;b&#61;&lt;x&gt; title=\"&quot;q&quot; &amp; &lt;t&gt;\"></div>"
+        );
+    }
+
+    #[test]
+    fn url_attribute_context_percent_encodes_values() {
+        let template = Template::new("url")
+            .parse("<a href=\"{{.URL}}\">go</a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"URL": "https://example.com/q?a=b c&x=<y>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<a href=\"https%3A%2F%2Fexample.com%2Fq%3Fa%3Db%20c%26x%3D%3Cy%3E\">go</a>"
+        );
+    }
+
+    #[test]
+    fn script_context_emits_json_escaped_literals() {
+        let template = Template::new("script")
+            .parse("<script>const x = {{.X}}; const y = {{.Y}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>", "Y": {"a": "<b>"}}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>const x = \"\\u003ctag\\u003e\"; const y = {\"a\":\"\\u003cb\\u003e\"};</script>"
+        );
+    }
+
+    #[test]
+    fn urlquery_function_matches_percent_encoding_behavior() {
+        let template = Template::new("urlquery")
+            .parse("{{urlquery .Query}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Query": "a=b c&x=<y>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "a%3Db%20c%26x%3D%3Cy%3E");
     }
 }
