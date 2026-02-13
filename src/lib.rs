@@ -1273,12 +1273,33 @@ impl Template {
                         .map(|arg| self.eval_term(arg, root, dot, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
-                    if index > 0 {
-                        let value = piped.take().ok_or_else(|| {
-                            TemplateError::Render("pipeline is missing input value".to_string())
-                        })?;
-                        evaluated_args.push(value);
-                    }
+                        if index > 0 {
+                            let value = piped.take().ok_or_else(|| {
+                                TemplateError::Render("pipeline is missing input value".to_string())
+                            })?;
+                            evaluated_args.push(value);
+                        }
+
+                        if index == 0 && evaluated_args.is_empty() {
+                            let methods = self.name_space.methods.read().unwrap();
+                            let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                            if let Some(value) =
+                                lookup_identifier(dot, root, name, &methods, missing_key_mode)?
+                            {
+                                piped = Some(value);
+                                continue;
+                            }
+
+                            let funcs = self.name_space.funcs.read().unwrap();
+                            if !funcs.contains_key(name) {
+                                if matches!(dot, Value::Json(JsonValue::Object(_)))
+                                    || matches!(root, Value::Json(JsonValue::Object(_)))
+                                {
+                                    piped = Some(missing_value_for_key(name, missing_key_mode)?);
+                                    continue;
+                                }
+                            }
+                        }
 
                     if name == "call" {
                         piped = Some(self.eval_call_function(&evaluated_args)?);
@@ -1341,18 +1362,14 @@ impl Template {
             Term::Identifier(name) => {
                 let methods = self.name_space.methods.read().unwrap();
                 let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                if let Some(value) =
-                    lookup_identifier(dot, root, name, &methods, missing_key_mode)?
-                {
+                if let Some(value) = lookup_identifier(dot, root, name, &methods, missing_key_mode)? {
                     Ok(value)
-                } else if self
-                    .name_space
-                    .funcs
-                    .read()
-                    .unwrap()
-                    .contains_key(name)
-                {
+                } else if self.name_space.funcs.read().unwrap().contains_key(name) {
                     Ok(Value::FunctionRef(name.clone()))
+                } else if matches!(dot, Value::Json(JsonValue::Object(_)))
+                    || matches!(root, Value::Json(JsonValue::Object(_)))
+                {
+                    missing_value_for_key(name, missing_key_mode)
                 } else {
                     Err(TemplateError::Render(format!(
                         "identifier `{name}` could not be resolved"
@@ -2177,7 +2194,7 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
         EscapeMode::ScriptExpr => "<script>".to_string(),
         EscapeMode::ScriptString { quote } => format!("<script>{quote}"),
         EscapeMode::ScriptTemplate => "<script>`".to_string(),
-        EscapeMode::ScriptRegexp => "<script>/".to_string(),
+        EscapeMode::ScriptRegexp => "<script>/x".to_string(),
         EscapeMode::ScriptLineComment => "<script>//".to_string(),
         EscapeMode::ScriptBlockComment => "<script>/*".to_string(),
         EscapeMode::StyleExpr => "<style>".to_string(),
@@ -5056,6 +5073,19 @@ fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option
             content_start = Some(start);
             cursor = start;
         } else {
+            if tag_name == "script" {
+                let start = content_start?;
+                if let Some(close_start) = find_close_tag(rendered, start, b"script") {
+                    let close_end =
+                        html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                    cursor = close_end;
+                    content_start = None;
+                    continue;
+                }
+
+                return Some(&rendered[start..]);
+            }
+
             let Some(relative) = lower[cursor..].find(&close_pattern) else {
                 let start = content_start?;
                 return Some(&rendered[start..]);
@@ -5253,8 +5283,16 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                         js_ctx,
                     }
                 } else if bytes[i] == b'/' && !in_char_class {
-                    i += 1;
-                    JsScanState::Expr { js_ctx }
+                    if is_script_tag_close_in_regexp(bytes, i) {
+                        i += 1;
+                        JsScanState::RegExp {
+                            in_char_class,
+                            js_ctx,
+                        }
+                    } else {
+                        i += 1;
+                        JsScanState::Expr { js_ctx }
+                    }
                 } else {
                     i += 1;
                     JsScanState::RegExp {
@@ -5499,9 +5537,18 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                         js_ctx,
                     }
                 } else if bytes[i] == b'/' && !in_char_class {
-                    output.push('/');
-                    i += 1;
-                    JsScanState::Expr { js_ctx }
+                    if is_script_tag_close_in_regexp(bytes, i) {
+                        output.push('/');
+                        i += 1;
+                        JsScanState::RegExp {
+                            in_char_class,
+                            js_ctx,
+                        }
+                    } else {
+                        output.push('/');
+                        i += 1;
+                        JsScanState::Expr { js_ctx }
+                    }
                 } else {
                     i += 1;
                     JsScanState::RegExp {
@@ -5690,6 +5737,10 @@ fn find_open_tag(content: &str, start: usize, tag: &[u8]) -> Option<usize> {
 }
 
 fn find_close_tag(content: &str, start: usize, tag: &[u8]) -> Option<usize> {
+    if tag == b"script" {
+        return find_script_close_tag(content, start);
+    }
+
     let bytes = content.as_bytes();
     if start >= bytes.len() {
         return None;
@@ -5703,6 +5754,318 @@ fn find_close_tag(content: &str, start: usize, tag: &[u8]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+
+    let mut state = JsScanState::Expr {
+        js_ctx: JsContext::RegExp,
+    };
+    let mut segment_start = start;
+    let mut i = start;
+
+    while i < bytes.len() {
+        state = match state {
+            JsScanState::Expr { js_ctx } => {
+                if is_html_close_tag(bytes, i, b"script") {
+                    return Some(i);
+                }
+
+                let ch = bytes[i];
+                match ch {
+                    b'\'' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::SingleQuote
+                    }
+                    b'"' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::DoubleQuote
+                    }
+                    b'`' => {
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::TemplateLiteral
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::LineComment {
+                            js_ctx,
+                            preserve_body: true,
+                            keep_terminator: true,
+                        }
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::BlockComment { js_ctx }
+                    }
+                    b'<' if i + 3 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 4;
+                        segment_start = i;
+                        JsScanState::LineComment {
+                            js_ctx,
+                            preserve_body: false,
+                            keep_terminator: true,
+                        }
+                    }
+                    b'-'
+                        if i + 2 <= bytes.len()
+                            && &bytes[i..i + 3] == b"-->" =>
+                    {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 3;
+                        segment_start = i;
+                        JsScanState::LineComment {
+                            js_ctx,
+                            preserve_body: false,
+                            keep_terminator: true,
+                        }
+                    }
+                    b'#' if i + 1 < bytes.len() && bytes[i + 1] == b'!' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::LineComment {
+                            js_ctx,
+                            preserve_body: false,
+                            keep_terminator: true,
+                        }
+                    }
+                    b'/' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        if js_ctx == JsContext::RegExp {
+                            i += 1;
+                            segment_start = i;
+                            JsScanState::RegExp {
+                                in_char_class: false,
+                                js_ctx,
+                            }
+                        } else {
+                            i += 1;
+                            segment_start = i;
+                            JsScanState::Expr { js_ctx }
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                        JsScanState::Expr { js_ctx }
+                    }
+                }
+            }
+            JsScanState::SingleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::SingleQuote
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else {
+                    i += 1;
+                    JsScanState::SingleQuote
+                }
+            }
+            JsScanState::DoubleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::DoubleQuote
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else {
+                    i += 1;
+                    JsScanState::DoubleQuote
+                }
+            }
+            JsScanState::RegExp {
+                mut in_char_class,
+                js_ctx,
+            } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'[' {
+                    in_char_class = true;
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b']' {
+                    in_char_class = false;
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'/' && !in_char_class {
+                    if is_script_tag_close_in_regexp(bytes, i) {
+                        i += 1;
+                        JsScanState::RegExp {
+                            in_char_class,
+                            js_ctx,
+                        }
+                    } else {
+                        i += 1;
+                        JsScanState::Expr { js_ctx }
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                }
+            }
+            JsScanState::TemplateLiteral => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::TemplateLiteral
+                } else if bytes[i] == b'`' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    i += 2;
+                    JsScanState::TemplateExpr {
+                        brace_depth: 1,
+                        js_ctx: JsContext::DivOp,
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::TemplateLiteral
+                }
+            }
+            JsScanState::TemplateExpr {
+                mut brace_depth,
+                js_ctx,
+            } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'{' {
+                    brace_depth += 1;
+                    i += 1;
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'}' {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    }
+                    i += 1;
+                    if brace_depth == 0 {
+                        JsScanState::TemplateLiteral
+                    } else {
+                        JsScanState::TemplateExpr {
+                            brace_depth,
+                            js_ctx,
+                        }
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
+                }
+            }
+            JsScanState::LineComment {
+                js_ctx,
+                preserve_body: _,
+                keep_terminator: _,
+            } => {
+                if bytes[i] == b'\n' || bytes[i] == b'\r' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx }
+                } else if i + 2 < bytes.len() && bytes[i] == 0xE2 {
+                    let is_2028 = bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8;
+                    if (is_2028 || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9)) {
+                        i += 3;
+                        JsScanState::Expr { js_ctx }
+                    } else {
+                        i += 1;
+                        JsScanState::LineComment {
+                            js_ctx,
+                            preserve_body: true,
+                            keep_terminator: true,
+                        }
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::LineComment {
+                        js_ctx,
+                        preserve_body: true,
+                        keep_terminator: true,
+                    }
+                }
+            }
+            JsScanState::BlockComment { js_ctx } => {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    JsScanState::Expr { js_ctx }
+                } else {
+                    i += 1;
+                    JsScanState::BlockComment { js_ctx }
+                }
+            }
+        };
+    }
+
+    None
+}
+
+fn is_html_close_tag(bytes: &[u8], i: usize, tag: &[u8]) -> bool {
+    if i + 2 + tag.len() > bytes.len() {
+        return false;
+    }
+    if bytes[i] != b'<' || bytes[i + 1] != b'/' {
+        return false;
+    }
+    if !bytes[i + 2..i + 2 + tag.len()]
+        .iter()
+        .zip(tag.iter())
+        .all(|(lhs, rhs)| lhs.to_ascii_lowercase() == rhs.to_ascii_lowercase())
+    {
+        return false;
+    }
+
+    match bytes.get(i + 2 + tag.len()) {
+        None => true,
+        Some(&b' ') | Some(&b'\t') | Some(&b'\n') | Some(&b'\x0C') | Some(&b'\r')
+        | Some(&b'/') | Some(&b'>') => true,
+        Some(_) => false,
+    }
+}
+
+fn is_script_tag_close_in_regexp(bytes: &[u8], i: usize) -> bool {
+    if i == 0 || i + 7 > bytes.len() || bytes[i] != b'/' || bytes[i - 1] != b'<' {
+        return false;
+    }
+
+    let tag = b"</script";
+    bytes[i - 1..i + 7]
+        .iter()
+        .zip(tag.iter())
+        .all(|(lhs, rhs)| lhs.to_ascii_lowercase() == rhs.to_ascii_lowercase())
 }
 
 fn filter_html_text_sections(prefix: &str, text: &str) -> String {
@@ -6069,34 +6432,13 @@ fn normalize_url_for_attribute(input: &str) -> String {
 
 fn is_safe_url(input: &str) -> bool {
     let trimmed = input.trim();
-    let mut chars = trimmed.chars().peekable();
-    let mut scheme = String::new();
 
-    while let Some(ch) = chars.peek().copied() {
-        if ch == ':' {
-            if scheme.is_empty() {
-                return true;
-            }
-            let scheme = scheme.to_ascii_lowercase();
-            return !matches!(scheme.as_str(), "javascript" | "vbscript" | "data");
-        }
-        if ch == '/' || ch == '?' || ch == '#' {
-            return true;
-        }
-        if scheme.is_empty() {
-            if ch.is_ascii_alphabetic() {
-                scheme.push(ch);
-                chars.next();
-                continue;
-            }
-            return true;
-        }
-        if ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.' {
-            scheme.push(ch);
-            chars.next();
-            continue;
-        }
-        return true;
+    if let Some((scheme, _remainder)) = trimmed.split_once(':')
+        && !scheme.contains('/')
+    {
+        return scheme.eq_ignore_ascii_case("http")
+            || scheme.eq_ignore_ascii_case("https")
+            || scheme.eq_ignore_ascii_case("mailto");
     }
 
     true
@@ -7064,6 +7406,32 @@ mod tests {
     }
 
     #[test]
+    fn url_attribute_blocks_non_http_https_mailto_schemes() {
+        let template = Template::new("url")
+            .parse("<a href=\"{{.URL}}\">go</a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"URL": "tel:+1-212-555-1212"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<a href=\"#ZgotmplZ\">go</a>");
+    }
+
+    #[test]
+    fn url_attribute_allows_mailto_scheme() {
+        let template = Template::new("url")
+            .parse("<a href=\"{{.URL}}\">go</a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"URL": "mailto:alice@example.com"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<a href=\"mailto:alice@example.com\">go</a>");
+    }
+
+    #[test]
     fn namespaced_and_data_attributes_follow_go_like_context_rules() {
         let template = Template::new("attrs")
             .parse(
@@ -7268,6 +7636,38 @@ mod tests {
     }
 
     #[test]
+    fn script_template_context_keeps_script_state_with_mixed_case_close_tag() {
+        let template = Template::new("script")
+            .parse("<script>const s = `</SCRIPT>`; const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<x>"}))
+            .expect("execute to succeed");
+
+        assert_eq!(
+            output,
+            "<script>const s = `</SCRIPT>`; const x = \"\\u003cx\\u003e\";</script>"
+        );
+    }
+
+    #[test]
+    fn script_context_keeps_script_state_for_literals_with_close_tag() {
+        let template = Template::new("script")
+            .parse("<script>const s = \"</script>\"; const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<x>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>const s = \"</script>\"; const x = \"\\u003cx\\u003e\";</script>"
+        );
+    }
+
+    #[test]
     fn script_regexp_context_escapes_regexp_delimiters() {
         let template = Template::new("script")
             .parse("<script>const r = /{{.R}}/i;</script>")
@@ -7278,6 +7678,38 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<script>const r = /a\\/b\\x3C\\/script\\x3E/i;</script>");
+    }
+
+    #[test]
+    fn script_regexp_context_reverts_to_expr_after_template() {
+        let template = Template::new("script")
+            .parse("<script>const r = /{{.R}}/; const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"R": "a/b</sCrIpT>", "X": "<x>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>const r = /a\\/b\\x3C\\/sCrIpT\\x3E/; const x = \"\\u003cx\\u003e\";</script>"
+        );
+    }
+
+    #[test]
+    fn script_template_context_reverts_to_expr_after_template() {
+        let template = Template::new("script")
+            .parse("<script>const s = `{{.S}}`; const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"S": "</script>${x}", "X": "<x>"}))
+            .expect("execute to succeed");
+
+        assert_eq!(
+            output,
+            "<script>const s = `\\x3C/script\\x3E\\$\\{x\\}`; const x = \"\\u003cx\\u003e\";</script>"
+        );
     }
 
     #[test]
@@ -7359,6 +7791,22 @@ mod tests {
     }
 
     #[test]
+    fn style_string_context_escapes_css_string_tokens() {
+        let template = Template::new("style")
+            .parse("<style>.x{content:'{{.S}}';}</style>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"S": "a'b\\c"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<style>.x{content:'a\\'b\\\\c';}</style>"
+        );
+    }
+
+    #[test]
     fn script_string_context_escapes_without_double_quoting() {
         let template = Template::new("script")
             .parse("<script>const s = \"{{.S}}\";</script>")
@@ -7437,6 +7885,28 @@ mod tests {
     }
 
     #[test]
+    fn lookup_path_supports_intermediate_method_lookup() {
+        let template = Template::new("method")
+            .add_method("UpperNested", |receiver: &Value, args: &[Value]| {
+                if !args.is_empty() {
+                    return Err(TemplateError::Render(
+                        "UpperNested expects no arguments".to_string(),
+                    ));
+                }
+                let name = lookup_path(receiver, &[String::from("Name")]).to_plain_string();
+                Ok(Value::from(json!({ "Name": name.to_uppercase() })))
+            })
+            .parse("{{.User.UpperNested.Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"User": {"Name": "alice"}}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "ALICE");
+    }
+
+    #[test]
     fn field_lookup_has_priority_over_method_name() {
         let template = Template::new("method")
             .add_method("Name", |_: &Value, _: &[Value]| Ok(Value::from("method")))
@@ -7448,6 +7918,87 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "field");
+    }
+
+    #[test]
+    fn root_identifier_missing_key_uses_method_resolution() {
+        let template = Template::new("method")
+            .add_method("RootName", |_receiver: &Value, args: &[Value]| {
+                if !args.is_empty() {
+                    return Err(TemplateError::Render(
+                        "RootName expects no arguments".to_string(),
+                    ));
+                }
+                Ok(Value::from("resolved-by-method"))
+            })
+            .parse("{{RootName}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "y"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "resolved-by-method");
+    }
+
+    #[test]
+    fn root_identifier_prefers_root_field_over_method() {
+        let template = Template::new("method")
+            .add_method("Name", |_: &Value, _args: &[Value]| {
+                Ok(Value::from("from-method"))
+            })
+            .parse("{{Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "from-root"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "from-root");
+    }
+
+    #[test]
+    fn identifier_missingkey_default_renders_no_value_marker() {
+        let template = Template::new("missing")
+            .parse("{{Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "&lt;no value&gt;");
+    }
+
+    #[test]
+    fn identifier_missingkey_zero_renders_empty_string() {
+        let template = Template::new("missing")
+            .option("missingkey=zero")
+            .expect("option should succeed")
+            .parse("{{Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn identifier_missingkey_error_returns_execution_error() {
+        let template = Template::new("missing")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse("{{Name}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+
+        assert!(error.to_string().contains("map has no entry"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrMissingKey);
     }
 
     #[test]
@@ -7955,6 +8506,34 @@ mod tests {
                 .contains("branches end in different contexts")
         );
         assert_eq!(error.code(), TemplateErrorCode::ErrBranchEnd);
+    }
+
+    #[test]
+    fn parse_time_detects_recursive_template_calls() {
+        let error = match Template::new("main").parse("{{template \"main\" .}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("cannot compute output context for recursive template")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
+    }
+
+    #[test]
+    fn parse_time_detects_mutual_recursive_template_calls() {
+        let error = match Template::new("a").parse(
+            "{{define \"a\"}}{{template \"b\" .}}{{end}}{{define \"b\"}}{{template \"a\" .}}{{end}}{{template \"a\" .}}",
+        ) {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("cannot compute output context for recursive template")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
     }
 
     #[test]

@@ -31,15 +31,15 @@
 - [x] 属性名位置での `htmlNameFilter` 的挙動を追加する
   - 属性名インジェクション耐性の観点で必要
   - 動的属性名を `alnum + attr_type::plain` 条件でフィルタ、空文字/不正値は `#ZgotmplZ` に置換
-- [ ] `url` 扱いと安全URL判定を Go 互換へ再確認する
+- [x] `url` 扱いと安全URL判定を Go 互換へ再確認する
   - 特に URI スキーム許可/拒否の境界、正規化挙動の差分
 - [ ] `js`/`css`/`html` 用エスケープ処理を Go 側の既知のルール（文字列境界、`script` タグ特殊ケース等）へ寄せる
   - テスト追加: ScriptTemplate/ScriptRegexp/JS/CSSコメント状態
 
 ## 実行時データ・評価
-- [ ] `lookup_identifier` / `lookup_path` の評価モデルを text/template 的に再設計する
+- [x] `lookup_identifier` / `lookup_path` の評価モデルを text/template 的に再設計する
   - 現在は主に JSON 値前提で、Go 版の詳細なリフレクションベース解決と異なる
-- [ ] メソッド解決とフィールド解決の優先順・未定義時挙動を Go 準拠で再点検する
+- [x] メソッド解決とフィールド解決の優先順・未定義時挙動を Go 準拠で再点検する
 - [ ] 再帰実行・深さ制御など（`text/template` 由来）を確認し、既知の実行限界テストを追加する
 
 ## テスト整備
