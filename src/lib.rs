@@ -7,12 +7,43 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::RwLock;
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, TemplateError>;
+
+#[cfg(not(feature = "web-rust"))]
+pub trait TemplateFS {
+    fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+    fn glob(&self, pattern: &str) -> Result<Vec<String>>;
+}
+
+#[cfg(not(feature = "web-rust"))]
+#[derive(Clone, Debug)]
+pub struct OSFileSystem;
+
+#[cfg(not(feature = "web-rust"))]
+impl TemplateFS for OSFileSystem {
+    fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        Ok(fs::read(path)?)
+    }
+
+    fn glob(&self, pattern: &str) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        for entry in glob::glob(pattern)? {
+            paths.push(entry?.to_string_lossy().to_string());
+        }
+
+        if paths.is_empty() {
+            return Err(TemplateError::Parse(format!("glob pattern matched no files: {pattern}")));
+        }
+
+        Ok(paths)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TemplateError {
@@ -277,6 +308,11 @@ pub type Method = Arc<dyn Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 
 pub type MethodMap = HashMap<String, Method>;
 type ScopeStack = Vec<HashMap<String, Value>>;
 
+#[derive(Clone, Debug)]
+pub struct ParseTree {
+    nodes: Vec<Node>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderFlow {
     Normal,
@@ -294,7 +330,7 @@ pub enum MissingKeyMode {
 #[derive(Clone)]
 pub struct Template {
     name: String,
-    templates: HashMap<String, Vec<Node>>,
+    templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
     funcs: FuncMap,
     methods: MethodMap,
     missing_key_mode: MissingKeyMode,
@@ -307,7 +343,7 @@ impl Template {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            templates: HashMap::new(),
+            templates: Arc::new(RwLock::new(HashMap::new())),
             funcs: builtin_funcs(),
             methods: HashMap::new(),
             missing_key_mode: MissingKeyMode::Default,
@@ -354,6 +390,11 @@ impl Template {
     }
 
     pub fn clone_template(&self) -> Result<Self> {
+        self.Clone()
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Clone(&self) -> Result<Self> {
         if self.left_delim.is_empty() || self.right_delim.is_empty() {
             return Err(TemplateError::Parse(
                 "template delimiters must not be empty".to_string(),
@@ -361,9 +402,18 @@ impl Template {
         }
         self.ensure_not_executed()?;
 
-        let mut clone = self.clone();
-        clone.executed = Arc::new(AtomicBool::new(false));
-        Ok(clone)
+        let templates = self.templates.read().unwrap().clone();
+
+        Ok(Self {
+            name: self.name.clone(),
+            templates: Arc::new(RwLock::new(templates)),
+            funcs: self.funcs.clone(),
+            methods: self.methods.clone(),
+            missing_key_mode: self.missing_key_mode.clone(),
+            left_delim: self.left_delim.clone(),
+            right_delim: self.right_delim.clone(),
+            executed: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn option(mut self, option: &str) -> Result<Self> {
@@ -411,6 +461,46 @@ impl Template {
         Ok(self)
     }
 
+    #[allow(non_snake_case)]
+    pub fn New(&self, name: impl Into<String>) -> Self {
+        let mut clone = self.clone();
+        clone.name = name.into();
+        clone
+    }
+
+    pub fn parse_tree(&self, text: &str) -> Result<ParseTree> {
+        let preprocessed = strip_html_comments(text);
+        let tokens = tokenize(&preprocessed, &self.left_delim, &self.right_delim)?;
+        let mut index = 0;
+        let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
+        if let Some(stop) = stop {
+            return Err(TemplateError::Parse(format!(
+                "unexpected control action `{}`",
+                stop.keyword
+            )));
+        }
+        Ok(ParseTree { nodes })
+    }
+
+    #[allow(non_snake_case)]
+    pub fn AddParseTree(mut self, name: impl Into<String>, tree: ParseTree) -> Result<Self> {
+        self.ensure_not_executed()?;
+        let name = name.into();
+        if !self.templates.read().unwrap().contains_key(&self.name) {
+            self.name = name.clone();
+        }
+        {
+            let mut templates = self.templates.write().unwrap();
+            self.merge_template_nodes(&mut templates, &name, tree.nodes);
+        }
+        self.reanalyze_contexts()?;
+        Ok(self)
+    }
+
+    pub fn add_parse_tree(self, name: impl Into<String>, tree: ParseTree) -> Result<Self> {
+        self.AddParseTree(name, tree)
+    }
+
     /// Parse templates from file paths.
     ///
     /// Note: this API is not available in `web-rust` builds.
@@ -434,7 +524,7 @@ impl Template {
                 .to_string();
 
             self.parse_named(&name, &source)?;
-            if !self.templates.contains_key(&self.name) {
+            if !self.templates.read().unwrap().contains_key(&self.name) {
                 self.name = name;
             }
             parsed_any = true;
@@ -500,8 +590,22 @@ impl Template {
         S: AsRef<str>,
     {
         self.ensure_not_executed()?;
-        let paths = expand_glob_patterns(patterns)?;
-        self.parse_files(paths)
+        self.ParseFS(&OSFileSystem, patterns)
+    }
+
+    /// Parse templates from a file-system abstraction.
+    #[cfg(not(feature = "web-rust"))]
+    #[allow(non_snake_case)]
+    pub fn ParseFS<F, I, S>(mut self, fs: &F, patterns: I) -> Result<Self>
+    where
+        F: TemplateFS,
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ensure_not_executed()?;
+        let paths = glob_patterns_with_fsys(fs, patterns)?;
+        parse_files_with_fsys(&mut self, fs, paths)?;
+        Ok(self)
     }
 
     /// Parse templates from file system pattern list.
@@ -509,6 +613,20 @@ impl Template {
     /// Note: this API is not available in `web-rust` builds.
     #[cfg(feature = "web-rust")]
     pub fn parse_fs<I, S>(self, _patterns: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ensure_not_executed()?;
+        Err(TemplateError::Parse(
+            "parse_fs is not supported in web-rust builds".to_string(),
+        ))
+    }
+
+    /// Parse templates from a file-system abstraction.
+    #[cfg(feature = "web-rust")]
+    #[allow(non_snake_case)]
+    pub fn ParseFS<F, I, S>(self, _fs: &F, _patterns: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -562,7 +680,7 @@ impl Template {
     }
 
     pub fn lookup(&self, name: &str) -> Option<Self> {
-        if self.templates.contains_key(name) {
+        if self.templates.read().unwrap().contains_key(name) {
             let mut clone = self.clone();
             clone.name = name.to_string();
             Some(clone)
@@ -572,11 +690,17 @@ impl Template {
     }
 
     pub fn has_template(&self, name: &str) -> bool {
-        self.templates.contains_key(name)
+        self.templates.read().unwrap().contains_key(name)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn Templates(&self) -> Vec<Self> {
+        self.templates()
     }
 
     pub fn defined_templates(&self) -> Vec<String> {
-        let mut names = self.templates.keys().cloned().collect::<Vec<_>>();
+        let templates = self.templates.read().unwrap();
+        let mut names = templates.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
     }
@@ -590,6 +714,11 @@ impl Template {
         }
     }
 
+    #[allow(non_snake_case)]
+    pub fn DefinedTemplates(&self) -> String {
+        self.defined_templates_string()
+    }
+
     pub fn templates(&self) -> Vec<Self> {
         let names = self.defined_templates();
         names
@@ -599,17 +728,19 @@ impl Template {
     }
 
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
-        let preprocessed = strip_html_comments(text);
-        let tokens = tokenize(&preprocessed, &self.left_delim, &self.right_delim)?;
-        let mut index = 0;
-        let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
-        if let Some(stop) = stop {
-            return Err(TemplateError::Parse(format!(
-                "unexpected control action `{}`",
-                stop.keyword
-            )));
-        }
+        let tree = self.parse_tree(text)?;
+        let mut templates = self.templates.write().unwrap();
+        self.merge_template_nodes(&mut templates, name, tree.nodes);
 
+        Ok(())
+    }
+
+    fn merge_template_nodes(
+        &self,
+        templates: &mut HashMap<String, Vec<Node>>,
+        name: &str,
+        nodes: Vec<Node>,
+    ) {
         let mut root_nodes = Vec::new();
         for node in nodes {
             match node {
@@ -617,14 +748,14 @@ impl Template {
                     name: defined_name,
                     body,
                 } => {
-                    self.templates.insert(defined_name, body);
+                    templates.insert(defined_name, body);
                 }
                 Node::Block {
                     name: block_name,
                     data,
                     body,
                 } => {
-                    self.templates
+                    templates
                         .entry(block_name.clone())
                         .or_insert_with(|| body.clone());
                     root_nodes.push(Node::TemplateCall {
@@ -636,11 +767,9 @@ impl Template {
             }
         }
 
-        if !root_nodes.is_empty() || !self.templates.contains_key(name) {
-            self.templates.insert(name.to_string(), root_nodes);
+        if !root_nodes.is_empty() || !templates.contains_key(name) {
+            templates.insert(name.to_string(), root_nodes);
         }
-
-        Ok(())
     }
 
     fn ensure_not_executed(&self) -> Result<()> {
@@ -653,14 +782,15 @@ impl Template {
     }
 
     fn reanalyze_contexts(&mut self) -> Result<()> {
-        if !self.templates.contains_key(&self.name) {
+        let raw_templates = self.templates.read().unwrap().clone();
+        if !raw_templates.contains_key(&self.name) {
             return Err(TemplateError::Parse(format!(
                 "template `{}` is not defined",
                 self.name
             )));
         }
 
-        let mut analyzer = ParseContextAnalyzer::new(self.templates.clone());
+        let mut analyzer = ParseContextAnalyzer::new(raw_templates.clone());
         let root_start = ContextState::html_text();
         let root_end = analyzer.analyze_template(&self.name, root_start)?;
         if !root_end.is_text_context() {
@@ -672,15 +802,15 @@ impl Template {
 
         // Analyze unreferenced templates with HTML start context so
         // execute_template(name, ...) has stable precomputed escaping.
-        let mut names = self.templates.keys().cloned().collect::<Vec<_>>();
+        let mut names = raw_templates.keys().cloned().collect::<Vec<_>>();
         names.sort();
-        for name in names {
-            if !analyzer.has_analysis(&name) {
-                let _ = analyzer.analyze_template(&name, ContextState::html_text())?;
+        for name in names.iter() {
+            if !analyzer.has_analysis(name.as_str()) {
+                let _ = analyzer.analyze_template(name.as_str(), ContextState::html_text())?;
             }
         }
 
-        self.templates = analyzer.finish();
+        *self.templates.write().unwrap() = analyzer.finish();
         Ok(())
     }
 
@@ -693,10 +823,10 @@ impl Template {
         output: &mut String,
         in_range: bool,
     ) -> Result<RenderFlow> {
-        let nodes = self
-            .templates
-            .get(name)
-            .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
+        let templates = self.templates.read().unwrap();
+        let nodes = templates.get(name).ok_or_else(|| {
+            TemplateError::Render(format!("template `{name}` is not defined"))
+        })?;
         self.render_nodes(nodes, root, dot, scopes, output, in_range)
     }
 
@@ -846,7 +976,7 @@ impl Template {
                         None => dot.clone(),
                     };
 
-                    if self.templates.contains_key(name) {
+                    if self.templates.read().unwrap().contains_key(name) {
                         let mut template_scopes = vec![HashMap::new()];
                         let flow = self.render_named(
                             name,
@@ -1135,9 +1265,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let paths = expand_glob_patterns(patterns)?;
-    let name = template_name_from_path(&paths[0])?;
-    Template::new(name).parse_files(paths)
+    Template::new("").parse_fs(patterns)
+}
+
+/// Parse templates from a file-system abstraction.
+#[cfg(not(feature = "web-rust"))]
+#[allow(non_snake_case)]
+pub fn ParseFS<F, I, S>(fs: &F, patterns: I) -> Result<Template>
+where
+    F: TemplateFS,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    Template::new("").ParseFS(fs, patterns)
 }
 
 /// Parse templates from file system pattern list.
@@ -1145,6 +1285,18 @@ where
 /// Note: this API is not available in `web-rust` builds.
 #[cfg(feature = "web-rust")]
 pub fn parse_fs<I, S>(_: I) -> Result<Template>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    Err(TemplateError::Parse(
+        "parse_fs is not supported in web-rust builds".to_string(),
+    ))
+}
+
+#[cfg(feature = "web-rust")]
+#[allow(non_snake_case)]
+pub fn ParseFS<F, I, S>(_: &F, _: I) -> Result<Template>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -2652,6 +2804,57 @@ where
         ));
     }
     Ok(paths)
+}
+
+#[cfg(not(feature = "web-rust"))]
+fn glob_patterns_with_fsys<F, I, S>(fs: &F, patterns: I) -> Result<Vec<String>>
+where
+    F: TemplateFS,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        paths.extend(fs.glob(pattern.as_ref())?);
+    }
+
+    paths.sort();
+    if paths.is_empty() {
+        return Err(TemplateError::Parse(
+            "glob pattern matched no files".to_string(),
+        ));
+    }
+
+    Ok(paths)
+}
+
+#[cfg(not(feature = "web-rust"))]
+fn parse_files_with_fsys<F>(template: &mut Template, fs: &F, paths: Vec<String>) -> Result<()>
+where
+    F: TemplateFS,
+{
+    let mut parsed_any = false;
+    for path in paths {
+        let path = std::path::Path::new(&path);
+        let name = template_name_from_path(path)?;
+        let source = fs.read_file(path.to_string_lossy().as_ref())?;
+        let source = std::str::from_utf8(&source)
+            .map_err(|error| TemplateError::Parse(format!("template file `{path:?}` is not valid UTF-8: {error}")))?;
+        template.parse_named(&name, source)?;
+        if !template.templates.read().unwrap().contains_key(&template.name) {
+            template.name = name;
+        }
+        parsed_any = true;
+    }
+
+    if !parsed_any {
+        return Err(TemplateError::Parse(
+            "parse_fs requires at least one template".to_string(),
+        ));
+    }
+
+    template.reanalyze_contexts()?;
+    Ok(())
 }
 
 fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Token>> {
@@ -4742,6 +4945,43 @@ mod tests {
         assert_eq!(output, "<ul><li>x</li><li>&lt;y&gt;</li></ul>");
     }
 
+    #[test]
+    fn add_parse_tree_adds_named_template() {
+        let tree = Template::new("base")
+            .parse_tree("{{define \"greet\"}}Hello {{.Name}}{{end}}")
+            .expect("parse_tree should succeed");
+
+        let template = Template::new("base")
+            .AddParseTree("greet", tree)
+            .expect("AddParseTree should succeed");
+
+        let output = template
+            .execute_template_to_string("greet", &json!({"Name": "Alice"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "Hello Alice");
+    }
+
+    #[test]
+    fn new_shares_template_namespace_with_parent() {
+        let base = Template::new("base")
+            .parse("{{define \"shared\"}}shared{{end}}")
+            .expect("parse should succeed");
+
+        let child = base.New("child").parse("{{define \"only_child\"}}only-child{{end}}");
+        let child = child.expect("parse should succeed");
+
+        let child_output = child
+            .execute_template_to_string("only_child", &json!({}))
+            .expect("child execute should succeed");
+        let base_output = base
+            .execute_template_to_string("only_child", &json!({}))
+            .expect("base execute should succeed");
+
+        assert_eq!(child_output, "only-child");
+        assert_eq!(base_output, "only-child");
+    }
+
     #[cfg(not(feature = "web-rust"))]
     #[test]
     fn parse_files_requires_paths() {
@@ -5413,6 +5653,132 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn clone_creates_isolated_template_namespace() {
+        let base = Template::new("base")
+            .parse("{{define \"shared\"}}shared{{end}}")
+            .expect("parse should succeed");
+
+        let cloned = base
+            .Clone()
+            .expect("clone should succeed")
+            .parse("{{define \"child\"}}child only{{end}}")
+            .expect("parse on clone should succeed");
+
+        assert!(base.lookup("child").is_none());
+        let cloned_output = cloned
+            .execute_template_to_string("child", &json!({}))
+            .expect("cloned execute should succeed");
+
+        assert_eq!(cloned_output, "child only");
+    }
+
+    #[test]
+    fn clone_api_is_independent_from_clone_template() {
+        let template = Template::new("base")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+        let cloned = template
+            .Clone()
+            .expect("Clone should succeed");
+
+        let output = cloned
+            .execute_to_string(&json!({"Name": "value"}))
+            .expect("execute should succeed");
+        assert_eq!(output, "value");
+    }
+
+    #[test]
+    fn clone_preserves_option_and_delims() {
+        let template = Template::new("base")
+            .delims("[[", "]]")
+            .option("missingkey=zero")
+            .expect("option should succeed")
+            .parse("[[.Missing]]")
+            .expect("parse should succeed");
+
+        let cloned = template.Clone().expect("Clone should succeed");
+        let output = cloned
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn clone_carries_functions_and_methods() {
+        let template = Template::new("clone-func")
+            .add_func("upper", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("upper expects one arg".to_string()))?;
+                Ok(Value::from(value.to_plain_string().to_uppercase()))
+            })
+            .add_method("Join", |_receiver: &Value, args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render("Join expects two args".to_string()));
+                }
+                Ok(Value::from(format!(
+                    "{}:{}",
+                    args[0].to_plain_string(),
+                    args[1].to_plain_string()
+                )))
+            })
+            .parse("{{.Name | upper}}|{{.Obj.Join \"a\" \"b\"}}")
+            .expect("parse should succeed");
+
+        let cloned = template.Clone().expect("Clone should succeed");
+        let output = cloned
+            .execute_to_string(&json!({"Name": "rust", "Obj": {"Name": "x"}}))
+            .expect("execute should succeed");
+        assert_eq!(output, "RUST|a:b");
+    }
+
+    #[test]
+    fn clone_fails_after_execution() {
+        let template = Template::new("clone-fail")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+
+        let _ = template
+            .execute_to_string(&json!({"Name": "value"}))
+            .expect("execute should succeed");
+
+        let error = match template.Clone() {
+            Ok(_) => panic!("Clone should fail after execute"),
+            Err(err) => err,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn templates_includes_all_associated_templates() {
+        let template = Template::new("base")
+            .parse("base {{define \"footer\"}}footer{{end}}{{define \"header\"}}header{{end}}")
+            .expect("parse should succeed");
+
+        let names = template
+            .Templates()
+            .into_iter()
+            .map(|tpl| tpl.name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"base".to_string()));
+        assert!(names.contains(&"header".to_string()));
+        assert!(names.contains(&"footer".to_string()));
+    }
+
+    #[test]
+    fn defined_templates_matches_prefixed_sorted_list() {
+        let template = Template::new("base")
+            .parse("base {{define \"footer\"}}footer{{end}}{{define \"header\"}}header{{end}}")
+            .expect("parse should succeed");
+
+        assert_eq!(
+            template.DefinedTemplates(),
+            "; defined templates are: base, footer, header"
+        );
     }
 
     #[test]
