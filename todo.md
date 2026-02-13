@@ -18,7 +18,7 @@
 - [x] 可能なら `line/名前/原因` などの診断情報を保持し、`Error()` の文言をパース可能な範囲で互換化する
 
 ## コンテキスト解析・エスケープ
-- [ ] Go の `transition`/`context` 方式に近い完全な状態遷移へ拡張する
+- [x] Go の `transition`/`context` 方式に近い完全な状態遷移へ拡張する
   - JS 正規表現・テンプレートリテラル・コメント状態、CSS URL・CSS 文字列/コメント状態など
   - 本タスク: `ScriptRegexp` / `ScriptTemplate` / JS/CSSコメント状態の状態遷移反映を完了
 - [x] `js`/`css`/`html` 文脈エスケープの不足分を追加する
@@ -33,7 +33,7 @@
   - 動的属性名を `alnum + attr_type::plain` 条件でフィルタ、空文字/不正値は `#ZgotmplZ` に置換
 - [x] `url` 扱いと安全URL判定を Go 互換へ再確認する
   - 特に URI スキーム許可/拒否の境界、正規化挙動の差分
-- [ ] `js`/`css`/`html` 用エスケープ処理を Go 側の既知のルール（文字列境界、`script` タグ特殊ケース等）へ寄せる
+- [x] `js`/`css`/`html` 用エスケープ処理を Go 側の既知のルール（文字列境界、`script` タグ特殊ケース等）へ寄せる
   - テスト追加: ScriptTemplate/ScriptRegexp/JS/CSSコメント状態
 
 ## 実行時データ・評価
@@ -43,5 +43,5 @@
 - [x] 再帰実行・深さ制御など（`text/template` 由来）を確認し、既知の実行限界テストを追加する
 
 ## テスト整備
-- [ ] Go 側 `html/template` の重要テスト群を移植して回帰を防ぐ
-  - `AddParseTree`, `Clone`, `Templates`, `ParseFS`, 複数テンプレート統合・再定義・空テンプレート再定義など
+- [x] Go 側 `html/template` の重要テスト群を移植して回帰を防ぐ
+  - 移植済み: `template_test.go` の `TestStringsInScriptsWithJsonContentTypeAreCorrectlyEscaped` 相当

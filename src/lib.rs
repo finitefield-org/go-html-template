@@ -5136,6 +5136,11 @@ fn style_attribute_mode(value_prefix: &str) -> Option<EscapeMode> {
 }
 
 fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
+    let script_tag = current_unclosed_script_tag(rendered)?;
+    if !is_script_type_javascript(script_tag) {
+        return None;
+    }
+
     let content = current_unclosed_tag_content(rendered, "script")?;
     Some(current_js_mode(content))
 }
@@ -5143,6 +5148,140 @@ fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
 fn style_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let content = current_unclosed_tag_content(rendered, "style")?;
     Some(current_css_mode(content))
+}
+
+fn current_unclosed_script_tag(rendered: &str) -> Option<&str> {
+    let mut cursor = 0usize;
+
+    loop {
+        let start = find_open_tag(rendered, cursor, b"script")?;
+        let end = html_tag_end(rendered, start)?;
+
+        if let Some(close_start) = find_close_tag(rendered, end, b"script") {
+            let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+            cursor = close_end;
+            continue;
+        }
+
+        return Some(&rendered[start..end]);
+    }
+}
+
+fn is_script_type_javascript(script_tag: &str) -> bool {
+    match script_type_attribute(script_tag) {
+        Some(type_value) => is_js_type_mime(&type_value),
+        None => true,
+    }
+}
+
+fn script_type_attribute(script_tag: &str) -> Option<String> {
+    let bytes = script_tag.as_bytes();
+    if bytes.len() < 7 || !script_tag[..7].eq_ignore_ascii_case("<script") {
+        return None;
+    }
+
+    let mut i = 7usize;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' || bytes[i] == b'>' {
+            break;
+        }
+
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'/'
+            && bytes[i] != b'>'
+        {
+            i += 1;
+        }
+        let name = script_tag[name_start..i].to_ascii_lowercase();
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'/' || bytes[i] == b'>' {
+            continue;
+        }
+        if bytes[i] != b'=' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+
+        let mut value = "";
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let quote = bytes[i];
+            i += 1;
+            let value_start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            value = &script_tag[value_start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else {
+            let value_start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' && bytes[i] != b'>'
+            {
+                i += 1;
+            }
+            value = &script_tag[value_start..i];
+        }
+
+        if name == "type" {
+            return Some(value.trim().to_string());
+        }
+    }
+
+    None
+}
+
+fn is_js_type_mime(type_value: &str) -> bool {
+    let mime = type_value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        mime.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/json"
+            | "application/ld+json"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "module"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
 }
 
 fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option<&'a str> {
@@ -5348,6 +5487,18 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                             preserve_body: false,
                             keep_terminator: true,
                         }
+                    }
+                    ch if content[i..].starts_with('\u{2028}') => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 3;
+                        segment_start = i;
+                        JsScanState::Expr { js_ctx }
+                    }
+                    ch if content[i..].starts_with('\u{2029}') => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 3;
+                        segment_start = i;
+                        JsScanState::Expr { js_ctx }
                     }
                     b'/' => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
@@ -6997,6 +7148,13 @@ fn find_style_close_tag(content: &str, start: usize) -> Option<usize> {
                 if bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\x0c' {
                     i += 1;
                     CssScanState::Expr
+                } else if bytes[i] == 0xE2
+                    && i + 2 < bytes.len()
+                    && ((bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8)
+                        || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9))
+                {
+                    i += 3;
+                    CssScanState::Expr
                 } else {
                     i += 1;
                     CssScanState::LineComment
@@ -7054,8 +7212,12 @@ fn is_script_tag_close_in_regexp(bytes: &[u8], i: usize) -> bool {
 
 fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     let mut output = String::new();
-    let mut section = if current_unclosed_tag_content(prefix, "script").is_some() {
-        HtmlSection::Script
+    let mut section = if let Some(script_tag) = current_unclosed_script_tag(prefix) {
+        if is_script_type_javascript(script_tag) {
+            HtmlSection::Script
+        } else {
+            HtmlSection::Html
+        }
     } else if current_unclosed_tag_content(prefix, "style").is_some() {
         HtmlSection::Style
     } else {
@@ -7076,6 +7238,23 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                     (Some(a), None) => (a, HtmlSection::Script),
                     (None, Some(b)) => (b, HtmlSection::Style),
                     (None, None) => (usize::MAX, HtmlSection::Html),
+                };
+                let target = if let HtmlSection::Script = target {
+                    if let Some(end) = html_tag_end(text, next) {
+                        if let Some(script_tag) = text.get(next..end) {
+                            if is_script_type_javascript(script_tag) {
+                                HtmlSection::Script
+                            } else {
+                                HtmlSection::Html
+                            }
+                        } else {
+                            HtmlSection::Html
+                        }
+                    } else {
+                        HtmlSection::Html
+                    }
+                } else {
+                    target
                 };
 
                 if next == usize::MAX {
@@ -7330,6 +7509,13 @@ fn current_css_scan_state(content: &str) -> CssScanState {
             CssScanState::LineComment => {
                 if bytes[i] == b'\n' || bytes[i] == b'\x0c' || bytes[i] == b'\r' {
                     i += 1;
+                    CssScanState::Expr
+                } else if bytes[i] == 0xE2
+                    && i + 2 < bytes.len()
+                    && ((bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8)
+                        || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9))
+                {
+                    i += 3;
                     CssScanState::Expr
                 } else {
                     i += 1;
@@ -8628,6 +8814,67 @@ mod tests {
     }
 
     #[test]
+    fn script_type_template_is_not_treated_as_javascript() {
+        let template = Template::new("script")
+            .parse("<script type=\"text/template\">{{.X}}</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script type=\"text/template\">&lt;tag&gt;</script>");
+    }
+
+    #[test]
+    fn script_type_module_is_treated_as_javascript() {
+        let template = Template::new("script")
+            .parse("<script type='module'>const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script type='module'>const x = \"\\u003ctag\\u003e\";</script>");
+    }
+
+    #[test]
+    fn script_type_json_serializes_as_json() {
+        let template = Template::new("script")
+            .parse("<script type=\"application/ld+json\">{{.}}</script>")
+            .expect("parse should succeed");
+
+        const PREFIX: &str = "<script type=\"application/ld+json\">";
+        const SUFFIX: &str = "</script>";
+        let tests = [
+            "",
+            "\u{FFFD}",
+            "\u{0000}",
+            "\u{001F}",
+            "\t",
+            "<>",
+            "\"'",
+            "ASCII letters",
+            "ʕ⊙ϖ⊙ʔ",
+            "🍕",
+        ];
+
+        for input in tests {
+            let rendered = template
+                .execute_to_string(&input)
+                .expect("execute should succeed");
+            let json_text = rendered
+                .strip_prefix(PREFIX)
+                .and_then(|value| value.strip_suffix(SUFFIX))
+                .expect("rendered script wrapper should match expected format");
+            let output: String =
+                serde_json::from_str(json_text).expect("script contents should be valid JSON");
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
     fn script_template_context_escapes_template_literal_tokens() {
         let template = Template::new("script")
             .parse("<script>const s = `{{.S}}`;</script>")
@@ -8981,6 +9228,78 @@ mod tests {
         println!("block analyzer end state = {:?}", block_end);
     }
 
+    fn analyze_expr_modes(name: &str, source: &str) -> Vec<EscapeMode> {
+        let mut template = Template::new(name)
+            .parse(source)
+            .expect("parse should succeed");
+
+        let raw_templates = template.name_space.templates.read().unwrap().clone();
+        let mut nodes = raw_templates
+            .get(name)
+            .expect("template should exist")
+            .clone();
+
+        let mut analyzer = ParseContextAnalyzer::new(raw_templates);
+        let mut tracker = ContextTracker::from_state(ContextState::html_text());
+        for node in nodes.iter_mut() {
+            let mut flows = analyzer
+                .analyze_node(node, tracker, false)
+                .expect("analyze_node should succeed");
+            assert_eq!(flows.len(), 1);
+            tracker = flows.pop().expect("one flow should be produced").tracker;
+        }
+
+        nodes
+            .into_iter()
+            .filter_map(|node| match node {
+                Node::Expr { mode, .. } => Some(mode),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_context_tracks_script_template_and_regexp_states() {
+        let template_states = analyze_expr_modes("script_template_state", "<script>const s = `{{.S}}`;</script>");
+        assert_eq!(template_states, vec![EscapeMode::ScriptTemplate]);
+
+        let regexp_states = analyze_expr_modes("script_regexp_state", "<script>const r = /{{.R}}/i;</script>");
+        assert_eq!(regexp_states, vec![EscapeMode::ScriptRegexp]);
+    }
+
+    #[test]
+    fn parse_context_tracks_script_comment_states() {
+        let line_states = analyze_expr_modes(
+            "script_comment_state_line",
+            "<script>// {{.A}}\nconst x = {{.B}};</script>",
+        );
+        assert_eq!(
+            line_states,
+            vec![EscapeMode::ScriptLineComment, EscapeMode::ScriptExpr]
+        );
+
+        let block_states = analyze_expr_modes(
+            "script_comment_state_block",
+            "<script>/* {{.A}} */const x = {{.B}};</script>",
+        );
+        assert_eq!(
+            block_states,
+            vec![EscapeMode::ScriptBlockComment, EscapeMode::ScriptExpr]
+        );
+    }
+
+    #[test]
+    fn parse_context_tracks_style_comment_states() {
+        let block_states = analyze_expr_modes(
+            "style_comment_state",
+            "<style>/* {{.A}} */.a { color: {{.B}}; }</style>",
+        );
+        assert_eq!(
+            block_states,
+            vec![EscapeMode::StyleBlockComment, EscapeMode::StyleExpr]
+        );
+    }
+
     #[test]
     fn script_template_expr_context_ignores_template_inner_line_comment_text() {
         let template = Template::new("script")
@@ -9092,6 +9411,32 @@ mod tests {
     }
 
     #[test]
+    fn script_expr_mode_with_unicode_line_separator_is_preserved() {
+        let template = Template::new("script")
+            .parse("<script>const x = 1;\u{2028}const y = {{.Y}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Y": 2}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>const x = 1;\u{2028}const y = 2;</script>");
+    }
+
+    #[test]
+    fn script_expr_mode_with_unicode_paragraph_separator_is_preserved() {
+        let template = Template::new("script")
+            .parse("<script>const x = 1;\u{2029}const y = {{.Y}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Y": 2}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>const x = 1;\u{2029}const y = 2;</script>");
+    }
+
+    #[test]
     fn script_line_comment_mode_ignores_template_inner_close_tag() {
         let template = Template::new("script")
             .parse("<script>// </script>\nconst x = {{.X}};</script>")
@@ -9141,6 +9486,32 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<style>// \x0c.a { color: red; }</style>");
+    }
+
+    #[test]
+    fn style_line_comment_mode_with_unicode_line_separator_is_terminated() {
+        let template = Template::new("style")
+            .parse("<style>// {{.A}}\u{2028}.a { color: red; }</style>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "<x>"}))
+            .expect("execute to succeed");
+
+        assert_eq!(output, "<style>// \u{2028}.a { color: red; }</style>");
+    }
+
+    #[test]
+    fn style_line_comment_mode_with_unicode_paragraph_separator_is_terminated() {
+        let template = Template::new("style")
+            .parse("<style>// {{.A}}\u{2029}.a { color: red; }</style>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "<x>"}))
+            .expect("execute to succeed");
+
+        assert_eq!(output, "<style>// \u{2029}.a { color: red; }</style>");
     }
 
     #[test]
@@ -9906,6 +10277,33 @@ mod tests {
     }
 
     #[test]
+    fn clone_can_execute_parsed_text_independently() {
+        let template = Template::new("clone-base")
+            .parse("orig {{define \"foo\"}}foo{{end}}")
+            .expect("parse should succeed");
+
+        let cloned = template
+            .Clone()
+            .expect("clone should succeed")
+            .parse("extra")
+            .expect("parse on clone should succeed");
+
+        assert_eq!(cloned.Templates().len(), 2);
+        assert_eq!(
+            cloned
+                .execute_to_string(&json!({}))
+                .expect("execute should succeed"),
+            "extra"
+        );
+        assert_eq!(
+            template
+                .execute_to_string(&json!({}))
+                .expect("execute should succeed"),
+            "orig "
+        );
+    }
+
+    #[test]
     fn clone_fails_after_execution() {
         let template = Template::new("clone-fail")
             .parse("{{.Name}}")
@@ -10054,6 +10452,23 @@ mod tests {
             output,
             "<a href=\"javascript:alert(1)\">go</a><script>const s=\"\\\"</script>\";</script><style>.x{content:\"\\\"</style>\";}</style>"
         );
+    }
+
+    #[test]
+    fn safe_html_attr_preserves_raw_markup_in_attribute_quotes() {
+        let template = Template::new("attr-safe")
+            .add_func("safe_html_attr_value", |args: &[Value]| {
+                let value = args.first().map(Value::to_plain_string).unwrap_or_default();
+                Ok(Value::safe_html_attr(value))
+            })
+            .parse("<a title=\"{{safe_html_attr_value .A}}\"></a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "O'Reilly & <x>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<a title=\"O'Reilly & <x>\"></a>");
     }
 
     #[test]
