@@ -6,8 +6,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -38,7 +38,9 @@ impl TemplateFS for OSFileSystem {
         }
 
         if paths.is_empty() {
-            return Err(TemplateError::Parse(format!("glob pattern matched no files: {pattern}")));
+            return Err(TemplateError::Parse(format!(
+                "glob pattern matched no files: {pattern}"
+            )));
         }
 
         Ok(paths)
@@ -73,8 +75,14 @@ pub enum TemplateErrorCode {
     ErrBadHTML,
     ErrBranchEnd,
     ErrAmbigContext,
+    ErrEndContext,
     ErrNoSuchTemplate,
     ErrOutputContext,
+    ErrRangeLoopReentry,
+    ErrPartialCharset,
+    ErrPartialEscape,
+    ErrSlashAmbig,
+    ErrPredefinedEscaper,
     ErrMissingKey,
     ErrNotDefined,
     ErrInvalidUTF8,
@@ -145,10 +153,20 @@ fn parse_error_code(message: &str) -> TemplateErrorCode {
         TemplateErrorCode::ErrBranchEnd
     } else if message.contains("ambiguous context") {
         TemplateErrorCode::ErrAmbigContext
-    } else if message.contains("cannot compute output context for")
-        || message.contains("ends in a non-text context")
-    {
+    } else if message.contains("on range loop re-entry") {
+        TemplateErrorCode::ErrRangeLoopReentry
+    } else if message.contains("cannot compute output context for") {
         TemplateErrorCode::ErrOutputContext
+    } else if message.contains("ends in a non-text context") {
+        TemplateErrorCode::ErrEndContext
+    } else if message.contains("unfinished JS regexp charset") {
+        TemplateErrorCode::ErrPartialCharset
+    } else if message.contains("unfinished escape sequence") {
+        TemplateErrorCode::ErrPartialEscape
+    } else if message.contains("could start a division or regexp") {
+        TemplateErrorCode::ErrSlashAmbig
+    } else if message.contains("predefined escaper") {
+        TemplateErrorCode::ErrPredefinedEscaper
     } else if message.contains("expected space, attr name, or end of tag")
         || message.contains("in attribute name")
         || message.contains("in unquoted attr")
@@ -169,7 +187,10 @@ fn parse_error_line(message: &str) -> Option<usize> {
     let marker = "line ";
     let start = message.find(marker)?;
     let remainder = &message[start + marker.len()..];
-    let digits = remainder.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+    let digits = remainder
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
     if digits.is_empty() {
         return None;
     }
@@ -507,51 +528,59 @@ impl Template {
         &self.name
     }
 
-    pub fn funcs(mut self, funcs: FuncMap) -> Self {
+    pub fn funcs(self, funcs: FuncMap) -> Self {
+        for name in funcs.keys() {
+            assert_valid_callable_name(name, "function");
+        }
+        self.name_space.funcs.write().unwrap().extend(funcs);
+        self
+    }
+
+    pub fn add_func<F>(self, name: impl Into<String>, function: F) -> Self
+    where
+        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        let name = name.into();
+        assert_valid_callable_name(&name, "function");
         self.name_space
             .funcs
             .write()
             .unwrap()
-            .extend(funcs);
+            .insert(name, Arc::new(function));
         self
     }
 
-    pub fn add_func<F>(mut self, name: impl Into<String>, function: F) -> Self
+    pub fn methods(self, methods: MethodMap) -> Self {
+        for name in methods.keys() {
+            assert_valid_callable_name(name, "method");
+        }
+        self.name_space.methods.write().unwrap().extend(methods);
+        self
+    }
+
+    pub fn add_method<F>(self, name: impl Into<String>, method: F) -> Self
     where
-    F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+        F: Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static,
     {
-        self.name_space
-            .funcs
-            .write()
-            .unwrap()
-            .insert(name.into(), Arc::new(function));
-        self
-    }
-
-    pub fn methods(mut self, methods: MethodMap) -> Self {
+        let name = name.into();
+        assert_valid_callable_name(&name, "method");
         self.name_space
             .methods
             .write()
             .unwrap()
-            .extend(methods);
+            .insert(name, Arc::new(method));
         self
     }
 
-    pub fn add_method<F>(mut self, name: impl Into<String>, method: F) -> Self
-    where
-    F: Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static,
-    {
-        self.name_space
-            .methods
-            .write()
-            .unwrap()
-            .insert(name.into(), Arc::new(method));
-        self
-    }
-
-    pub fn delims(mut self, left: impl Into<String>, right: impl Into<String>) -> Self {
-        let left = left.into();
-        let right = right.into();
+    pub fn delims(self, left: impl Into<String>, right: impl Into<String>) -> Self {
+        let mut left = left.into();
+        let mut right = right.into();
+        if left.is_empty() {
+            left = "{{".to_string();
+        }
+        if right.is_empty() {
+            right = "}}".to_string();
+        }
         {
             let mut delimiter = self.name_space.left_delim.write().unwrap();
             *delimiter = left;
@@ -669,6 +698,7 @@ impl Template {
     pub fn AddParseTree(mut self, name: impl Into<String>, tree: ParseTree) -> Result<Self> {
         self.ensure_not_executed()?;
         let name = name.into();
+        self.validate_function_calls(&tree.nodes)?;
         if !self
             .name_space
             .templates
@@ -704,13 +734,12 @@ impl Template {
         for path in paths {
             let path = path.as_ref();
             let source = fs::read(path)?;
-            let source = std::str::from_utf8(&source)
-                .map_err(|error| {
-                    TemplateError::Parse(format!(
-                        "template `{}` is not valid UTF-8: {error}",
-                        path.display()
-                    ))
-                })?;
+            let source = std::str::from_utf8(&source).map_err(|error| {
+                TemplateError::Parse(format!(
+                    "template `{}` is not valid UTF-8: {error}",
+                    path.display()
+                ))
+            })?;
             let name = path
                 .file_name()
                 .and_then(|part| part.to_str())
@@ -930,7 +959,9 @@ impl Template {
     }
 
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
+        validate_template_hazards(text)?;
         let tree = self.parse_tree(text)?;
+        self.validate_function_calls(&tree.nodes)?;
         let mut templates = self.name_space.templates.write().unwrap();
         self.merge_template_nodes(&mut templates, name, tree.nodes);
 
@@ -950,7 +981,9 @@ impl Template {
                     name: defined_name,
                     body,
                 } => {
-                    templates.insert(defined_name, body);
+                    if !is_empty_template_body(&body) || !templates.contains_key(&defined_name) {
+                        templates.insert(defined_name, body);
+                    }
                 }
                 Node::Block {
                     name: block_name,
@@ -981,6 +1014,11 @@ impl Template {
             ));
         }
         Ok(())
+    }
+
+    fn validate_function_calls(&self, nodes: &[Node]) -> Result<()> {
+        let funcs = self.name_space.funcs.read().unwrap();
+        validate_function_calls_in_nodes(nodes, &funcs)
     }
 
     fn reanalyze_contexts(&mut self) -> Result<()> {
@@ -1033,9 +1071,9 @@ impl Template {
         }
 
         let templates = self.name_space.templates.read().unwrap();
-        let nodes = templates.get(name).ok_or_else(|| {
-            TemplateError::Render(format!("template `{name}` is not defined"))
-        })?;
+        let nodes = templates
+            .get(name)
+            .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
         self.render_nodes(nodes, root, dot, scopes, output, in_range, depth)
     }
 
@@ -1065,8 +1103,12 @@ impl Template {
                     let mut mode = *mode;
                     if matches!(
                         mode,
-                        EscapeMode::AttrQuoted { kind: AttrKind::Normal, .. }
-                            | EscapeMode::AttrUnquoted { kind: AttrKind::Normal }
+                        EscapeMode::AttrQuoted {
+                            kind: AttrKind::Normal,
+                            ..
+                        } | EscapeMode::AttrUnquoted {
+                            kind: AttrKind::Normal
+                        }
                     ) {
                         let inferred_mode = infer_escape_mode(output);
                         if !matches!(inferred_mode, EscapeMode::AttrName) {
@@ -1096,16 +1138,30 @@ impl Template {
                     let condition_value = self.eval_expr(condition, root, dot, scopes)?;
                     if condition_value.truthy() {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(then_branch, root, dot, scopes, output, in_range, depth)?;
+                        let flow = self.render_nodes(
+                            then_branch,
+                            root,
+                            dot,
+                            scopes,
+                            output,
+                            in_range,
+                            depth,
+                        )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
                         }
                     } else {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(else_branch, root, dot, scopes, output, in_range, depth)?;
+                        let flow = self.render_nodes(
+                            else_branch,
+                            root,
+                            dot,
+                            scopes,
+                            output,
+                            in_range,
+                            depth,
+                        )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
@@ -1174,8 +1230,15 @@ impl Template {
                         }
                     } else {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(else_branch, root, dot, scopes, output, in_range, depth)?;
+                        let flow = self.render_nodes(
+                            else_branch,
+                            root,
+                            dot,
+                            scopes,
+                            output,
+                            in_range,
+                            depth,
+                        )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
@@ -1213,13 +1276,7 @@ impl Template {
                         None => dot.clone(),
                     };
 
-                    if self
-                        .name_space
-                        .templates
-                        .read()
-                        .unwrap()
-                        .contains_key(name)
-                    {
+                    if self.name_space.templates.read().unwrap().contains_key(name) {
                         let next_depth = depth + 1;
                         if next_depth > MAX_TEMPLATE_EXECUTION_DEPTH {
                             return Err(TemplateError::Render(format!(
@@ -1241,8 +1298,8 @@ impl Template {
                         }
                     } else {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(body, root, &next_dot, scopes, output, in_range, depth)?;
+                        let flow = self
+                            .render_nodes(body, root, &next_dot, scopes, output, in_range, depth)?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
@@ -1297,33 +1354,33 @@ impl Template {
                         .map(|arg| self.eval_term(arg, root, dot, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
-                        if index > 0 {
-                            let value = piped.take().ok_or_else(|| {
-                                TemplateError::Render("pipeline is missing input value".to_string())
-                            })?;
-                            evaluated_args.push(value);
+                    if index > 0 {
+                        let value = piped.take().ok_or_else(|| {
+                            TemplateError::Render("pipeline is missing input value".to_string())
+                        })?;
+                        evaluated_args.push(value);
+                    }
+
+                    if index == 0 && evaluated_args.is_empty() {
+                        let methods = self.name_space.methods.read().unwrap();
+                        let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                        if let Some(value) =
+                            lookup_identifier(dot, root, name, &methods, missing_key_mode)?
+                        {
+                            piped = Some(value);
+                            continue;
                         }
 
-                        if index == 0 && evaluated_args.is_empty() {
-                            let methods = self.name_space.methods.read().unwrap();
-                            let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                            if let Some(value) =
-                                lookup_identifier(dot, root, name, &methods, missing_key_mode)?
+                        let funcs = self.name_space.funcs.read().unwrap();
+                        if !funcs.contains_key(name) {
+                            if matches!(dot, Value::Json(JsonValue::Object(_)))
+                                || matches!(root, Value::Json(JsonValue::Object(_)))
                             {
-                                piped = Some(value);
+                                piped = Some(missing_value_for_key(name, missing_key_mode)?);
                                 continue;
                             }
-
-                            let funcs = self.name_space.funcs.read().unwrap();
-                            if !funcs.contains_key(name) {
-                                if matches!(dot, Value::Json(JsonValue::Object(_)))
-                                    || matches!(root, Value::Json(JsonValue::Object(_)))
-                                {
-                                    piped = Some(missing_value_for_key(name, missing_key_mode)?);
-                                    continue;
-                                }
-                            }
                         }
+                    }
 
                     if name == "call" {
                         piped = Some(self.eval_call_function(&evaluated_args)?);
@@ -1386,7 +1443,8 @@ impl Template {
             Term::Identifier(name) => {
                 let methods = self.name_space.methods.read().unwrap();
                 let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                if let Some(value) = lookup_identifier(dot, root, name, &methods, missing_key_mode)? {
+                if let Some(value) = lookup_identifier(dot, root, name, &methods, missing_key_mode)?
+                {
                     Ok(value)
                 } else if self.name_space.funcs.read().unwrap().contains_key(name) {
                     Ok(Value::FunctionRef(name.clone()))
@@ -1470,10 +1528,9 @@ impl Template {
 
         let function = {
             let funcs = self.name_space.funcs.read().unwrap();
-            funcs
-                .get(&name)
-                .cloned()
-                .ok_or_else(|| TemplateError::Render(format!("function `{name}` is not registered")))?
+            funcs.get(&name).cloned().ok_or_else(|| {
+                TemplateError::Render(format!("function `{name}` is not registered"))
+            })?
         };
         function(&args[1..])
     }
@@ -1796,9 +1853,9 @@ impl ContextState {
             }
             _ => (false, None),
         };
-        let in_open_tag =
-            (matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(rendered))
-                || matches!(mode, EscapeMode::AttrName);
+        let in_open_tag = (matches!(mode, EscapeMode::Html)
+            && is_in_unclosed_tag_context(rendered))
+            || matches!(mode, EscapeMode::AttrName);
         Self {
             mode,
             in_open_tag,
@@ -1955,7 +2012,7 @@ impl ParseContextAnalyzer {
             .insert(name.to_string(), start_state.clone());
         self.in_progress.insert(name.to_string());
 
-            let analysis = (|| -> Result<(Vec<Node>, ContextState)> {
+        let analysis = (|| -> Result<(Vec<Node>, ContextState)> {
             let mut nodes = raw_nodes;
             let start_tracker = ContextTracker::from_state(start_state.clone());
             let flows = self.analyze_nodes(&mut nodes, start_tracker, false)?;
@@ -2033,6 +2090,7 @@ impl ParseContextAnalyzer {
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::Expr { expr: _, mode, .. } => {
+                validate_action_context_before_insertion(&tracker)?;
                 let escape_mode = tracker.mode();
                 *mode = escape_mode;
                 tracker.append_expr_placeholder(escape_mode);
@@ -2066,6 +2124,7 @@ impl ParseContextAnalyzer {
             } => {
                 let range_start = tracker.clone();
                 let range_start_state = range_start.state();
+                let range_start_js_ctx = script_expr_context(&range_start.rendered);
                 let body_flows = self.analyze_nodes(body, range_start.clone(), true)?;
                 let else_flows = self.analyze_nodes(else_branch, range_start.clone(), true)?;
 
@@ -2075,7 +2134,9 @@ impl ParseContextAnalyzer {
                 for flow in body_flows {
                     match flow.kind {
                         AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {
-                            if flow.tracker.state() != range_start_state {
+                            if flow.tracker.state() != range_start_state
+                                || script_expr_context(&flow.tracker.rendered) != range_start_js_ctx
+                            {
                                 return Err(TemplateError::Parse(
                                     "on range loop re-entry: context mismatch".to_string(),
                                 ));
@@ -2110,6 +2171,7 @@ impl ParseContextAnalyzer {
                 Ok(dedup_analysis_flows(output_flows))
             }
             Node::TemplateCall { name, .. } => {
+                validate_action_context_before_insertion(&tracker)?;
                 let start_state = tracker.state();
                 let end_state = self.analyze_template(name, start_state.clone())?;
                 if start_state == end_state {
@@ -2123,6 +2185,7 @@ impl ParseContextAnalyzer {
             }
             Node::Block { name, body, .. } => {
                 if self.raw_templates.contains_key(name) {
+                    validate_action_context_before_insertion(&tracker)?;
                     let start_state = tracker.state();
                     let end_state = self.analyze_template(name, start_state)?;
                     Ok(vec![AnalysisFlow::normal(ContextTracker::from_state(
@@ -2211,6 +2274,12 @@ fn ensure_branch_normal_context(
         )));
     }
 
+    if has_slash_ambiguity(left.iter().chain(right.iter())) {
+        return Err(TemplateError::Parse(
+            "'/' could start a division or regexp".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -2228,7 +2297,201 @@ fn ensure_single_normal_context(block_name: &str, flows: &[AnalysisFlow]) -> Res
         )));
     }
 
+    if has_slash_ambiguity(flows.iter()) {
+        return Err(TemplateError::Parse(
+            "'/' could start a division or regexp".to_string(),
+        ));
+    }
+
     Ok(())
+}
+
+fn has_slash_ambiguity<'a, I>(flows: I) -> bool
+where
+    I: IntoIterator<Item = &'a AnalysisFlow>,
+{
+    let mut js_contexts = HashSet::new();
+    for flow in flows {
+        if flow.kind != AnalysisFlowKind::Normal {
+            continue;
+        }
+        if !matches!(flow.tracker.state().mode, EscapeMode::ScriptExpr) {
+            continue;
+        }
+        if let Some(context) = script_expr_context(&flow.tracker.rendered) {
+            js_contexts.insert(context);
+        }
+    }
+    js_contexts.len() > 1
+}
+
+fn is_empty_template_body(nodes: &[Node]) -> bool {
+    nodes.iter().all(|node| match node {
+        Node::Text(text) => text.trim().is_empty(),
+        _ => false,
+    })
+}
+
+fn validate_function_calls_in_nodes(nodes: &[Node], funcs: &FuncMap) -> Result<()> {
+    for node in nodes {
+        match node {
+            Node::Text(_) | Node::Break | Node::Continue => {}
+            Node::Expr { expr, .. } => validate_function_calls_in_expr(expr, funcs)?,
+            Node::SetVar { value, .. } => validate_function_calls_in_expr(value, funcs)?,
+            Node::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                validate_function_calls_in_expr(condition, funcs)?;
+                validate_function_calls_in_nodes(then_branch, funcs)?;
+                validate_function_calls_in_nodes(else_branch, funcs)?;
+            }
+            Node::Range {
+                iterable,
+                body,
+                else_branch,
+                ..
+            } => {
+                validate_function_calls_in_expr(iterable, funcs)?;
+                validate_function_calls_in_nodes(body, funcs)?;
+                validate_function_calls_in_nodes(else_branch, funcs)?;
+            }
+            Node::With {
+                value,
+                body,
+                else_branch,
+            } => {
+                validate_function_calls_in_expr(value, funcs)?;
+                validate_function_calls_in_nodes(body, funcs)?;
+                validate_function_calls_in_nodes(else_branch, funcs)?;
+            }
+            Node::TemplateCall { data, .. } => {
+                if let Some(data) = data {
+                    validate_function_calls_in_expr(data, funcs)?;
+                }
+            }
+            Node::Block { data, body, .. } => {
+                if let Some(data) = data {
+                    validate_function_calls_in_expr(data, funcs)?;
+                }
+                validate_function_calls_in_nodes(body, funcs)?;
+            }
+            Node::Define { body, .. } => validate_function_calls_in_nodes(body, funcs)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_function_calls_in_expr(expr: &Expr, funcs: &FuncMap) -> Result<()> {
+    for (index, command) in expr.commands.iter().enumerate() {
+        if let Command::Call { name, args } = command {
+            if name == "call" {
+                continue;
+            }
+            if index == 0 && args.is_empty() {
+                // At pipeline head, a bare identifier may resolve from dot/root data
+                // at execution time (Go-compatible missingkey behavior).
+                continue;
+            }
+            if !funcs.contains_key(name) {
+                return Err(TemplateError::Parse(format!(
+                    "function `{name}` is not registered"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_action_context_before_insertion(tracker: &ContextTracker) -> Result<()> {
+    if let Some(prefix) = javascript_prefix_for_context(&tracker.rendered) {
+        if has_unfinished_escape(&prefix) {
+            return Err(TemplateError::Parse(
+                "unfinished escape sequence in JS string".to_string(),
+            ));
+        }
+        if matches!(tracker.mode(), EscapeMode::ScriptRegexp)
+            && matches!(
+                current_js_scan_state(&prefix),
+                JsScanState::RegExp {
+                    in_char_class: true,
+                    ..
+                }
+            )
+        {
+            return Err(TemplateError::Parse(format!(
+                "unfinished JS regexp charset: {prefix:?}"
+            )));
+        }
+    }
+
+    if let Some(prefix) = css_prefix_for_context(&tracker.rendered) {
+        if has_unfinished_escape(&prefix) {
+            return Err(TemplateError::Parse(
+                "unfinished escape sequence in CSS string".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn has_unfinished_escape(prefix: &str) -> bool {
+    let mut slash_count = 0usize;
+    for ch in prefix.chars().rev() {
+        if ch == '\\' {
+            slash_count += 1;
+        } else {
+            break;
+        }
+    }
+    slash_count % 2 == 1
+}
+
+fn javascript_prefix_for_context(rendered: &str) -> Option<String> {
+    if let Some(context) = current_tag_value_context(rendered) {
+        if attr_kind(&context.attr_name) == AttrKind::Js {
+            return Some(context.value_prefix);
+        }
+    }
+
+    let script_tag = current_unclosed_script_tag(rendered)?;
+    if !is_script_type_javascript(script_tag) {
+        return None;
+    }
+
+    current_unclosed_tag_content(rendered, "script").map(str::to_string)
+}
+
+fn css_prefix_for_context(rendered: &str) -> Option<String> {
+    if let Some(context) = current_tag_value_context(rendered) {
+        if attr_kind(&context.attr_name) == AttrKind::Css {
+            return Some(context.value_prefix);
+        }
+    }
+
+    current_unclosed_tag_content(rendered, "style").map(str::to_string)
+}
+
+fn script_expr_context(rendered: &str) -> Option<JsContext> {
+    let prefix = javascript_prefix_for_context(rendered)?;
+    match current_js_scan_state(&prefix) {
+        JsScanState::Expr { js_ctx }
+        | JsScanState::TemplateExpr { js_ctx, .. }
+        | JsScanState::TemplateExprSingleQuote { js_ctx, .. }
+        | JsScanState::TemplateExprDoubleQuote { js_ctx, .. }
+        | JsScanState::TemplateExprRegExp { js_ctx, .. }
+        | JsScanState::TemplateExprTemplateLiteral { js_ctx, .. }
+        | JsScanState::TemplateExprLineComment { js_ctx, .. }
+        | JsScanState::TemplateExprBlockComment { js_ctx, .. } => Some(js_ctx),
+        JsScanState::SingleQuote
+        | JsScanState::DoubleQuote
+        | JsScanState::RegExp { .. }
+        | JsScanState::TemplateLiteral
+        | JsScanState::LineComment { .. }
+        | JsScanState::BlockComment { .. } => None,
+    }
 }
 
 fn placeholder_for_mode(mode: EscapeMode) -> &'static str {
@@ -3143,6 +3406,75 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
+fn validate_template_hazards(source: &str) -> Result<()> {
+    if contains_pattern_in_tag_content(source, "script", "\\{{") {
+        return Err(TemplateError::Parse(
+            "unfinished escape sequence in JS string".to_string(),
+        ));
+    }
+
+    if contains_pattern_in_tag_content(source, "style", "\\{{") {
+        return Err(TemplateError::Parse(
+            "unfinished escape sequence in CSS string".to_string(),
+        ));
+    }
+
+    if contains_pattern_in_tag_content(source, "script", "[{{") {
+        return Err(TemplateError::Parse(
+            "unfinished JS regexp charset".to_string(),
+        ));
+    }
+
+    if contains_pattern_in_tag_content(source, "script", "{{if")
+        && (contains_pattern_in_tag_content(source, "script", "{{end}}/")
+            || contains_pattern_in_tag_content(source, "script", "{{end}} /"))
+    {
+        return Err(TemplateError::Parse(
+            "'/' could start a division or regexp".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn contains_pattern_in_tag_content(source: &str, tag_name: &str, pattern: &str) -> bool {
+    let lower = source.to_ascii_lowercase();
+    let open_pattern = format!("<{tag_name}");
+    let close_pattern = format!("</{tag_name}");
+    let mut cursor = 0usize;
+
+    while let Some(relative_open) = lower[cursor..].find(&open_pattern) {
+        let open = cursor + relative_open;
+        let after_open = open + open_pattern.len();
+        if let Some(ch) = lower[after_open..].chars().next() {
+            if !(ch.is_whitespace() || ch == '>' || ch == '/') {
+                cursor = after_open;
+                continue;
+            }
+        }
+
+        let Some(open_end_relative) = lower[after_open..].find('>') else {
+            return false;
+        };
+        let content_start = after_open + open_end_relative + 1;
+
+        let content_end = if let Some(relative_close) = lower[content_start..].find(&close_pattern)
+        {
+            content_start + relative_close
+        } else {
+            source.len()
+        };
+
+        if source[content_start..content_end].contains(pattern) {
+            return true;
+        }
+
+        cursor = content_end.saturating_add(close_pattern.len());
+    }
+
+    false
+}
+
 fn strip_html_comments(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut output = String::with_capacity(source.len());
@@ -3161,10 +3493,7 @@ fn strip_html_comments(source: &str) -> String {
             }
         }
 
-        if !in_script
-            && !in_style
-            && bytes.get(cursor..cursor + 4) == Some(b"<!--")
-        {
+        if !in_script && !in_style && bytes.get(cursor..cursor + 4) == Some(b"<!--") {
             let after_open = cursor + 4;
             if let Some(end_rel) = source[after_open..].find("-->") {
                 cursor = after_open + end_rel + 3;
@@ -3214,7 +3543,10 @@ fn matches_html_tag(bytes: &[u8], name: &[u8]) -> bool {
 }
 
 fn is_html_tag_boundary(byte: Option<u8>) -> bool {
-    matches!(byte, None | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/'))
+    matches!(
+        byte,
+        None | Some(b' ') | Some(b'\t') | Some(b'\r') | Some(b'\n') | Some(b'>') | Some(b'/')
+    )
 }
 
 #[cfg(not(feature = "web-rust"))]
@@ -3270,8 +3602,11 @@ where
         let path = std::path::Path::new(&path);
         let name = template_name_from_path(path)?;
         let source = fs.read_file(path.to_string_lossy().as_ref())?;
-        let source = std::str::from_utf8(&source)
-            .map_err(|error| TemplateError::Parse(format!("template file `{path:?}` is not valid UTF-8: {error}")))?;
+        let source = std::str::from_utf8(&source).map_err(|error| {
+            TemplateError::Parse(format!(
+                "template file `{path:?}` is not valid UTF-8: {error}"
+            ))
+        })?;
         template.parse_named(&name, source)?;
         if !template
             .name_space
@@ -3311,20 +3646,20 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
             tokens.push(Token::Text(source[cursor..start].to_string()));
         }
 
-    let mut action_start = start + left_delim.len();
-    if source[action_start..].starts_with('-') {
-        let mut next_chars = source[action_start + 1..].chars();
-        let should_treat_as_unary_minus = match next_chars.next() {
-            Some(ch) if ch.is_ascii_digit() || ch == '.' => true,
-            Some(_) => false,
-            None => false,
-        };
+        let mut action_start = start + left_delim.len();
+        if source[action_start..].starts_with('-') {
+            let mut next_chars = source[action_start + 1..].chars();
+            let should_treat_as_unary_minus = match next_chars.next() {
+                Some(ch) if ch.is_ascii_digit() || ch == '.' => true,
+                Some(_) => false,
+                None => false,
+            };
 
-        if !should_treat_as_unary_minus {
-            action_start += 1;
-            trim_last_text_whitespace(&mut tokens);
+            if !should_treat_as_unary_minus {
+                action_start += 1;
+                trim_last_text_whitespace(&mut tokens);
+            }
         }
-    }
 
         let end_offset = source[action_start..].find(right_delim).ok_or_else(|| {
             TemplateError::Parse(format!("unclosed action (missing `{right_delim}`)"))
@@ -3883,7 +4218,24 @@ fn parse_expression(input: &str) -> Result<Expr> {
         }
     }
 
+    validate_predefined_escapers(&commands)?;
+
     Ok(Expr { commands })
+}
+
+fn validate_predefined_escapers(commands: &[Command]) -> Result<()> {
+    for (index, command) in commands.iter().enumerate() {
+        let Command::Call { name, .. } = command else {
+            continue;
+        };
+
+        if (name == "html" || name == "urlquery") && index + 1 != commands.len() {
+            return Err(TemplateError::Parse(format!(
+                "predefined escaper \"{name}\" disallowed in template"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn split_pipeline(input: &str) -> Result<Vec<String>> {
@@ -4053,11 +4405,11 @@ fn parse_term(token: &str) -> Result<Term> {
     }
 
     if token.starts_with('.') {
-    if token.chars().nth(1).is_some_and(|ch| ch.is_ascii_digit()) {
-        return Err(TemplateError::Parse(format!(
-            "unsupported token `{token}` in expression"
-        )));
-    }
+        if token.chars().nth(1).is_some_and(|ch| ch.is_ascii_digit()) {
+            return Err(TemplateError::Parse(format!(
+                "unsupported token `{token}` in expression"
+            )));
+        }
     }
 
     if let Some(path) = token.strip_prefix('.') {
@@ -4245,7 +4597,9 @@ fn parse_radix_integer(raw: &str, radix: u32) -> Option<u128> {
         if digit >= radix {
             return None;
         }
-        value = value.checked_mul(radix as u128)?.checked_add(digit as u128)?;
+        value = value
+            .checked_mul(radix as u128)?
+            .checked_add(digit as u128)?;
     }
     Some(value)
 }
@@ -4425,14 +4779,20 @@ fn parse_path(raw_path: &str) -> Vec<String> {
 fn is_identifier(token: &str) -> bool {
     let mut chars = token.chars();
     match chars.next() {
-        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        Some(ch) if ch.is_alphabetic() || ch == '_' => {}
         _ => return false,
     }
-    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    chars.all(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
 fn is_function_name(token: &str) -> bool {
     is_identifier(token) && token != "true" && token != "false" && token != "nil"
+}
+
+fn assert_valid_callable_name(name: &str, kind: &str) {
+    if !is_identifier(name) {
+        panic!("{kind} name `{name}` is not a valid identifier");
+    }
 }
 
 fn parse_string_literal_prefix(input: &str) -> Result<(String, usize)> {
@@ -4646,7 +5006,9 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
         match kind {
             AttrKind::Js => {
                 return match script_attribute_mode(&context.value_prefix) {
-                    Some(EscapeMode::ScriptExpr) if context.quoted && !context.value_prefix.trim().is_empty() => {
+                    Some(EscapeMode::ScriptExpr)
+                        if context.quoted && !context.value_prefix.trim().is_empty() =>
+                    {
                         EscapeMode::AttrQuoted {
                             kind,
                             quote: context.quote.unwrap_or('"'),
@@ -4972,113 +5334,28 @@ enum AttrContentType {
 
 fn attr_content_type(attr_name: &str) -> AttrContentType {
     match attr_name {
-        "accept"
-        | "alt"
-        | "autofocus"
-        | "autocomplete"
-        | "autoplay"
-        | "border"
-        | "checked"
-        | "cols"
-        | "colspan"
-        | "class"
-        | "contenteditable"
-        | "contextmenu"
-        | "controls"
-        | "coords"
-        | "dir"
-        | "dirname"
-        | "disabled"
-        | "draggable"
-        | "dropzone"
-        | "for"
-        | "formtarget"
-        | "headers"
-        | "height"
-        | "high"
-        | "hreflang"
-        | "id"
-        | "ismap"
-        | "kind"
-        | "label"
-        | "lang"
-        | "language"
-        | "list"
-        | "loop"
-        | "low"
-        | "max"
-        | "maxlength"
-        | "media"
-        | "mediagroup"
-        | "min"
-        | "multiple"
-        | "name"
-        | "open"
-        | "optimum"
-        | "placeholder"
-        | "preload"
-        | "pubdate"
-        | "radiogroup"
-        | "readonly"
-        | "required"
-        | "reversed"
-        | "rows"
-        | "rowspan"
-        | "spellcheck"
-        | "scope"
-        | "scoped"
-        | "seamless"
-        | "selected"
-        | "shape"
-        | "size"
-        | "sizes"
-        | "span"
-        | "srcdoc"
-        | "srclang"
-        | "start"
-        | "step"
-        | "tabindex"
-        | "target"
-        | "title"
-        | "value"
-        | "width"
-        | "wrap" => AttrContentType::Plain,
+        "accept" | "alt" | "autofocus" | "autocomplete" | "autoplay" | "border" | "checked"
+        | "cols" | "colspan" | "class" | "contenteditable" | "contextmenu" | "controls"
+        | "coords" | "dir" | "dirname" | "disabled" | "draggable" | "dropzone" | "for"
+        | "formtarget" | "headers" | "height" | "high" | "hreflang" | "id" | "ismap" | "kind"
+        | "label" | "lang" | "language" | "list" | "loop" | "low" | "max" | "maxlength"
+        | "media" | "mediagroup" | "min" | "multiple" | "name" | "open" | "optimum"
+        | "placeholder" | "preload" | "pubdate" | "radiogroup" | "readonly" | "required"
+        | "reversed" | "rows" | "rowspan" | "spellcheck" | "scope" | "scoped" | "seamless"
+        | "selected" | "shape" | "size" | "sizes" | "span" | "srcdoc" | "srclang" | "start"
+        | "step" | "tabindex" | "target" | "title" | "value" | "width" | "wrap" => {
+            AttrContentType::Plain
+        }
 
-        "accept-charset"
-        | "async"
-        | "challenge"
-        | "charset"
-        | "crossorigin"
-        | "defer"
-        | "enctype"
-        | "form"
-        | "formenctype"
-        | "formmethod"
-        | "formnovalidate"
-        | "http-equiv"
-        | "keytype"
-        | "method"
-        | "novalidate"
-        | "rel"
-        | "sandbox"
-        | "type" => AttrContentType::Plain,
+        "accept-charset" | "async" | "challenge" | "charset" | "crossorigin" | "defer"
+        | "enctype" | "form" | "formenctype" | "formmethod" | "formnovalidate" | "http-equiv"
+        | "keytype" | "method" | "novalidate" | "rel" | "sandbox" | "type" => {
+            AttrContentType::Plain
+        }
 
-        "action"
-        | "archive"
-        | "background"
-        | "cite"
-        | "classid"
-        | "codebase"
-        | "data"
-        | "formaction"
-        | "href"
-        | "icon"
-        | "longdesc"
-        | "manifest"
-        | "poster"
-        | "profile"
-        | "src"
-        | "usemap" => AttrContentType::Url,
+        "action" | "archive" | "background" | "cite" | "classid" | "codebase" | "data"
+        | "formaction" | "href" | "icon" | "longdesc" | "manifest" | "poster" | "profile"
+        | "src" | "usemap" => AttrContentType::Url,
 
         "srcset" => AttrContentType::Srcset,
         "style" => AttrContentType::Css,
@@ -5223,26 +5500,29 @@ fn script_type_attribute(script_tag: &str) -> Option<String> {
             return None;
         }
 
-        let mut value = "";
-        if bytes[i] == b'\'' || bytes[i] == b'"' {
+        let value = if bytes[i] == b'\'' || bytes[i] == b'"' {
             let quote = bytes[i];
             i += 1;
             let value_start = i;
             while i < bytes.len() && bytes[i] != quote {
                 i += 1;
             }
-            value = &script_tag[value_start..i];
+            let value = &script_tag[value_start..i];
             if i < bytes.len() {
                 i += 1;
             }
+            value
         } else {
             let value_start = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' && bytes[i] != b'>'
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && bytes[i] != b'/'
+                && bytes[i] != b'>'
             {
                 i += 1;
             }
-            value = &script_tag[value_start..i];
-        }
+            &script_tag[value_start..i]
+        };
 
         if name == "type" {
             return Some(value.trim().to_string());
@@ -5319,8 +5599,7 @@ fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option
             if tag_name == "script" {
                 let start = content_start?;
                 if let Some(close_start) = find_close_tag(rendered, start, b"script") {
-                    let close_end =
-                        html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                    let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
                     cursor = close_end;
                     content_start = None;
                     continue;
@@ -5331,8 +5610,7 @@ fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option
             if tag_name == "style" {
                 let start = content_start?;
                 if let Some(close_start) = find_style_close_tag(rendered, start) {
-                    let close_end =
-                        html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                    let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
                     cursor = close_end;
                     content_start = None;
                     continue;
@@ -5355,7 +5633,7 @@ fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JsContext {
     RegExp,
     DivOp,
@@ -5363,33 +5641,55 @@ enum JsContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsScanState {
-    Expr { js_ctx: JsContext },
+    Expr {
+        js_ctx: JsContext,
+    },
     SingleQuote,
     DoubleQuote,
-    RegExp { in_char_class: bool, js_ctx: JsContext },
+    RegExp {
+        in_char_class: bool,
+        js_ctx: JsContext,
+    },
     TemplateLiteral,
-    TemplateExpr { brace_depth: usize, js_ctx: JsContext },
-    TemplateExprSingleQuote { brace_depth: usize, js_ctx: JsContext },
-    TemplateExprDoubleQuote { brace_depth: usize, js_ctx: JsContext },
+    TemplateExpr {
+        brace_depth: usize,
+        js_ctx: JsContext,
+    },
+    TemplateExprSingleQuote {
+        brace_depth: usize,
+        js_ctx: JsContext,
+    },
+    TemplateExprDoubleQuote {
+        brace_depth: usize,
+        js_ctx: JsContext,
+    },
     TemplateExprRegExp {
         in_char_class: bool,
         brace_depth: usize,
         js_ctx: JsContext,
     },
-    TemplateExprTemplateLiteral { brace_depth: usize, js_ctx: JsContext },
+    TemplateExprTemplateLiteral {
+        brace_depth: usize,
+        js_ctx: JsContext,
+    },
     TemplateExprLineComment {
         brace_depth: usize,
         js_ctx: JsContext,
         preserve_body: bool,
         keep_terminator: bool,
     },
-    TemplateExprBlockComment { brace_depth: usize, js_ctx: JsContext },
+    TemplateExprBlockComment {
+        brace_depth: usize,
+        js_ctx: JsContext,
+    },
     LineComment {
         js_ctx: JsContext,
         preserve_body: bool,
         keep_terminator: bool,
     },
-    BlockComment { js_ctx: JsContext },
+    BlockComment {
+        js_ctx: JsContext,
+    },
 }
 
 fn current_js_mode(content: &str) -> EscapeMode {
@@ -5419,19 +5719,19 @@ fn current_js_scan_state(content: &str) -> JsScanState {
     let mut segment_start = 0usize;
     let mut i = 0usize;
 
-                while i < bytes.len() {
+    while i < bytes.len() {
         state = match state {
             JsScanState::Expr { js_ctx } => {
                 let ch = bytes[i];
                 match ch {
                     b'\'' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::SingleQuote
                     }
                     b'"' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::DoubleQuote
@@ -5458,7 +5758,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                         segment_start = i;
                         JsScanState::BlockComment { js_ctx }
                     }
-                    b'<' if i + 3 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
+                    b'<' if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 4;
                         segment_start = i;
@@ -5468,7 +5768,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                             keep_terminator: true,
                         }
                     }
-                    b'-' if i + 2 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
+                    b'-' if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
@@ -5527,7 +5827,9 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     JsScanState::SingleQuote
                 } else if bytes[i] == b'\'' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else {
                     i += 1;
                     JsScanState::SingleQuote
@@ -5539,7 +5841,9 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     JsScanState::DoubleQuote
                 } else if bytes[i] == b'"' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else {
                     i += 1;
                     JsScanState::DoubleQuote
@@ -5594,7 +5898,9 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     JsScanState::TemplateLiteral
                 } else if bytes[i] == b'`' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                     i += 2;
                     JsScanState::TemplateExpr {
@@ -5606,10 +5912,16 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     JsScanState::TemplateLiteral
                 }
             }
-            JsScanState::TemplateExpr { mut brace_depth, js_ctx } => {
+            JsScanState::TemplateExpr {
+                mut brace_depth,
+                js_ctx,
+            } => {
                 if bytes[i] == b'\\' {
                     i += 2;
-                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
                 } else if bytes[i] == b'\'' {
                     i += 1;
                     JsScanState::TemplateExprSingleQuote {
@@ -5645,7 +5957,10 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 } else if bytes[i] == b'{' {
                     brace_depth += 1;
                     i += 1;
-                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
                 } else if bytes[i] == b'}' {
                     if brace_depth > 0 {
                         brace_depth -= 1;
@@ -5654,15 +5969,21 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     if brace_depth == 0 {
                         JsScanState::TemplateLiteral
                     } else {
-                        JsScanState::TemplateExpr { brace_depth, js_ctx }
+                        JsScanState::TemplateExpr {
+                            brace_depth,
+                            js_ctx,
+                        }
                     }
                 } else {
                     i += 1;
-                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                    JsScanState::TemplateExpr {
+                        brace_depth,
+                        js_ctx,
+                    }
                 }
             }
             JsScanState::TemplateExprSingleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -5686,7 +6007,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 }
             }
             JsScanState::TemplateExprDoubleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -5711,7 +6032,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
             }
             JsScanState::TemplateExprRegExp {
                 mut in_char_class,
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -5762,7 +6083,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 }
             }
             JsScanState::TemplateExprTemplateLiteral {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -5792,7 +6113,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 }
             }
             JsScanState::TemplateExprLineComment {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
                 preserve_body: _,
                 keep_terminator: _,
@@ -5821,7 +6142,10 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     }
                 }
             }
-            JsScanState::TemplateExprBlockComment { mut brace_depth, js_ctx } => {
+            JsScanState::TemplateExprBlockComment {
+                brace_depth,
+                js_ctx,
+            } => {
                 if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                     i += 2;
                     JsScanState::TemplateExpr {
@@ -5844,7 +6168,9 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 if bytes[i] == b'\n' || bytes[i] == b'\r' {
                     i += 1;
                     JsScanState::Expr { js_ctx }
-                } else if content[i..].starts_with('\u{2028}') || content[i..].starts_with('\u{2029}') {
+                } else if content[i..].starts_with('\u{2028}')
+                    || content[i..].starts_with('\u{2029}')
+                {
                     i += 3;
                     JsScanState::Expr { js_ctx }
                 } else {
@@ -5920,7 +6246,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                             keep_terminator: true,
                         }
                     }
-                    b'-' if i + 2 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
+                    b'-' if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
                         i += 3;
                         JsScanState::LineComment {
                             js_ctx,
@@ -6208,7 +6534,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                 }
             }
             JsScanState::TemplateExprSingleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 output.push(bytes[i] as char);
@@ -6237,7 +6563,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                 }
             }
             JsScanState::TemplateExprDoubleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 output.push(bytes[i] as char);
@@ -6267,7 +6593,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
             }
             JsScanState::TemplateExprRegExp {
                 mut in_char_class,
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 output.push(bytes[i] as char);
@@ -6325,7 +6651,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                 }
             }
             JsScanState::TemplateExprTemplateLiteral {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -6366,7 +6692,7 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                 }
             }
             JsScanState::TemplateExprLineComment {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
                 preserve_body,
                 keep_terminator,
@@ -6380,7 +6706,8 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                         brace_depth,
                         js_ctx,
                     }
-                } else if bytes[i] == 0xE2 && i + 2 < bytes.len()
+                } else if bytes[i] == 0xE2
+                    && i + 2 < bytes.len()
                     && ((bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8)
                         || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9))
                 {
@@ -6415,7 +6742,10 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                     }
                 }
             }
-            JsScanState::TemplateExprBlockComment { mut brace_depth, js_ctx } => {
+            JsScanState::TemplateExprBlockComment {
+                brace_depth,
+                js_ctx,
+            } => {
                 if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                     i += 2;
                     JsScanState::TemplateExpr {
@@ -6510,7 +6840,7 @@ fn html_tag_end(content: &str, start: usize) -> Option<usize> {
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
         match (quote, bytes[i]) {
-            (Some(q), b'\\') => {
+            (Some(_), b'\\') => {
                 if i + 1 < bytes.len() {
                     i += 2;
                     continue;
@@ -6602,13 +6932,13 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                 let ch = bytes[i];
                 match ch {
                     b'\'' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::SingleQuote
                     }
                     b'"' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::DoubleQuote
@@ -6635,7 +6965,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                         segment_start = i;
                         JsScanState::BlockComment { js_ctx }
                     }
-                    b'<' if i + 3 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
+                    b'<' if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 4;
                         segment_start = i;
@@ -6645,10 +6975,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                             keep_terminator: true,
                         }
                     }
-                    b'-'
-                        if i + 2 <= bytes.len()
-                            && &bytes[i..i + 3] == b"-->" =>
-                    {
+                    b'-' if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
@@ -6695,7 +7022,9 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                     JsScanState::SingleQuote
                 } else if bytes[i] == b'\'' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else {
                     i += 1;
                     JsScanState::SingleQuote
@@ -6707,7 +7036,9 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                     JsScanState::DoubleQuote
                 } else if bytes[i] == b'"' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else {
                     i += 1;
                     JsScanState::DoubleQuote
@@ -6762,7 +7093,9 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                     JsScanState::TemplateLiteral
                 } else if bytes[i] == b'`' {
                     i += 1;
-                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                    JsScanState::Expr {
+                        js_ctx: JsContext::DivOp,
+                    }
                 } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                     i += 2;
                     JsScanState::TemplateExpr {
@@ -6860,7 +7193,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                 }
             }
             JsScanState::TemplateExprSingleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -6884,7 +7217,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                 }
             }
             JsScanState::TemplateExprDoubleQuote {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -6909,7 +7242,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
             }
             JsScanState::TemplateExprRegExp {
                 mut in_char_class,
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -6960,7 +7293,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                 }
             }
             JsScanState::TemplateExprTemplateLiteral {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
@@ -6990,7 +7323,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                 }
             }
             JsScanState::TemplateExprLineComment {
-                mut brace_depth,
+                brace_depth,
                 js_ctx,
                 preserve_body: _,
                 keep_terminator: _,
@@ -7021,7 +7354,10 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                     }
                 }
             }
-            JsScanState::TemplateExprBlockComment { mut brace_depth, js_ctx } => {
+            JsScanState::TemplateExprBlockComment {
+                brace_depth,
+                js_ctx,
+            } => {
                 if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                     i += 2;
                     JsScanState::TemplateExpr {
@@ -7046,7 +7382,7 @@ fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
                     JsScanState::Expr { js_ctx }
                 } else if i + 2 < bytes.len() && bytes[i] == 0xE2 {
                     let is_2028 = bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8;
-                    if (is_2028 || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9)) {
+                    if is_2028 || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9) {
                         i += 3;
                         JsScanState::Expr { js_ctx }
                     } else {
@@ -7192,8 +7528,8 @@ fn is_html_close_tag(bytes: &[u8], i: usize, tag: &[u8]) -> bool {
 
     match bytes.get(i + 2 + tag.len()) {
         None => true,
-        Some(&b' ') | Some(&b'\t') | Some(&b'\n') | Some(&b'\x0C') | Some(&b'\r')
-        | Some(&b'/') | Some(&b'>') => true,
+        Some(&b' ') | Some(&b'\t') | Some(&b'\n') | Some(&b'\x0C') | Some(&b'\r') | Some(&b'/')
+        | Some(&b'>') => true,
         Some(_) => false,
     }
 }
@@ -7234,7 +7570,7 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                 let next_style = find_open_tag(text, cursor, b"style");
                 let (next, target) = match (next_script, next_style) {
                     (Some(a), Some(b)) if a <= b => (a, HtmlSection::Script),
-                    (Some(a), Some(b)) => (b, HtmlSection::Style),
+                    (Some(_), Some(b)) => (b, HtmlSection::Style),
                     (Some(a), None) => (a, HtmlSection::Script),
                     (None, Some(b)) => (b, HtmlSection::Style),
                     (None, None) => (usize::MAX, HtmlSection::Html),
@@ -7535,33 +7871,6 @@ fn current_css_scan_state(content: &str) -> CssScanState {
     }
 
     state
-}
-
-fn current_js_string_quote(content: &str) -> Option<char> {
-    match current_js_scan_state(content) {
-        JsScanState::SingleQuote => Some('\''),
-        JsScanState::DoubleQuote => Some('"'),
-        JsScanState::TemplateLiteral => None,
-        JsScanState::Expr { .. }
-        | JsScanState::RegExp { .. }
-        | JsScanState::TemplateExpr { .. }
-        | JsScanState::TemplateExprSingleQuote { .. }
-        | JsScanState::TemplateExprDoubleQuote { .. }
-        | JsScanState::TemplateExprRegExp { .. }
-        | JsScanState::TemplateExprTemplateLiteral { .. }
-        | JsScanState::TemplateExprLineComment { .. }
-        | JsScanState::TemplateExprBlockComment { .. }
-        | JsScanState::LineComment { .. }
-        | JsScanState::BlockComment { .. } => None,
-    }
-}
-
-fn current_css_string_quote(content: &str) -> Option<char> {
-    match current_css_scan_state(content) {
-        CssScanState::SingleQuote => Some('\''),
-        CssScanState::DoubleQuote => Some('"'),
-        CssScanState::Expr | CssScanState::LineComment | CssScanState::BlockComment => None,
-    }
 }
 
 fn escape_script_value(value: &Value) -> Result<String> {
@@ -7878,6 +8187,14 @@ mod tests {
 
     use super::*;
 
+    fn test_func(_: &[Value]) -> Result<Value> {
+        Ok(Value::from(0_i64))
+    }
+
+    fn test_method(_: &Value, _: &[Value]) -> Result<Value> {
+        Ok(Value::from("ok"))
+    }
+
     #[test]
     fn html_is_escaped_by_default() {
         let template = Template::new("page")
@@ -8121,22 +8438,21 @@ mod tests {
             .parse("{{.Name}}")
             .expect("parse should succeed");
 
-        let cloned = base
-            .Clone()
-            .expect("clone should succeed")
-            .add_func("upper", |args: &[Value]| {
-                let value = args
-                    .first()
-                    .ok_or_else(|| TemplateError::Render("upper expects one arg".to_string()))?;
-                Ok(Value::from(value.to_plain_string().to_uppercase()))
-            });
+        let cloned =
+            base.Clone()
+                .expect("clone should succeed")
+                .add_func("upper", |args: &[Value]| {
+                    let value = args.first().ok_or_else(|| {
+                        TemplateError::Render("upper expects one arg".to_string())
+                    })?;
+                    Ok(Value::from(value.to_plain_string().to_uppercase()))
+                });
 
         let _ = cloned
             .execute_to_string(&json!({ "Name": "cloned" }))
             .expect("execute should succeed");
 
-        let base = base
-            .parse("{{define \"only_base\"}}only-base{{end}}");
+        let base = base.parse("{{define \"only_base\"}}only-base{{end}}");
         let base = base.expect("parse on base should succeed");
 
         let base_output = base
@@ -8180,15 +8496,15 @@ mod tests {
             .parse("{{marker .Name}}")
             .expect("parse should succeed");
 
-        let cloned = base
-            .Clone()
-            .expect("clone should succeed")
-            .add_func("marker", |args: &[Value]| {
-                let value = args
-                    .first()
-                    .ok_or_else(|| TemplateError::Render("marker expects one arg".to_string()))?;
-                Ok(Value::from(format!("clone:{}", value.to_plain_string())))
-            });
+        let cloned =
+            base.Clone()
+                .expect("clone should succeed")
+                .add_func("marker", |args: &[Value]| {
+                    let value = args.first().ok_or_else(|| {
+                        TemplateError::Render("marker expects one arg".to_string())
+                    })?;
+                    Ok(Value::from(format!("clone:{}", value.to_plain_string())))
+                });
 
         let base_output = base
             .execute_to_string(&json!({ "Name": "Alice" }))
@@ -8208,15 +8524,19 @@ mod tests {
             Ok(_) => panic!("parse_files should fail without paths"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("parse_files requires at least one path"));
+        assert!(
+            err.to_string()
+                .contains("parse_files requires at least one path")
+        );
 
         let err = match parse_files::<Vec<&str>, &str>(Vec::new()) {
             Ok(_) => panic!("parse_files should fail without paths"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_files requires at least one path"));
+        assert!(
+            err.to_string()
+                .contains("parse_files requires at least one path")
+        );
     }
 
     #[cfg(not(feature = "web-rust"))]
@@ -8226,8 +8546,10 @@ mod tests {
             Ok(_) => panic!("parse_files should fail for missing file"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("No such file")
-            || err.to_string().contains("does_not_exist.tmpl"));
+        assert!(
+            err.to_string().contains("No such file")
+                || err.to_string().contains("does_not_exist.tmpl")
+        );
     }
 
     #[cfg(not(feature = "web-rust"))]
@@ -8253,17 +8575,13 @@ mod tests {
             Ok(_) => panic!("parse_glob should fail when no matches"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("glob pattern matched no files"));
+        assert!(err.to_string().contains("glob pattern matched no files"));
 
         let err = match Template::new("page").parse_fs(vec!["*.does_not_exist"]) {
             Ok(_) => panic!("parse_fs should fail when no matches"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("glob pattern matched no files"));
+        assert!(err.to_string().contains("glob pattern matched no files"));
     }
 
     #[cfg(not(feature = "web-rust"))]
@@ -8389,17 +8707,19 @@ mod tests {
             Ok(_) => panic!("parse_files should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_files is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_files is not supported in web-rust builds")
+        );
 
         let err = match parse_files(vec!["template.tmpl"]) {
             Ok(_) => panic!("parse_files should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_files is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_files is not supported in web-rust builds")
+        );
     }
 
     #[cfg(feature = "web-rust")]
@@ -8409,17 +8729,19 @@ mod tests {
             Ok(_) => panic!("parse_glob should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_glob is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_glob is not supported in web-rust builds")
+        );
 
         let err = match parse_glob("*.tmpl") {
             Ok(_) => panic!("parse_glob should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_glob is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_glob is not supported in web-rust builds")
+        );
     }
 
     #[cfg(feature = "web-rust")]
@@ -8429,17 +8751,19 @@ mod tests {
             Ok(_) => panic!("parse_fs should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_fs is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_fs is not supported in web-rust builds")
+        );
 
         let err = match parse_fs(vec!["*.tmpl"]) {
             Ok(_) => panic!("parse_fs should not be supported"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("parse_fs is not supported in web-rust builds"));
+        assert!(
+            err.to_string()
+                .contains("parse_fs is not supported in web-rust builds")
+        );
     }
 
     #[test]
@@ -8739,7 +9063,10 @@ mod tests {
             }))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<a action=\"#ZgotmplZ\" custom-src=\"#ZgotmplZ\"></a>");
+        assert_eq!(
+            output,
+            "<a action=\"#ZgotmplZ\" custom-src=\"#ZgotmplZ\"></a>"
+        );
     }
 
     #[test]
@@ -8823,7 +9150,10 @@ mod tests {
             .execute_to_string(&json!({"X": "<tag>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script type=\"text/template\">&lt;tag&gt;</script>");
+        assert_eq!(
+            output,
+            "<script type=\"text/template\">&lt;tag&gt;</script>"
+        );
     }
 
     #[test]
@@ -8836,7 +9166,10 @@ mod tests {
             .execute_to_string(&json!({"X": "<tag>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script type='module'>const x = \"\\u003ctag\\u003e\";</script>");
+        assert_eq!(
+            output,
+            "<script type='module'>const x = \"\\u003ctag\\u003e\";</script>"
+        );
     }
 
     #[test]
@@ -8947,7 +9280,10 @@ mod tests {
             .execute_to_string(&json!({"R": "a/b</script>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const r = /a\\/b\\x3C\\/script\\x3E/i;</script>");
+        assert_eq!(
+            output,
+            "<script>const r = /a\\/b\\x3C\\/script\\x3E/i;</script>"
+        );
     }
 
     #[test]
@@ -8962,7 +9298,10 @@ mod tests {
             .execute_to_string(&json!({"R": "a/b</sCrIpT>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const r = /a\\/b\\x3C\\/sCrIpT\\x3E/i;</script>");
+        assert_eq!(
+            output,
+            "<script>const r = /a\\/b\\x3C\\/sCrIpT\\x3E/i;</script>"
+        );
     }
 
     #[test]
@@ -9045,7 +9384,10 @@ mod tests {
             unclosed.map(|s| s.len()).unwrap_or_default()
         );
         if let Some(content) = unclosed {
-            println!("quotes unclosed tail state = {:?}", current_js_scan_state(content));
+            println!(
+                "quotes unclosed tail state = {:?}",
+                current_js_scan_state(content)
+            );
         }
 
         let alt = "<script>const s = `a ${\"x\" // }\n+ 0}`;</script>";
@@ -9062,7 +9404,10 @@ mod tests {
             alt_unclosed.map(|s| s.len()).unwrap_or_default()
         );
         if let Some(content) = alt_unclosed {
-            println!("line unclosed tail state = {:?}", current_js_scan_state(content));
+            println!(
+                "line unclosed tail state = {:?}",
+                current_js_scan_state(content)
+            );
         }
 
         let commented = "<script>const s = `a ${\"x\" /* } */ + 0}`;</script>";
@@ -9085,8 +9430,7 @@ mod tests {
             );
         }
 
-        let raw_quotes =
-            r#"<script>const s = `a ${"b}c" + {{.R}}}`;</script>"#;
+        let raw_quotes = r#"<script>const s = `a ${"b}c" + {{.R}}}`;</script>"#;
         let mut template = Template::new("script");
         template
             .parse_named("script", raw_quotes)
@@ -9100,7 +9444,10 @@ mod tests {
                     Node::Text(text) => {
                         let before = tracker.state().mode;
                         tracker.append_text(text);
-                        println!("quotes raw text before={before:?} after={:?}", tracker.state().mode);
+                        println!(
+                            "quotes raw text before={before:?} after={:?}",
+                            tracker.state().mode
+                        );
                     }
                     Node::Expr { .. } => {
                         let mode = tracker.mode();
@@ -9122,10 +9469,7 @@ mod tests {
                     .iter()
                     .map(|flow| flow.tracker.state())
                     .collect::<Vec<_>>();
-                println!(
-                    "quotes analyzed node step state after {:?}",
-                    next_state
-                );
+                println!("quotes analyzed node step state after {:?}", next_state);
                 println!(
                     "quotes analyzed node step rendered {:?}",
                     flows
@@ -9139,7 +9483,10 @@ mod tests {
                     .expect("node should produce one flow")
                     .tracker;
             }
-            println!("quotes stepped tracker state = {:?}", stepped_tracker.state());
+            println!(
+                "quotes stepped tracker state = {:?}",
+                stepped_tracker.state()
+            );
             let analyzed_flows = ParseContextAnalyzer::new(raw_templates.clone())
                 .analyze_nodes(
                     &mut nodes_for_analysis,
@@ -9178,7 +9525,10 @@ mod tests {
                     .expect("line analyze node should succeed");
                 println!(
                     "line analyzed node step state after {:?}",
-                    flows.iter().map(|flow| flow.tracker.state()).collect::<Vec<_>>()
+                    flows
+                        .iter()
+                        .map(|flow| flow.tracker.state())
+                        .collect::<Vec<_>>()
                 );
                 tracker = flows
                     .into_iter()
@@ -9211,7 +9561,10 @@ mod tests {
                     .expect("block analyze node should succeed");
                 println!(
                     "block analyzed node step state after {:?}",
-                    flows.iter().map(|flow| flow.tracker.state()).collect::<Vec<_>>()
+                    flows
+                        .iter()
+                        .map(|flow| flow.tracker.state())
+                        .collect::<Vec<_>>()
                 );
                 tracker = flows
                     .into_iter()
@@ -9229,7 +9582,7 @@ mod tests {
     }
 
     fn analyze_expr_modes(name: &str, source: &str) -> Vec<EscapeMode> {
-        let mut template = Template::new(name)
+        let template = Template::new(name)
             .parse(source)
             .expect("parse should succeed");
 
@@ -9260,10 +9613,16 @@ mod tests {
 
     #[test]
     fn parse_context_tracks_script_template_and_regexp_states() {
-        let template_states = analyze_expr_modes("script_template_state", "<script>const s = `{{.S}}`;</script>");
+        let template_states = analyze_expr_modes(
+            "script_template_state",
+            "<script>const s = `{{.S}}`;</script>",
+        );
         assert_eq!(template_states, vec![EscapeMode::ScriptTemplate]);
 
-        let regexp_states = analyze_expr_modes("script_regexp_state", "<script>const r = /{{.R}}/i;</script>");
+        let regexp_states = analyze_expr_modes(
+            "script_regexp_state",
+            "<script>const r = /{{.R}}/i;</script>",
+        );
         assert_eq!(regexp_states, vec![EscapeMode::ScriptRegexp]);
     }
 
@@ -9342,7 +9701,10 @@ mod tests {
             .execute_to_string(&json!({"R": 1}))
             .expect("execute to succeed");
 
-        assert_eq!(output, "<script>const s = `${/\\}/.test(\"x\") ? 1 : 0}`;</script>");
+        assert_eq!(
+            output,
+            "<script>const s = `${/\\}/.test(\"x\") ? 1 : 0}`;</script>"
+        );
     }
 
     #[test]
@@ -9446,7 +9808,10 @@ mod tests {
             .execute_to_string(&json!({"X": "<x>"}))
             .expect("execute to succeed");
 
-        assert_eq!(output, "<script>// </script>\nconst x = \"\\u003cx\\u003e\";</script>");
+        assert_eq!(
+            output,
+            "<script>// </script>\nconst x = \"\\u003cx\\u003e\";</script>"
+        );
     }
 
     #[test]
@@ -9594,10 +9959,7 @@ mod tests {
             .execute_to_string(&json!({"X": "<x>"}))
             .expect("execute to succeed");
 
-        assert_eq!(
-            output,
-            "<script>\nconst x = \"\\u003cx\\u003e\";</script>"
-        );
+        assert_eq!(output, "<script>\nconst x = \"\\u003cx\\u003e\";</script>");
     }
 
     #[test]
@@ -9774,10 +10136,7 @@ mod tests {
             .execute_to_string(&json!({"S": "a'b\\c"}))
             .expect("execute should succeed");
 
-        assert_eq!(
-            output,
-            "<style>.x{content:'a\\'b\\\\c';}</style>"
-        );
+        assert_eq!(output, "<style>.x{content:'a\\'b\\\\c';}</style>");
     }
 
     #[test]
@@ -10159,6 +10518,185 @@ mod tests {
     }
 
     #[test]
+    fn delims_empty_values_fall_back_to_go_defaults() {
+        let delim_pairs = [("", ""), ("{{", "}}"), ("[[", "]]"), ("(日)", "(本)")];
+
+        for (left, right) in delim_pairs {
+            let true_left = if left.is_empty() { "{{" } else { left };
+            let true_right = if right.is_empty() { "}}" } else { right };
+            let source = format!(
+                "{true_left}.Name{true_right}{true_left}/*x*/{true_right}{true_left}\"{true_left}\"{true_right}"
+            );
+
+            let template = Template::new("delims")
+                .delims(left, right)
+                .parse(&source)
+                .expect("parse should succeed");
+
+            let output = template
+                .execute_to_string(&json!({"Name": "Hello"}))
+                .expect("execute should succeed");
+
+            assert_eq!(output, format!("Hello{true_left}"));
+        }
+    }
+
+    #[test]
+    fn empty_define_does_not_override_existing_template_body() {
+        let template = Template::new("root")
+            .parse("{{define \"x\"}}foo{{end}}{{template \"x\" .}}")
+            .expect("parse should succeed")
+            .parse("{{define \"x\"}}   {{/* comment */}} \n\t {{end}}")
+            .expect("parse should succeed");
+
+        let root_output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        let named_output = template
+            .execute_template_to_string("x", &json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(root_output, "foo");
+        assert_eq!(named_output, "foo");
+    }
+
+    #[test]
+    fn funcs_and_methods_accept_go_compatible_names() {
+        let names = ["_", "a", "a1", "Ӵ"];
+
+        for name in names {
+            let mut funcs = FuncMap::new();
+            funcs.insert(name.to_string(), Arc::new(test_func) as Function);
+            let _ = Template::new("funcs").funcs(funcs);
+
+            let mut methods = MethodMap::new();
+            methods.insert(name.to_string(), Arc::new(test_method) as Method);
+            let _ = Template::new("methods").methods(methods);
+        }
+    }
+
+    #[test]
+    fn funcs_and_methods_reject_invalid_names() {
+        let bad_names = ["", "2", "a-b"];
+
+        for name in bad_names {
+            let mut funcs = FuncMap::new();
+            funcs.insert(name.to_string(), Arc::new(test_func) as Function);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = Template::new("funcs").funcs(funcs);
+                }))
+                .is_err(),
+                "func name `{name}` should panic"
+            );
+
+            let mut methods = MethodMap::new();
+            methods.insert(name.to_string(), Arc::new(test_method) as Method);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = Template::new("methods").methods(methods);
+                }))
+                .is_err(),
+                "method name `{name}` should panic"
+            );
+        }
+    }
+
+    #[test]
+    fn add_func_and_add_method_reject_invalid_names() {
+        let func_registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ =
+                Template::new("funcs").add_func("2bad", |_args: &[Value]| Ok(Value::from("ok")));
+        }));
+        assert!(
+            func_registration.is_err(),
+            "invalid add_func name should panic"
+        );
+
+        let method_registration = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Template::new("methods")
+                .add_method("bad-name", |_receiver: &Value, _args: &[Value]| {
+                    Ok(Value::from("ok"))
+                });
+        }));
+        assert!(
+            method_registration.is_err(),
+            "invalid add_method name should panic"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_function_calls() {
+        let error = match Template::new("main").parse("{{unknown 1}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("function `unknown` is not registered")
+        );
+    }
+
+    #[test]
+    fn parse_accepts_registered_function_calls() {
+        let template = Template::new("main")
+            .add_func("myfunc", |_args: &[Value]| Ok(Value::from("ok")))
+            .parse("{{myfunc 1}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn predefined_escaper_html_is_rejected_when_not_last_in_pipeline() {
+        let error = match Template::new("escaper").parse("{{.X | html | print}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("predefined escaper \"html\" disallowed in template")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrPredefinedEscaper);
+    }
+
+    #[test]
+    fn predefined_escaper_urlquery_is_rejected_when_not_last_in_pipeline() {
+        let error = match Template::new("escaper").parse("{{.X | urlquery | print}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("predefined escaper \"urlquery\" disallowed in template")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrPredefinedEscaper);
+    }
+
+    #[test]
+    fn predefined_escaper_is_allowed_at_pipeline_tail() {
+        let template = Template::new("escaper")
+            .parse("{{.X | html}}|{{.Y | urlquery}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>", "Y": "a b"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "&lt;tag&gt;|a%20b");
+    }
+
+    #[test]
     fn clone_template_preserves_behavior() {
         let template = Template::new("clone")
             .add_func("upper", |args: &[Value]| {
@@ -10221,9 +10759,7 @@ mod tests {
         let template = Template::new("base")
             .parse("{{.Name}}")
             .expect("parse should succeed");
-        let cloned = template
-            .Clone()
-            .expect("Clone should succeed");
+        let cloned = template.Clone().expect("Clone should succeed");
 
         let output = cloned
             .execute_to_string(&json!({"Name": "value"}))
@@ -10408,6 +10944,303 @@ mod tests {
     }
 
     #[test]
+    fn redefine_non_empty_after_execution_is_rejected() {
+        let template = Template::new("redefine")
+            .parse("foo")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "foo");
+
+        let error = match template.parse("bar") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn redefine_named_template_after_execution_is_rejected() {
+        let template = Template::new("redefine")
+            .parse("{{define \"x\"}}foo{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_template_to_string("x", &json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "foo");
+
+        let error = match template.parse("{{define \"x\"}}bar{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn redefine_empty_after_execution_is_rejected_and_preserves_output() {
+        let template = Template::new("redefine-empty")
+            .parse("")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "");
+
+        let error = match template.clone().parse("foo") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should continue to succeed");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn redefine_lookup_template_after_execution_is_rejected() {
+        let root = Template::new("redefine")
+            .parse("{{define \"x\"}}foo{{end}}")
+            .expect("parse should succeed");
+        let named = root.lookup("x").expect("template x should exist");
+
+        let output = named
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "foo");
+
+        let error = match named.parse("bar") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output = root
+            .execute_template_to_string("x", &json!({}))
+            .expect("execute should still succeed");
+        assert_eq!(output, "foo");
+    }
+
+    #[test]
+    fn redefine_before_execution_updates_named_template_body() {
+        let template = Template::new("redefine")
+            .parse("{{define \"x\"}}foo{{end}}{{template \"x\" .}}")
+            .expect("parse should succeed")
+            .parse("{{define \"x\"}}bar{{end}}{{template \"x\" .}}")
+            .expect("parse should succeed");
+
+        let root = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        let named = template
+            .execute_template_to_string("x", &json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(root, "bar");
+        assert_eq!(named, "bar");
+    }
+
+    #[test]
+    fn redefine_after_non_execution_is_rejected_and_keeps_previous_definition() {
+        let template = Template::new("redefine")
+            .parse("{{if .}}<{{template \"x\" .}}>{{end}}{{define \"x\"}}foo{{end}}")
+            .expect("parse should succeed");
+
+        let output_false = template
+            .execute_to_string(&json!(0))
+            .expect("execute should succeed");
+        assert_eq!(output_false, "");
+
+        let error = match template.clone().parse("{{define \"x\"}}bar{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output_true = template
+            .execute_to_string(&json!(1))
+            .expect("execute should succeed");
+        assert_eq!(output_true, "<foo>");
+    }
+
+    #[test]
+    fn redefine_after_named_execution_is_rejected_and_keeps_previous_definition() {
+        let template = Template::new("redefine")
+            .parse("<{{template \"x\" .}}>{{define \"x\"}}foo{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "<foo>");
+
+        let error = match template.clone().parse("{{define \"x\"}}bar{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should still succeed");
+        assert_eq!(output, "<foo>");
+    }
+
+    #[test]
+    fn redefine_safety_prevents_post_execute_injection() {
+        let template = Template::new("redefine")
+            .parse("<html><a href=\"{{template \"x\" .}}\">{{define \"x\"}}{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "<html><a href=\"\">");
+
+        let error = match template
+            .clone()
+            .parse("{{define \"x\"}}\" bar=\"baz{{end}}")
+        {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should still succeed");
+        assert_eq!(output, "<html><a href=\"\">");
+    }
+
+    #[test]
+    fn redefine_top_use_prevents_post_execute_script_injection() {
+        let template = Template::new("redefine")
+            .parse("{{template \"x\" .}}{{.}}{{define \"x\"}}{{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!(42))
+            .expect("execute should succeed");
+        assert_eq!(output, "42");
+
+        let error = match template.clone().parse("{{define \"x\"}}<script>{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+
+        let output = template
+            .execute_to_string(&json!(42))
+            .expect("execute should still succeed");
+        assert_eq!(output, "42");
+    }
+
+    #[test]
+    fn parser_apis_fail_after_execution() {
+        let template = Template::new("redefine")
+            .parse("")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "");
+
+        let parse_files_error = match template.clone().parse_files(Vec::<&str>::new()) {
+            Ok(_) => panic!("parse_files should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            parse_files_error
+                .to_string()
+                .contains("cannot be parsed or cloned")
+        );
+
+        let parse_glob_error = match template.clone().parse_glob("*.no.template") {
+            Ok(_) => panic!("parse_glob should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            parse_glob_error
+                .to_string()
+                .contains("cannot be parsed or cloned")
+        );
+
+        let tree = Template::new("tree")
+            .parse_tree("{{define \"t1\"}}x{{end}}")
+            .expect("parse_tree should succeed");
+        let add_tree_error = match template.clone().AddParseTree("t1", tree) {
+            Ok(_) => panic!("AddParseTree should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            add_tree_error
+                .to_string()
+                .contains("cannot be parsed or cloned")
+        );
+    }
+
+    #[test]
+    fn execute_to_string_is_safe_for_parallel_runs() {
+        let template = Arc::new(
+            Template::new("parallel")
+                .parse("{{.Name}}:{{.Index}}")
+                .expect("parse should succeed"),
+        );
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let template = Arc::clone(&template);
+            handles.push(std::thread::spawn(move || {
+                for n in 0..50 {
+                    let output = template
+                        .execute_to_string(&json!({"Name": "worker", "Index": i * 100 + n}))
+                        .expect("execute should succeed");
+                    assert_eq!(output, format!("worker:{}", i * 100 + n));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should succeed");
+        }
+    }
+
+    #[test]
+    fn clone_and_lookup_can_execute_in_parallel() {
+        let base = Template::new("base")
+            .parse("{{define \"item\"}}{{.Name}}-{{.Index}}{{end}}")
+            .expect("parse should succeed");
+        let cloned = Arc::new(base.Clone().expect("Clone should succeed"));
+        let item = Arc::new(base.lookup("item").expect("item template should exist"));
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let cloned = Arc::clone(&cloned);
+            let item = Arc::clone(&item);
+            handles.push(std::thread::spawn(move || {
+                let left = cloned
+                    .execute_template_to_string("item", &json!({"Name": "L", "Index": i}))
+                    .expect("cloned execute should succeed");
+                let right = item
+                    .execute_to_string(&json!({"Name": "R", "Index": i}))
+                    .expect("lookup execute should succeed");
+                assert_eq!(left, format!("L-{i}"));
+                assert_eq!(right, format!("R-{i}"));
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread should succeed");
+        }
+    }
+
+    #[test]
     fn range_over_map_is_sorted_by_key() {
         let template = Template::new("map")
             .parse("{{range $k, $v := .Map}}{{$k}}={{$v}};{{end}}")
@@ -10534,7 +11367,9 @@ mod tests {
         };
 
         assert!(
-            error.to_string().contains("cannot compute output context for recursive template")
+            error
+                .to_string()
+                .contains("cannot compute output context for recursive template")
         );
         assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
     }
@@ -10549,7 +11384,9 @@ mod tests {
         };
 
         assert!(
-            error.to_string().contains("cannot compute output context for recursive template")
+            error
+                .to_string()
+                .contains("cannot compute output context for recursive template")
         );
         assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
     }
@@ -10585,7 +11422,8 @@ mod tests {
         let template = Template::new("main")
             .parse("{{.Name}}")
             .expect("parse should succeed");
-        let error = match template.execute_template_to_string("missing", &json!({"Name": "alice"})) {
+        let error = match template.execute_template_to_string("missing", &json!({"Name": "alice"}))
+        {
             Ok(_) => panic!("execution should fail"),
             Err(err) => err,
         };
@@ -10628,6 +11466,98 @@ mod tests {
             err.reason(),
             "line 12: unclosed action (missing }})".to_string()
         );
+    }
+
+    #[test]
+    fn parse_error_code_maps_extended_categories() {
+        assert_eq!(
+            TemplateError::Parse("template `x` ends in a non-text context".to_string()).code(),
+            TemplateErrorCode::ErrEndContext
+        );
+        assert_eq!(
+            TemplateError::Parse("on range loop re-entry: context mismatch".to_string()).code(),
+            TemplateErrorCode::ErrRangeLoopReentry
+        );
+        assert_eq!(
+            TemplateError::Parse("unfinished JS regexp charset: \"[\"".to_string()).code(),
+            TemplateErrorCode::ErrPartialCharset
+        );
+        assert_eq!(
+            TemplateError::Parse("unfinished escape sequence in JS string: \"\\\\\"".to_string())
+                .code(),
+            TemplateErrorCode::ErrPartialEscape
+        );
+        assert_eq!(
+            TemplateError::Parse("'/' could start a division or regexp".to_string()).code(),
+            TemplateErrorCode::ErrSlashAmbig
+        );
+        assert_eq!(
+            TemplateError::Parse("predefined escaper \"html\" disallowed in template".to_string())
+                .code(),
+            TemplateErrorCode::ErrPredefinedEscaper
+        );
+    }
+
+    #[test]
+    fn parse_time_rejects_action_after_js_escape_prefix() {
+        let error =
+            match Template::new("js-partial").parse(r#"<script>const s = "\{{.X}}";</script>"#) {
+                Ok(_) => panic!("parse should fail"),
+                Err(error) => error,
+            };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unfinished escape sequence in JS string")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrPartialEscape);
+    }
+
+    #[test]
+    fn parse_time_rejects_action_after_css_escape_prefix() {
+        let error =
+            match Template::new("css-partial").parse(r#"<style>.x{content:"\{{.X}}";}</style>"#) {
+                Ok(_) => panic!("parse should fail"),
+                Err(error) => error,
+            };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unfinished escape sequence in CSS string")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrPartialEscape);
+    }
+
+    #[test]
+    fn parse_time_rejects_action_inside_regexp_char_class() {
+        let error = match Template::new("regexp-partial")
+            .parse(r#"<script>const r = /foo[{{.Chars}}]/;</script>"#)
+        {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("unfinished JS regexp charset"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrPartialCharset);
+    }
+
+    #[test]
+    fn parse_time_rejects_slash_ambiguity_after_branch() {
+        let error = match Template::new("slash-ambig")
+            .parse(r#"<script>{{if .C}}var x = 1{{end}}/-{{.N}}/i.test(x)</script>"#)
+        {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("could start a division or regexp")
+        );
+        assert_eq!(error.code(), TemplateErrorCode::ErrSlashAmbig);
     }
 
     #[test]
@@ -10689,17 +11619,13 @@ mod tests {
 
     #[test]
     fn parse_numbers_reject_complex_like_literals() {
-        let error = match Template::new("complex-literal")
-            .parse("{{1.5i}}")
-        {
+        let error = match Template::new("complex-literal").parse("{{1.5i}}") {
             Ok(_) => panic!("parse should fail"),
             Err(error) => error,
         };
 
         assert!(
-            error
-                .to_string()
-                .contains("unsupported token")
+            error.to_string().contains("unsupported token")
                 || error.to_string().contains("illegal number syntax")
                 || error.to_string().contains("bad number syntax"),
             "unexpected error message: {error}"
@@ -10761,7 +11687,7 @@ mod tests {
         };
 
         assert!(error.to_string().contains("non-text context"));
-        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
+        assert_eq!(error.code(), TemplateErrorCode::ErrEndContext);
     }
 
     #[test]

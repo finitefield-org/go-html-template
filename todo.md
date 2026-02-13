@@ -45,3 +45,30 @@
 ## テスト整備
 - [x] Go 側 `html/template` の重要テスト群を移植して回帰を防ぐ
   - 移植済み: `template_test.go` の `TestStringsInScriptsWithJsonContentTypeAreCorrectlyEscaped` 相当
+
+## 追加候補（2026-02-13 レビュー）
+
+### 優先度: 高（互換性/安全性）
+- [x] `Delims("", "")` を Go と同様にデフォルト区切り（`{{` / `}}`）へフォールバックさせる
+  - `Template::delims` で空 delimiter を Go デフォルトへ正規化
+  - 追加テスト: `delims_empty_values_fall_back_to_go_defaults`
+- [x] `{{define}}` の「空本体（空白/コメントのみ）は既存定義を上書きしない」ルールを実装する
+  - `merge_template_nodes` で空本体 `define` の上書きを抑止
+  - 追加テスト: `empty_define_does_not_override_existing_template_body` / `redefine_*`
+  - 追加テスト（2026-02-13 追補）: `redefine_after_non_execution_is_rejected_and_keeps_previous_definition` / `redefine_after_named_execution_is_rejected_and_keeps_previous_definition` / `redefine_safety_prevents_post_execute_injection` / `redefine_top_use_prevents_post_execute_script_injection` / `parser_apis_fail_after_execution`
+- [x] JS 文脈の未対応パーサーエラーを追加する（Go `ErrorCode` 互換寄り）
+  - 対象: 部分エスケープ (`\{{...}}`)、正規表現 charset 途中挿入、`/` の曖昧解釈
+  - 追加テスト: `parse_time_rejects_action_after_js_escape_prefix` / `parse_time_rejects_action_inside_regexp_char_class` / `parse_time_rejects_slash_ambiguity_after_branch`
+
+### 優先度: 中（診断/API 互換）
+- [x] `TemplateErrorCode` の網羅性を Go `ErrorCode` へ近づける
+  - 追加候補: `ErrEndContext`, `ErrRangeLoopReentry`, `ErrPartialEscape`, `ErrPartialCharset`, `ErrSlashAmbig`, `ErrPredefinedEscaper`
+  - 追加テスト: `parse_error_code_maps_extended_categories`
+- [x] `FuncMap`/`MethodMap` の名前バリデーションと parse 時の関数解決チェックを強化する
+  - Go では不正関数名や未定義関数の一部が parse 時に検出される
+  - 追加テスト: `funcs_and_methods_accept_go_compatible_names` / `funcs_and_methods_reject_invalid_names` / `add_func_and_add_method_reject_invalid_names` / `parse_rejects_unknown_function_calls`
+
+### 優先度: 中（回帰耐性）
+- [x] 並行実行系テストを追加する（`Clone` 後の同時 `Execute*`、`lookup` 経由実行）
+  - 現状は機能テスト中心で、並行アクセスの回帰検知が薄い
+  - 追加テスト: `execute_to_string_is_safe_for_parallel_runs` / `clone_and_lookup_can_execute_in_parallel`
