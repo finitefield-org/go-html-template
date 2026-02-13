@@ -61,6 +61,141 @@ pub enum TemplateError {
     Render(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateErrorInfo {
+    pub line: Option<usize>,
+    pub name: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateErrorCode {
+    ErrBadHTML,
+    ErrBranchEnd,
+    ErrAmbigContext,
+    ErrNoSuchTemplate,
+    ErrOutputContext,
+    ErrMissingKey,
+    ErrNotDefined,
+    ErrInvalidUTF8,
+    ErrParse,
+    ErrRender,
+    ErrFileSystem,
+    ErrInternal,
+    ErrOther,
+}
+
+impl TemplateError {
+    pub fn code(&self) -> TemplateErrorCode {
+        match self {
+            TemplateError::Io(_) => TemplateErrorCode::ErrFileSystem,
+            TemplateError::Json(_) => TemplateErrorCode::ErrInternal,
+            TemplateError::GlobPattern(_) => TemplateErrorCode::ErrFileSystem,
+            TemplateError::Glob(_) => TemplateErrorCode::ErrFileSystem,
+            TemplateError::Parse(message) => parse_error_code(message),
+            TemplateError::Render(message) => render_error_code(message),
+        }
+    }
+
+    pub fn info(&self) -> TemplateErrorInfo {
+        match self {
+            TemplateError::Parse(message) | TemplateError::Render(message) => TemplateErrorInfo {
+                line: parse_error_line(message),
+                name: parse_error_name(message),
+                reason: message.clone(),
+            },
+            TemplateError::Io(error) => TemplateErrorInfo {
+                line: None,
+                name: None,
+                reason: error.to_string(),
+            },
+            TemplateError::Json(error) => TemplateErrorInfo {
+                line: None,
+                name: None,
+                reason: error.to_string(),
+            },
+            TemplateError::GlobPattern(error) => TemplateErrorInfo {
+                line: None,
+                name: None,
+                reason: error.to_string(),
+            },
+            TemplateError::Glob(error) => TemplateErrorInfo {
+                line: None,
+                name: None,
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    pub fn line(&self) -> Option<usize> {
+        self.info().line
+    }
+
+    pub fn name(&self) -> Option<String> {
+        self.info().name
+    }
+
+    pub fn reason(&self) -> String {
+        self.info().reason
+    }
+}
+
+fn parse_error_code(message: &str) -> TemplateErrorCode {
+    if message.contains("branches end in different contexts") {
+        TemplateErrorCode::ErrBranchEnd
+    } else if message.contains("ambiguous context") {
+        TemplateErrorCode::ErrAmbigContext
+    } else if message.contains("cannot compute output context for")
+        || message.contains("ends in a non-text context")
+    {
+        TemplateErrorCode::ErrOutputContext
+    } else if message.contains("expected space, attr name, or end of tag")
+        || message.contains("in attribute name")
+        || message.contains("in unquoted attr")
+    {
+        TemplateErrorCode::ErrBadHTML
+    } else if message.contains("not valid UTF-8")
+        || message.contains("invalid UTF-8 boundary while trimming")
+    {
+        TemplateErrorCode::ErrInvalidUTF8
+    } else if message.contains("no such template") {
+        TemplateErrorCode::ErrNoSuchTemplate
+    } else {
+        TemplateErrorCode::ErrParse
+    }
+}
+
+fn parse_error_line(message: &str) -> Option<usize> {
+    let marker = "line ";
+    let start = message.find(marker)?;
+    let remainder = &message[start + marker.len()..];
+    let digits = remainder.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<usize>().ok()
+}
+
+fn parse_error_name(message: &str) -> Option<String> {
+    let start = message.find("template `")?;
+    let remainder = &message[start + "template `".len()..];
+    let end = remainder.find('`')?;
+    Some(remainder[..end].to_string())
+}
+
+fn render_error_code(message: &str) -> TemplateErrorCode {
+    if message.contains("template `") && message.contains("` is not defined") {
+        TemplateErrorCode::ErrNotDefined
+    } else if message.contains("map has no entry")
+        || message.contains("has no entry for key")
+        || message.contains("could not be resolved")
+    {
+        TemplateErrorCode::ErrMissingKey
+    } else {
+        TemplateErrorCode::ErrRender
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Json(JsonValue),
@@ -328,28 +463,41 @@ pub enum MissingKeyMode {
 }
 
 #[derive(Clone)]
+struct TemplateNameSpace {
+    templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
+    funcs: Arc<RwLock<FuncMap>>,
+    methods: Arc<RwLock<MethodMap>>,
+    missing_key_mode: Arc<RwLock<MissingKeyMode>>,
+    left_delim: Arc<RwLock<String>>,
+    right_delim: Arc<RwLock<String>>,
+    executed: Arc<AtomicBool>,
+}
+
+impl TemplateNameSpace {
+    fn new() -> Self {
+        Self {
+            templates: Arc::new(RwLock::new(HashMap::new())),
+            funcs: Arc::new(RwLock::new(builtin_funcs())),
+            methods: Arc::new(RwLock::new(HashMap::new())),
+            missing_key_mode: Arc::new(RwLock::new(MissingKeyMode::Default)),
+            left_delim: Arc::new(RwLock::new("{{".to_string())),
+            right_delim: Arc::new(RwLock::new("}}".to_string())),
+            executed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Template {
     name: String,
-    templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
-    funcs: FuncMap,
-    methods: MethodMap,
-    missing_key_mode: MissingKeyMode,
-    left_delim: String,
-    right_delim: String,
-    executed: Arc<AtomicBool>,
+    name_space: TemplateNameSpace,
 }
 
 impl Template {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            templates: Arc::new(RwLock::new(HashMap::new())),
-            funcs: builtin_funcs(),
-            methods: HashMap::new(),
-            missing_key_mode: MissingKeyMode::Default,
-            left_delim: "{{".to_string(),
-            right_delim: "}}".to_string(),
-            executed: Arc::new(AtomicBool::new(false)),
+            name_space: TemplateNameSpace::new(),
         }
     }
 
@@ -358,34 +506,58 @@ impl Template {
     }
 
     pub fn funcs(mut self, funcs: FuncMap) -> Self {
-        self.funcs.extend(funcs);
+        self.name_space
+            .funcs
+            .write()
+            .unwrap()
+            .extend(funcs);
         self
     }
 
     pub fn add_func<F>(mut self, name: impl Into<String>, function: F) -> Self
     where
-        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
     {
-        self.funcs.insert(name.into(), Arc::new(function));
+        self.name_space
+            .funcs
+            .write()
+            .unwrap()
+            .insert(name.into(), Arc::new(function));
         self
     }
 
     pub fn methods(mut self, methods: MethodMap) -> Self {
-        self.methods.extend(methods);
+        self.name_space
+            .methods
+            .write()
+            .unwrap()
+            .extend(methods);
         self
     }
 
     pub fn add_method<F>(mut self, name: impl Into<String>, method: F) -> Self
     where
-        F: Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static,
+    F: Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 'static,
     {
-        self.methods.insert(name.into(), Arc::new(method));
+        self.name_space
+            .methods
+            .write()
+            .unwrap()
+            .insert(name.into(), Arc::new(method));
         self
     }
 
     pub fn delims(mut self, left: impl Into<String>, right: impl Into<String>) -> Self {
-        self.left_delim = left.into();
-        self.right_delim = right.into();
+        let left = left.into();
+        let right = right.into();
+        {
+            let mut delimiter = self.name_space.left_delim.write().unwrap();
+            *delimiter = left;
+        }
+        {
+            let mut delimiter = self.name_space.right_delim.write().unwrap();
+            *delimiter = right;
+        }
         self
     }
 
@@ -395,24 +567,30 @@ impl Template {
 
     #[allow(non_snake_case)]
     pub fn Clone(&self) -> Result<Self> {
-        if self.left_delim.is_empty() || self.right_delim.is_empty() {
+        let left_delim = self.name_space.left_delim.read().unwrap().clone();
+        let right_delim = self.name_space.right_delim.read().unwrap().clone();
+        if left_delim.is_empty() || right_delim.is_empty() {
             return Err(TemplateError::Parse(
                 "template delimiters must not be empty".to_string(),
             ));
         }
         self.ensure_not_executed()?;
-
-        let templates = self.templates.read().unwrap().clone();
+        let templates = self.name_space.templates.read().unwrap().clone();
+        let funcs = self.name_space.funcs.read().unwrap().clone();
+        let methods = self.name_space.methods.read().unwrap().clone();
+        let missing_key_mode = self.name_space.missing_key_mode.read().unwrap().clone();
 
         Ok(Self {
             name: self.name.clone(),
-            templates: Arc::new(RwLock::new(templates)),
-            funcs: self.funcs.clone(),
-            methods: self.methods.clone(),
-            missing_key_mode: self.missing_key_mode.clone(),
-            left_delim: self.left_delim.clone(),
-            right_delim: self.right_delim.clone(),
-            executed: Arc::new(AtomicBool::new(false)),
+            name_space: TemplateNameSpace {
+                templates: Arc::new(RwLock::new(templates)),
+                funcs: Arc::new(RwLock::new(funcs)),
+                methods: Arc::new(RwLock::new(methods)),
+                missing_key_mode: Arc::new(RwLock::new(missing_key_mode)),
+                left_delim: Arc::new(RwLock::new(left_delim)),
+                right_delim: Arc::new(RwLock::new(right_delim)),
+                executed: Arc::new(AtomicBool::new(false)),
+            },
         })
     }
 
@@ -440,7 +618,7 @@ impl Template {
             )));
         };
 
-        self.missing_key_mode = match value {
+        let mode = match value {
             "default" | "invalid" => MissingKeyMode::Default,
             "zero" => MissingKeyMode::Zero,
             "error" => MissingKeyMode::Error,
@@ -450,6 +628,7 @@ impl Template {
                 )));
             }
         };
+        *self.name_space.missing_key_mode.write().unwrap() = mode;
         Ok(())
     }
 
@@ -470,7 +649,9 @@ impl Template {
 
     pub fn parse_tree(&self, text: &str) -> Result<ParseTree> {
         let preprocessed = strip_html_comments(text);
-        let tokens = tokenize(&preprocessed, &self.left_delim, &self.right_delim)?;
+        let left_delim = self.name_space.left_delim.read().unwrap().clone();
+        let right_delim = self.name_space.right_delim.read().unwrap().clone();
+        let tokens = tokenize(&preprocessed, &left_delim, &right_delim)?;
         let mut index = 0;
         let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
         if let Some(stop) = stop {
@@ -486,11 +667,17 @@ impl Template {
     pub fn AddParseTree(mut self, name: impl Into<String>, tree: ParseTree) -> Result<Self> {
         self.ensure_not_executed()?;
         let name = name.into();
-        if !self.templates.read().unwrap().contains_key(&self.name) {
+        if !self
+            .name_space
+            .templates
+            .read()
+            .unwrap()
+            .contains_key(&self.name)
+        {
             self.name = name.clone();
         }
         {
-            let mut templates = self.templates.write().unwrap();
+            let mut templates = self.name_space.templates.write().unwrap();
             self.merge_template_nodes(&mut templates, &name, tree.nodes);
         }
         self.reanalyze_contexts()?;
@@ -524,7 +711,13 @@ impl Template {
                 .to_string();
 
             self.parse_named(&name, &source)?;
-            if !self.templates.read().unwrap().contains_key(&self.name) {
+            if !self
+                .name_space
+                .templates
+                .read()
+                .unwrap()
+                .contains_key(&self.name)
+            {
                 self.name = name;
             }
             parsed_any = true;
@@ -651,7 +844,7 @@ impl Template {
         name: &str,
         data: &T,
     ) -> Result<()> {
-        self.executed.store(true, AtomicOrdering::SeqCst);
+        self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut scopes = vec![HashMap::new()];
@@ -666,7 +859,7 @@ impl Template {
     }
 
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
-        self.executed.store(true, AtomicOrdering::SeqCst);
+        self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut scopes = vec![HashMap::new()];
@@ -680,7 +873,7 @@ impl Template {
     }
 
     pub fn lookup(&self, name: &str) -> Option<Self> {
-        if self.templates.read().unwrap().contains_key(name) {
+        if self.name_space.templates.read().unwrap().contains_key(name) {
             let mut clone = self.clone();
             clone.name = name.to_string();
             Some(clone)
@@ -690,7 +883,7 @@ impl Template {
     }
 
     pub fn has_template(&self, name: &str) -> bool {
-        self.templates.read().unwrap().contains_key(name)
+        self.name_space.templates.read().unwrap().contains_key(name)
     }
 
     #[allow(non_snake_case)]
@@ -699,7 +892,7 @@ impl Template {
     }
 
     pub fn defined_templates(&self) -> Vec<String> {
-        let templates = self.templates.read().unwrap();
+        let templates = self.name_space.templates.read().unwrap();
         let mut names = templates.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
@@ -729,7 +922,7 @@ impl Template {
 
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
         let tree = self.parse_tree(text)?;
-        let mut templates = self.templates.write().unwrap();
+        let mut templates = self.name_space.templates.write().unwrap();
         self.merge_template_nodes(&mut templates, name, tree.nodes);
 
         Ok(())
@@ -773,7 +966,7 @@ impl Template {
     }
 
     fn ensure_not_executed(&self) -> Result<()> {
-        if self.executed.load(AtomicOrdering::SeqCst) {
+        if self.name_space.executed.load(AtomicOrdering::SeqCst) {
             return Err(TemplateError::Parse(
                 "template cannot be parsed or cloned after execution".to_string(),
             ));
@@ -782,7 +975,7 @@ impl Template {
     }
 
     fn reanalyze_contexts(&mut self) -> Result<()> {
-        let raw_templates = self.templates.read().unwrap().clone();
+        let raw_templates = self.name_space.templates.read().unwrap().clone();
         if !raw_templates.contains_key(&self.name) {
             return Err(TemplateError::Parse(format!(
                 "template `{}` is not defined",
@@ -810,7 +1003,7 @@ impl Template {
             }
         }
 
-        *self.templates.write().unwrap() = analyzer.finish();
+        *self.name_space.templates.write().unwrap() = analyzer.finish();
         Ok(())
     }
 
@@ -823,7 +1016,7 @@ impl Template {
         output: &mut String,
         in_range: bool,
     ) -> Result<RenderFlow> {
-        let templates = self.templates.read().unwrap();
+        let templates = self.name_space.templates.read().unwrap();
         let nodes = templates.get(name).ok_or_else(|| {
             TemplateError::Render(format!("template `{name}` is not defined"))
         })?;
@@ -976,7 +1169,13 @@ impl Template {
                         None => dot.clone(),
                     };
 
-                    if self.templates.read().unwrap().contains_key(name) {
+                    if self
+                        .name_space
+                        .templates
+                        .read()
+                        .unwrap()
+                        .contains_key(name)
+                    {
                         let mut template_scopes = vec![HashMap::new()];
                         let flow = self.render_named(
                             name,
@@ -1057,7 +1256,8 @@ impl Template {
                     if name == "call" {
                         piped = Some(self.eval_call_function(&evaluated_args)?);
                     } else {
-                        let function = self.funcs.get(name).ok_or_else(|| {
+                        let funcs = self.name_space.funcs.read().unwrap();
+                        let function = funcs.get(name).ok_or_else(|| {
                             TemplateError::Render(format!("function `{name}` is not registered"))
                         })?;
                         piped = Some(function(&evaluated_args)?);
@@ -1093,24 +1293,38 @@ impl Template {
     ) -> Result<Value> {
         match term {
             Term::DotPath(path) => {
-                lookup_path_with_methods(dot, path, &self.methods, self.missing_key_mode)
+                let methods = self.name_space.methods.read().unwrap();
+                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                lookup_path_with_methods(dot, path, &methods, missing_key_mode)
             }
             Term::RootPath(path) => {
-                lookup_path_with_methods(root, path, &self.methods, self.missing_key_mode)
+                let methods = self.name_space.methods.read().unwrap();
+                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                lookup_path_with_methods(root, path, &methods, missing_key_mode)
             }
             Term::Literal(value) => Ok(value.clone()),
             Term::Variable { name, path } => {
                 let variable = lookup_variable(scopes, name).ok_or_else(|| {
                     TemplateError::Render(format!("variable `${name}` could not be resolved"))
                 })?;
-                lookup_path_with_methods(&variable, path, &self.methods, self.missing_key_mode)
+                let methods = self.name_space.methods.read().unwrap();
+                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                lookup_path_with_methods(&variable, path, &methods, missing_key_mode)
             }
             Term::Identifier(name) => {
+                let methods = self.name_space.methods.read().unwrap();
+                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
                 if let Some(value) =
-                    lookup_identifier(dot, root, name, &self.methods, self.missing_key_mode)?
+                    lookup_identifier(dot, root, name, &methods, missing_key_mode)?
                 {
                     Ok(value)
-                } else if self.funcs.contains_key(name) {
+                } else if self
+                    .name_space
+                    .funcs
+                    .read()
+                    .unwrap()
+                    .contains_key(name)
+                {
                     Ok(Value::FunctionRef(name.clone()))
                 } else {
                     Err(TemplateError::Render(format!(
@@ -1139,7 +1353,8 @@ impl Template {
                 self.call_path_method(&variable, path, args)
             }
             Term::Identifier(name) => {
-                if let Some(method) = self.methods.get(name) {
+                let methods = self.name_space.methods.read().unwrap();
+                if let Some(method) = methods.get(name) {
                     return method(dot, args);
                 }
                 Err(TemplateError::Render(format!(
@@ -1158,9 +1373,10 @@ impl Template {
         }
 
         let (method_name, receiver_path) = split_last_path(path);
-        let receiver =
-            lookup_path_with_methods(base, receiver_path, &self.methods, self.missing_key_mode)?;
-        let method = self.methods.get(method_name).ok_or_else(|| {
+        let methods = self.name_space.methods.read().unwrap();
+        let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+        let receiver = lookup_path_with_methods(base, receiver_path, &methods, missing_key_mode)?;
+        let method = methods.get(method_name).ok_or_else(|| {
             TemplateError::Render(format!("method `{method_name}` is not registered"))
         })?;
         method(&receiver, args)
@@ -1184,10 +1400,13 @@ impl Template {
             }
         };
 
-        let function = self
-            .funcs
-            .get(&name)
-            .ok_or_else(|| TemplateError::Render(format!("function `{name}` is not registered")))?;
+        let function = {
+            let funcs = self.name_space.funcs.read().unwrap();
+            funcs
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| TemplateError::Render(format!("function `{name}` is not registered")))?;
+        };
         function(&args[1..])
     }
 }
@@ -1498,7 +1717,9 @@ impl ContextState {
 
     fn from_rendered(rendered: &str) -> Self {
         let mode = infer_escape_mode(rendered);
-        let in_open_tag = matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(rendered);
+        let in_open_tag =
+            (matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(rendered))
+                || matches!(mode, EscapeMode::AttrName);
         Self { mode, in_open_tag }
     }
 
@@ -1880,13 +2101,20 @@ fn ensure_single_normal_context(block_name: &str, flows: &[AnalysisFlow]) -> Res
 
 fn placeholder_for_mode(mode: EscapeMode) -> &'static str {
     match mode {
+        EscapeMode::ScriptExpr => "0",
         EscapeMode::Html
         | EscapeMode::AttrQuoted { .. }
         | EscapeMode::AttrUnquoted { .. }
+        | EscapeMode::AttrName
         | EscapeMode::ScriptString { .. }
+        | EscapeMode::ScriptTemplate
+        | EscapeMode::ScriptRegexp
+        | EscapeMode::ScriptLineComment
+        | EscapeMode::ScriptBlockComment
         | EscapeMode::StyleExpr
-        | EscapeMode::StyleString { .. } => "x",
-        EscapeMode::ScriptExpr => "0",
+        | EscapeMode::StyleString { .. }
+        | EscapeMode::StyleLineComment
+        | EscapeMode::StyleBlockComment => "x",
     }
 }
 
@@ -1908,14 +2136,21 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
                 String::new()
             }
         }
+        EscapeMode::AttrName => "<a x".to_string(),
         EscapeMode::AttrQuoted { kind, quote } => {
             format!("<a {}={quote}x", attr_name_for_kind(kind))
         }
         EscapeMode::AttrUnquoted { kind } => format!("<a {}=x", attr_name_for_kind(kind)),
         EscapeMode::ScriptExpr => "<script>".to_string(),
         EscapeMode::ScriptString { quote } => format!("<script>{quote}"),
+        EscapeMode::ScriptTemplate => "<script>`".to_string(),
+        EscapeMode::ScriptRegexp => "<script>/".to_string(),
+        EscapeMode::ScriptLineComment => "<script>//".to_string(),
+        EscapeMode::ScriptBlockComment => "<script>/*".to_string(),
         EscapeMode::StyleExpr => "<style>".to_string(),
         EscapeMode::StyleString { quote } => format!("<style>{quote}"),
+        EscapeMode::StyleLineComment => "<style>//".to_string(),
+        EscapeMode::StyleBlockComment => "<style>/*".to_string(),
     }
 }
 
@@ -2841,7 +3076,13 @@ where
         let source = std::str::from_utf8(&source)
             .map_err(|error| TemplateError::Parse(format!("template file `{path:?}` is not valid UTF-8: {error}")))?;
         template.parse_named(&name, source)?;
-        if !template.templates.read().unwrap().contains_key(&template.name) {
+        if !template
+            .name_space
+            .templates
+            .read()
+            .unwrap()
+            .contains_key(&template.name)
+        {
             template.name = name;
         }
         parsed_any = true;
@@ -4055,6 +4296,7 @@ fn parse_string_literal_prefix(input: &str) -> Result<(String, usize)> {
 enum AttrKind {
     Normal,
     Url,
+    Srcset,
     Js,
     Css,
 }
@@ -4064,10 +4306,17 @@ enum EscapeMode {
     Html,
     AttrQuoted { kind: AttrKind, quote: char },
     AttrUnquoted { kind: AttrKind },
+    AttrName,
     ScriptExpr,
     ScriptString { quote: char },
+    ScriptTemplate,
+    ScriptRegexp,
+    ScriptLineComment,
+    ScriptBlockComment,
     StyleExpr,
     StyleString { quote: char },
+    StyleLineComment,
+    StyleBlockComment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4075,14 +4324,18 @@ struct TagValueContext {
     attr_name: String,
     quoted: bool,
     quote: Option<char>,
+    value_prefix: String,
 }
 
 fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
     match (value, mode) {
         (Value::SafeHtml(raw), EscapeMode::Html) => return Ok(raw.clone()),
+        (Value::SafeHtml(raw), EscapeMode::AttrName) => return Ok(html_name_filter(&raw)),
         (Value::SafeHtmlAttr(raw), EscapeMode::AttrQuoted { .. })
         | (Value::SafeHtmlAttr(raw), EscapeMode::AttrUnquoted { .. }) => return Ok(raw.clone()),
         (Value::SafeJs(raw), EscapeMode::ScriptExpr)
+        | (Value::SafeJs(raw), EscapeMode::ScriptTemplate)
+        | (Value::SafeJs(raw), EscapeMode::ScriptRegexp)
         | (Value::SafeJs(raw), EscapeMode::ScriptString { .. })
         | (
             Value::SafeJs(raw),
@@ -4140,11 +4393,27 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
         ) => {
             return Ok(raw.clone());
         }
+        (
+            Value::SafeSrcset(raw),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Srcset,
+                ..
+            },
+        )
+        | (
+            Value::SafeSrcset(raw),
+            EscapeMode::AttrUnquoted {
+                kind: AttrKind::Srcset,
+            },
+        ) => {
+            return Ok(raw.clone());
+        }
         _ => {}
     }
 
     match mode {
         EscapeMode::Html => Ok(escape_html(&value.to_plain_string())),
+        EscapeMode::AttrName => Ok(html_name_filter(&value.to_plain_string())),
         EscapeMode::AttrQuoted { kind, quote } => {
             let text = transform_attr_value(&value.to_plain_string(), kind, Some(quote));
             Ok(escape_html(&text))
@@ -4154,10 +4423,14 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
             Ok(escape_attr_unquoted(&text))
         }
         EscapeMode::ScriptExpr => escape_script_value(value),
+        EscapeMode::ScriptTemplate => Ok(escape_js_string_fragment(&value.to_plain_string(), '`')),
+        EscapeMode::ScriptRegexp => Ok(escape_js_string_fragment(&value.to_plain_string(), '/')),
+        EscapeMode::ScriptLineComment | EscapeMode::ScriptBlockComment => Ok(String::new()),
         EscapeMode::ScriptString { quote } => {
             Ok(escape_js_string_fragment(&value.to_plain_string(), quote))
         }
         EscapeMode::StyleExpr => Ok(escape_css_text(&value.to_plain_string())),
+        EscapeMode::StyleLineComment | EscapeMode::StyleBlockComment => Ok(String::new()),
         EscapeMode::StyleString { quote } => {
             Ok(escape_css_string_fragment(&value.to_plain_string(), quote))
         }
@@ -4167,6 +4440,22 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
 fn infer_escape_mode(rendered: &str) -> EscapeMode {
     if let Some(context) = current_tag_value_context(rendered) {
         let kind = attr_kind(&context.attr_name);
+        match kind {
+            AttrKind::Js => {
+                return match script_attribute_mode(&context.value_prefix) {
+                    Some(mode) => mode,
+                    None => EscapeMode::ScriptExpr,
+                };
+            }
+            AttrKind::Css => {
+                return match style_attribute_mode(&context.value_prefix) {
+                    Some(mode) => mode,
+                    None => EscapeMode::StyleExpr,
+                };
+            }
+            _ => {}
+        }
+
         return if context.quoted {
             EscapeMode::AttrQuoted {
                 kind,
@@ -4175,6 +4464,10 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
         } else {
             EscapeMode::AttrUnquoted { kind }
         };
+    }
+
+    if current_attr_name_context(rendered) {
+        return EscapeMode::AttrName;
     }
 
     if let Some(mode) = script_escape_mode(rendered) {
@@ -4199,6 +4492,105 @@ fn current_tag_value_context(rendered: &str) -> Option<TagValueContext> {
 
     let fragment = &rendered[last_lt + 1..];
     parse_open_tag_value_context(fragment)
+}
+
+fn current_attr_name_context(rendered: &str) -> bool {
+    let last_gt = rendered.rfind('>');
+    let last_lt = rendered.rfind('<')?;
+
+    if let Some(last_gt) = last_gt {
+        if last_gt > last_lt {
+            return false;
+        }
+    }
+
+    let fragment = &rendered[last_lt + 1..];
+    if fragment.is_empty() {
+        return false;
+    }
+
+    let chars: Vec<char> = fragment.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return true;
+    }
+
+    if chars[i] == '/' || chars[i] == '!' || chars[i] == '?' {
+        return false;
+    }
+
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            return true;
+        }
+        if chars[i] == '/' || chars[i] == '>' {
+            return false;
+        }
+
+        let start = i;
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch.is_whitespace() || ch == '=' || ch == '/' || ch == '>' {
+                break;
+            }
+            i += 1;
+        }
+        if i <= start {
+            return false;
+        }
+
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] == '/' || chars[i] == '>' {
+            return true;
+        }
+
+        if chars[i] == '=' {
+            i += 1;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+
+            if i >= chars.len() {
+                return false;
+            }
+
+            if chars[i] == '"' || chars[i] == '\'' {
+                let quote = chars[i];
+                i += 1;
+                while i < chars.len() && chars[i] != quote {
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return false;
+                }
+                i += 1;
+                continue;
+            }
+
+            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
+                i += 1;
+            }
+
+            if i >= chars.len() {
+                return false;
+            }
+
+            continue;
+        }
+
+        return true;
+    }
+
+    false
 }
 
 fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
@@ -4266,6 +4658,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
                 attr_name,
                 quoted: false,
                 quote: None,
+                value_prefix: String::new(),
             });
         }
 
@@ -4283,6 +4676,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
                         attr_name,
                         quoted: true,
                         quote: Some(quote),
+                        value_prefix: partial,
                     });
                 }
                 return None;
@@ -4300,6 +4694,7 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
                         attr_name,
                         quoted: false,
                         quote: None,
+                        value_prefix: partial,
                     });
                 }
                 return None;
@@ -4308,13 +4703,6 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
     }
 
     None
-}
-
-fn is_url_attribute(attr_name: &str) -> bool {
-    matches!(
-        attr_name.to_ascii_lowercase().as_str(),
-        "href" | "src" | "action" | "formaction" | "poster" | "data" | "srcset"
-    )
 }
 
 fn normalize_attr_name_for_context(attr_name: &str) -> (String, bool) {
@@ -4341,21 +4729,174 @@ fn normalize_attr_name_for_context(attr_name: &str) -> (String, bool) {
 
 fn attr_kind(attr_name: &str) -> AttrKind {
     let (normalized, xmlns_attr) = normalize_attr_name_for_context(attr_name);
-    if xmlns_attr || is_url_attribute(&normalized) {
-        AttrKind::Url
-    } else if normalized.starts_with("on") {
-        AttrKind::Js
-    } else if normalized == "style" {
-        AttrKind::Css
-    } else {
-        AttrKind::Normal
+    if xmlns_attr {
+        return AttrKind::Url;
     }
+
+    match attr_content_type(&normalized) {
+        AttrContentType::Plain => AttrKind::Normal,
+        AttrContentType::Url => AttrKind::Url,
+        AttrContentType::Js => AttrKind::Js,
+        AttrContentType::Css => AttrKind::Css,
+        AttrContentType::Srcset => AttrKind::Srcset,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttrContentType {
+    Plain,
+    Url,
+    Js,
+    Css,
+    Srcset,
+}
+
+fn attr_content_type(attr_name: &str) -> AttrContentType {
+    match attr_name {
+        "accept"
+        | "alt"
+        | "autofocus"
+        | "autocomplete"
+        | "autoplay"
+        | "border"
+        | "checked"
+        | "cols"
+        | "colspan"
+        | "class"
+        | "contenteditable"
+        | "contextmenu"
+        | "controls"
+        | "coords"
+        | "dir"
+        | "dirname"
+        | "disabled"
+        | "draggable"
+        | "dropzone"
+        | "for"
+        | "formtarget"
+        | "headers"
+        | "height"
+        | "high"
+        | "hreflang"
+        | "id"
+        | "ismap"
+        | "kind"
+        | "label"
+        | "lang"
+        | "language"
+        | "list"
+        | "loop"
+        | "low"
+        | "max"
+        | "maxlength"
+        | "media"
+        | "mediagroup"
+        | "min"
+        | "multiple"
+        | "name"
+        | "open"
+        | "optimum"
+        | "placeholder"
+        | "preload"
+        | "pubdate"
+        | "radiogroup"
+        | "readonly"
+        | "required"
+        | "reversed"
+        | "rows"
+        | "rowspan"
+        | "spellcheck"
+        | "scope"
+        | "scoped"
+        | "seamless"
+        | "selected"
+        | "shape"
+        | "size"
+        | "sizes"
+        | "span"
+        | "srcdoc"
+        | "srclang"
+        | "start"
+        | "step"
+        | "tabindex"
+        | "target"
+        | "title"
+        | "value"
+        | "width"
+        | "wrap" => AttrContentType::Plain,
+
+        "accept-charset"
+        | "async"
+        | "challenge"
+        | "charset"
+        | "crossorigin"
+        | "defer"
+        | "enctype"
+        | "form"
+        | "formenctype"
+        | "formmethod"
+        | "formnovalidate"
+        | "http-equiv"
+        | "keytype"
+        | "method"
+        | "novalidate"
+        | "rel"
+        | "sandbox"
+        | "type" => AttrContentType::Plain,
+
+        "action"
+        | "archive"
+        | "background"
+        | "cite"
+        | "classid"
+        | "codebase"
+        | "data"
+        | "formaction"
+        | "href"
+        | "icon"
+        | "longdesc"
+        | "manifest"
+        | "poster"
+        | "profile"
+        | "src"
+        | "usemap" => AttrContentType::Url,
+
+        "srcset" => AttrContentType::Srcset,
+        "style" => AttrContentType::Css,
+        _ => {
+            if attr_name.starts_with("on") {
+                return AttrContentType::Js;
+            }
+            if attr_name.contains("src") || attr_name.contains("uri") || attr_name.contains("url") {
+                return AttrContentType::Url;
+            }
+            AttrContentType::Plain
+        }
+    }
+}
+
+fn html_name_filter(input: &str) -> String {
+    if input.is_empty() {
+        return "#ZgotmplZ".to_string();
+    }
+
+    let name = input.to_ascii_lowercase();
+    if !name.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return "#ZgotmplZ".to_string();
+    }
+
+    if attr_content_type(&name) != AttrContentType::Plain {
+        return "#ZgotmplZ".to_string();
+    }
+
+    name
 }
 
 fn transform_attr_value(value: &str, kind: AttrKind, quote: Option<char>) -> String {
     match kind {
         AttrKind::Normal => value.to_string(),
         AttrKind::Url => normalize_url_for_attribute(value),
+        AttrKind::Srcset => filter_srcset_attribute_value(value),
         AttrKind::Js => {
             let q = quote.unwrap_or('"');
             escape_js_string_fragment(value, q)
@@ -4367,20 +4908,22 @@ fn transform_attr_value(value: &str, kind: AttrKind, quote: Option<char>) -> Str
     }
 }
 
+fn script_attribute_mode(value_prefix: &str) -> Option<EscapeMode> {
+    Some(current_js_mode(value_prefix))
+}
+
+fn style_attribute_mode(value_prefix: &str) -> Option<EscapeMode> {
+    Some(current_css_mode(value_prefix))
+}
+
 fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let content = current_unclosed_tag_content(rendered, "script")?;
-    if let Some(quote) = current_js_string_quote(content) {
-        return Some(EscapeMode::ScriptString { quote });
-    }
-    Some(EscapeMode::ScriptExpr)
+    Some(current_js_mode(content))
 }
 
 fn style_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let content = current_unclosed_tag_content(rendered, "style")?;
-    if let Some(quote) = current_css_string_quote(content) {
-        return Some(EscapeMode::StyleString { quote });
-    }
-    Some(EscapeMode::StyleExpr)
+    Some(current_css_mode(content))
 }
 
 fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option<&'a str> {
@@ -4430,126 +4973,461 @@ fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option
     }
 }
 
-fn current_js_string_quote(content: &str) -> Option<char> {
-    let chars: Vec<char> = content.chars().collect();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsContext {
+    RegExp,
+    DivOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsScanState {
+    Expr { js_ctx: JsContext },
+    SingleQuote,
+    DoubleQuote,
+    RegExp { in_char_class: bool, js_ctx: JsContext },
+    TemplateLiteral,
+    TemplateExpr { brace_depth: usize, js_ctx: JsContext },
+    LineComment { js_ctx: JsContext },
+    BlockComment { js_ctx: JsContext },
+}
+
+fn current_js_mode(content: &str) -> EscapeMode {
+    match current_js_scan_state(content) {
+        JsScanState::Expr { .. } => EscapeMode::ScriptExpr,
+        JsScanState::SingleQuote => EscapeMode::ScriptString { quote: '\'' },
+        JsScanState::DoubleQuote => EscapeMode::ScriptString { quote: '"' },
+        JsScanState::RegExp { .. } => EscapeMode::ScriptRegexp,
+        JsScanState::TemplateLiteral => EscapeMode::ScriptTemplate,
+        JsScanState::TemplateExpr { .. } => EscapeMode::ScriptExpr,
+        JsScanState::LineComment { .. } => EscapeMode::ScriptLineComment,
+        JsScanState::BlockComment { .. } => EscapeMode::ScriptBlockComment,
+    }
+}
+
+fn current_js_scan_state(content: &str) -> JsScanState {
+    let bytes = content.as_bytes();
+    let mut state = JsScanState::Expr {
+        js_ctx: JsContext::Regexp,
+    };
+    let mut segment_start = 0usize;
     let mut i = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut line_comment = false;
-    let mut block_comment = false;
 
-    while i < chars.len() {
-        let ch = chars[i];
-        let next = chars.get(i + 1).copied();
-
-        if line_comment {
-            if ch == '\n' {
-                line_comment = false;
+    while i < bytes.len() {
+        state = match state {
+            JsScanState::Expr { js_ctx } => {
+                let ch = bytes[i];
+                match ch {
+                    b'\'' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::SingleQuote
+                    }
+                    b'"' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::DoubleQuote
+                    }
+                    b'`' => {
+                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
+                        segment_start = i + 1;
+                        i += 1;
+                        JsScanState::TemplateLiteral
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::LineComment { js_ctx }
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::BlockComment { js_ctx }
+                    }
+                    b'/' if i + 3 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 4;
+                        segment_start = i;
+                        JsScanState::LineComment { js_ctx }
+                    }
+                    b'-' if i + 2 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 3;
+                        segment_start = i;
+                        JsScanState::LineComment { js_ctx }
+                    }
+                    b'#' if i + 1 < bytes.len() && bytes[i + 1] == b'!' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        i += 2;
+                        segment_start = i;
+                        JsScanState::LineComment { js_ctx }
+                    }
+                    b'/' => {
+                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        if js_ctx == JsContext::Regexp {
+                            i += 1;
+                            segment_start = i;
+                            JsScanState::RegExp {
+                                in_char_class: false,
+                                js_ctx,
+                            }
+                        } else {
+                            i += 1;
+                            segment_start = i;
+                            JsScanState::Expr { js_ctx }
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                        JsScanState::Expr { js_ctx }
+                    }
+                }
             }
-            i += 1;
-            continue;
-        }
-
-        if block_comment {
-            if ch == '*' && next == Some('/') {
-                block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
+            JsScanState::SingleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::SingleQuote
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else {
+                    i += 1;
+                    JsScanState::SingleQuote
+                }
             }
-            continue;
-        }
-
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-                i += 1;
-                continue;
+            JsScanState::DoubleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::DoubleQuote
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else {
+                    i += 1;
+                    JsScanState::DoubleQuote
+                }
             }
-            if ch == '\\' {
-                escaped = true;
-                i += 1;
-                continue;
+            JsScanState::RegExp {
+                mut in_char_class,
+                js_ctx,
+            } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'[' {
+                    in_char_class = true;
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b']' {
+                    in_char_class = false;
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                } else if bytes[i] == b'/' && !in_char_class {
+                    i += 1;
+                    JsScanState::Expr { js_ctx }
+                } else {
+                    i += 1;
+                    JsScanState::RegExp {
+                        in_char_class,
+                        js_ctx,
+                    }
+                }
             }
-            if ch == active_quote {
-                quote = None;
+            JsScanState::TemplateLiteral => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::TemplateLiteral
+                } else if bytes[i] == b'`' {
+                    i += 1;
+                    JsScanState::Expr { js_ctx: JsContext::DivOp }
+                } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                    i += 2;
+                    JsScanState::TemplateExpr {
+                        brace_depth: 1,
+                        js_ctx: JsContext::DivOp,
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::TemplateLiteral
+                }
             }
-            i += 1;
-            continue;
-        }
-
-        if ch == '/' && next == Some('/') {
-            line_comment = true;
-            i += 2;
-            continue;
-        }
-        if ch == '/' && next == Some('*') {
-            block_comment = true;
-            i += 2;
-            continue;
-        }
-
-        if ch == '"' || ch == '\'' || ch == '`' {
-            quote = Some(ch);
-        }
-        i += 1;
+            JsScanState::TemplateExpr { mut brace_depth, js_ctx } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                } else if bytes[i] == b'{' {
+                    brace_depth += 1;
+                    i += 1;
+                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                } else if bytes[i] == b'}' {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    }
+                    i += 1;
+                    if brace_depth == 0 {
+                        JsScanState::TemplateLiteral
+                    } else {
+                        JsScanState::TemplateExpr { brace_depth, js_ctx }
+                    }
+                } else {
+                    i += 1;
+                    JsScanState::TemplateExpr { brace_depth, js_ctx }
+                }
+            }
+            JsScanState::LineComment { js_ctx } => {
+                if matches!(bytes[i], b'\n' | b'\r' | b'\u{2028}' | b'\u{2029}') {
+                    i += 1;
+                    JsScanState::Expr { js_ctx }
+                } else {
+                    i += 1;
+                    JsScanState::LineComment { js_ctx }
+                }
+            }
+            JsScanState::BlockComment { js_ctx } => {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    JsScanState::Expr { js_ctx }
+                } else {
+                    i += 1;
+                    JsScanState::BlockComment { js_ctx }
+                }
+            }
+        };
     }
 
-    quote
+    state
+}
+
+fn next_js_ctx(prefix: &str, preceding: JsContext) -> JsContext {
+    let prefix = prefix.trim_end_matches(js_whitespace);
+    if prefix.is_empty() {
+        return preceding;
+    }
+
+    let bytes = prefix.as_bytes();
+    let n = bytes.len();
+    let c = bytes[n - 1];
+    match c {
+        b'+' | b'-' => {
+            let mut start = n - 1;
+            while start > 0 && bytes[start - 1] == c {
+                start -= 1;
+            }
+            if (n - start) & 1 == 1 {
+                JsContext::Regexp
+            } else {
+                JsContext::DivOp
+            }
+        }
+        b'.' => {
+            if n != 1 && bytes[n - 2].is_ascii_digit() {
+                JsContext::DivOp
+            } else {
+                JsContext::Regexp
+            }
+        }
+        b',' | b'<' | b'>' | b'=' | b'*' | b'%' | b'&' | b'|' | b'^' | b'?' | b'!' | b'~'
+        | b'(' | b'[' | b':' | b';' | b'{' | b'}' => JsContext::Regexp,
+        b'_' | b'/' | b'\\' => JsContext::DivOp,
+        _ => {
+            let mut j = n;
+            while j > 0 && is_js_ident_part_byte(bytes[j - 1]) {
+                j -= 1;
+            }
+            if is_js_ident_keyword(&prefix[j..]) {
+                JsContext::Regexp
+            } else {
+                JsContext::DivOp
+            }
+        }
+    }
+}
+
+fn is_js_ident_part_byte(byte: u8) -> bool {
+    matches!(byte, b'$' | b'_' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+fn is_js_ident_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "break"
+            | "case"
+            | "continue"
+            | "delete"
+            | "do"
+            | "else"
+            | "finally"
+            | "in"
+            | "instanceof"
+            | "return"
+            | "throw"
+            | "try"
+            | "typeof"
+            | "void"
+    )
+}
+
+fn js_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{000C}'
+            | '\u{000A}'
+            | '\u{000D}'
+            | '\u{0009}'
+            | '\u{000B}'
+            | '\u{0020}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            | '\u{2001}'
+            | '\u{2002}'
+            | '\u{2003}'
+            | '\u{2004}'
+            | '\u{2005}'
+            | '\u{2006}'
+            | '\u{2007}'
+            | '\u{2008}'
+            | '\u{2009}'
+            | '\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CssScanState {
+    Expr,
+    SingleQuote,
+    DoubleQuote,
+    LineComment,
+    BlockComment,
+}
+
+fn current_css_mode(content: &str) -> EscapeMode {
+    match current_css_scan_state(content) {
+        CssScanState::Expr => EscapeMode::StyleExpr,
+        CssScanState::SingleQuote => EscapeMode::StyleString { quote: '\'' },
+        CssScanState::DoubleQuote => EscapeMode::StyleString { quote: '"' },
+        CssScanState::LineComment => EscapeMode::StyleLineComment,
+        CssScanState::BlockComment => EscapeMode::StyleBlockComment,
+    }
+}
+
+fn current_css_scan_state(content: &str) -> CssScanState {
+    let bytes = content.as_bytes();
+    let mut state = CssScanState::Expr;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        state = match state {
+            CssScanState::Expr => {
+                let ch = bytes[i];
+                match ch {
+                    b'"' => {
+                        i += 1;
+                        CssScanState::DoubleQuote
+                    }
+                    b'\'' => {
+                        i += 1;
+                        CssScanState::SingleQuote
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                        i += 2;
+                        CssScanState::LineComment
+                    }
+                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                        i += 2;
+                        CssScanState::BlockComment
+                    }
+                    _ => {
+                        i += 1;
+                        CssScanState::Expr
+                    }
+                }
+            }
+            CssScanState::SingleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    CssScanState::SingleQuote
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    CssScanState::Expr
+                } else {
+                    i += 1;
+                    CssScanState::SingleQuote
+                }
+            }
+            CssScanState::DoubleQuote => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    CssScanState::DoubleQuote
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    CssScanState::Expr
+                } else {
+                    i += 1;
+                    CssScanState::DoubleQuote
+                }
+            }
+            CssScanState::LineComment => {
+                if bytes[i] == b'\n' || bytes[i] == b'\f' || bytes[i] == b'\r' {
+                    i += 1;
+                    CssScanState::Expr
+                } else {
+                    i += 1;
+                    CssScanState::LineComment
+                }
+            }
+            CssScanState::BlockComment => {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    CssScanState::Expr
+                } else {
+                    i += 1;
+                    CssScanState::BlockComment
+                }
+            }
+        };
+    }
+
+    state
+}
+
+fn current_js_string_quote(content: &str) -> Option<char> {
+    match current_js_scan_state(content) {
+        JsScanState::SingleQuote => Some('\''),
+        JsScanState::DoubleQuote => Some('"'),
+        JsScanState::TemplateLiteral => None,
+        JsScanState::Expr { .. }
+        | JsScanState::RegExp { .. }
+        | JsScanState::TemplateExpr { .. }
+        | JsScanState::LineComment { .. }
+        | JsScanState::BlockComment { .. } => None,
+    }
 }
 
 fn current_css_string_quote(content: &str) -> Option<char> {
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0usize;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut block_comment = false;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        let next = chars.get(i + 1).copied();
-
-        if block_comment {
-            if ch == '*' && next == Some('/') {
-                block_comment = false;
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-                i += 1;
-                continue;
-            }
-            if ch == '\\' {
-                escaped = true;
-                i += 1;
-                continue;
-            }
-            if ch == active_quote {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-
-        if ch == '/' && next == Some('*') {
-            block_comment = true;
-            i += 2;
-            continue;
-        }
-
-        if ch == '"' || ch == '\'' {
-            quote = Some(ch);
-        }
-        i += 1;
+    match current_css_scan_state(content) {
+        CssScanState::SingleQuote => Some('\''),
+        CssScanState::DoubleQuote => Some('"'),
+        CssScanState::Expr | CssScanState::LineComment | CssScanState::BlockComment => None,
     }
-
-    quote
 }
 
 fn escape_script_value(value: &Value) -> Result<String> {
@@ -4643,6 +5521,76 @@ fn encode_url_attribute_value(input: &str) -> String {
     encoded
 }
 
+fn filter_srcset_attribute_value(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::new();
+    let mut start = 0usize;
+
+    for i in 0..bytes.len() {
+        if bytes[i] != b',' {
+            continue;
+        }
+
+        filter_srcset_element(input, bytes, &mut start, i, &mut output);
+        output.push(',');
+        start = i + 1;
+    }
+
+    filter_srcset_element(input, bytes, &mut start, bytes.len(), &mut output);
+    output
+}
+
+fn filter_srcset_element(
+    input: &str,
+    bytes: &[u8],
+    start: &mut usize,
+    end: usize,
+    output: &mut String,
+) {
+    let mut left = *start;
+    while left < end && is_html_space(bytes[left]) {
+        left += 1;
+    }
+
+    let mut element_end = end;
+    let mut i = left;
+    while i < end {
+        if is_html_space(bytes[i]) {
+            element_end = i;
+            break;
+        }
+        i += 1;
+    }
+
+    let url = &input[left..element_end];
+    if !url.is_empty() && is_safe_url(url) && srcset_metadata_is_safe(&input[element_end..end]) {
+        output.push_str(&input[*start..left]);
+        output.push_str(&normalize_url_for_attribute(url).replace(',', "%2c"));
+        output.push_str(&input[element_end..end]);
+    } else {
+        output.push_str("#ZgotmplZ");
+    }
+
+    *start = end;
+}
+
+fn srcset_metadata_is_safe(metadata: &str) -> bool {
+    for byte in metadata.as_bytes() {
+        if !is_html_space_or_ascii_alnum(*byte) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_html_space(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ')
+}
+
+fn is_html_space_or_ascii_alnum(byte: u8) -> bool {
+    is_html_space(byte) || (byte < 0x80 && byte.is_ascii_alphanumeric())
+}
+
 fn is_safe_url_attr_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
@@ -4687,6 +5635,19 @@ fn escape_js_string_fragment(input: &str, quote: char) -> String {
             '&' => escaped.push_str("\\x26"),
             '\u{2028}' => escaped.push_str("\\u2028"),
             '\u{2029}' => escaped.push_str("\\u2029"),
+            c if quote == '`' && c == '`' => escaped.push_str("\\x60"),
+            c if quote == '`' && c == '$' => {
+                escaped.push('\\');
+                escaped.push('$');
+            }
+            c if quote == '`' && c == '{' => {
+                escaped.push('\\');
+                escaped.push('{');
+            }
+            c if quote == '`' && c == '}' => {
+                escaped.push('\\');
+                escaped.push('}');
+            }
             c if c == quote => {
                 escaped.push('\\');
                 escaped.push(c);
@@ -4963,23 +5924,100 @@ mod tests {
     }
 
     #[test]
-    fn new_shares_template_namespace_with_parent() {
+    fn new_template_option_and_delims_are_shared() {
         let base = Template::new("base")
-            .parse("{{define \"shared\"}}shared{{end}}")
+            .delims("[[", "]]")
+            .add_func("upper", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("upper expects one arg".to_string()))?;
+                Ok(Value::from(value.to_plain_string().to_uppercase()))
+            })
+            .option("missingkey=zero")
+            .expect("option should succeed")
+            .parse("[[define \"shared\"]]shared[[end]]")
             .expect("parse should succeed");
 
-        let child = base.New("child").parse("{{define \"only_child\"}}only-child{{end}}");
+        let child = base
+            .New("child")
+            .parse("[[define \"only_child\"]][[upper .Name]]|[[.Missing]][[end]]");
         let child = child.expect("parse should succeed");
 
         let child_output = child
-            .execute_template_to_string("only_child", &json!({}))
+            .execute_template_to_string("only_child", &json!({ "Name": "alice" }))
             .expect("child execute should succeed");
         let base_output = base
-            .execute_template_to_string("only_child", &json!({}))
+            .execute_template_to_string("only_child", &json!({ "Name": "bob" }))
             .expect("base execute should succeed");
 
-        assert_eq!(child_output, "only-child");
-        assert_eq!(base_output, "only-child");
+        assert_eq!(child_output, "ALICE|");
+        assert_eq!(base_output, "BOB|");
+    }
+
+    #[test]
+    fn clone_creates_independent_namespace_after_execution() {
+        let base = Template::new("base")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+
+        let cloned = base
+            .Clone()
+            .expect("clone should succeed")
+            .add_func("upper", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("upper expects one arg".to_string()))?;
+                Ok(Value::from(value.to_plain_string().to_uppercase()))
+            });
+
+        let _ = cloned
+            .execute_to_string(&json!({ "Name": "cloned" }))
+            .expect("execute should succeed");
+
+        let base = base
+            .parse("{{define \"only_base\"}}only-base{{end}}");
+        let base = base.expect("parse on base should succeed");
+
+        let base_output = base
+            .execute_template_to_string("only_base", &json!({}))
+            .expect("base execute should succeed");
+        let cloned_output = cloned.execute_template_to_string("only_base", &json!({}));
+
+        assert_eq!(base_output, "only-base");
+        assert!(cloned_output.is_err());
+    }
+
+    #[test]
+    fn clone_does_not_share_function_map() {
+        let base = Template::new("base")
+            .add_func("marker", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("marker expects one arg".to_string()))?;
+                Ok(Value::from(format!("base:{}", value.to_plain_string())))
+            })
+            .parse("{{marker .Name}}")
+            .expect("parse should succeed");
+
+        let cloned = base
+            .Clone()
+            .expect("clone should succeed")
+            .add_func("marker", |args: &[Value]| {
+                let value = args
+                    .first()
+                    .ok_or_else(|| TemplateError::Render("marker expects one arg".to_string()))?;
+                Ok(Value::from(format!("clone:{}", value.to_plain_string())))
+            });
+
+        let base_output = base
+            .execute_to_string(&json!({ "Name": "Alice" }))
+            .expect("execute should succeed");
+        let cloned_output = cloned
+            .execute_to_string(&json!({ "Name": "Alice" }))
+            .expect("execute should succeed");
+
+        assert_eq!(base_output, "base:Alice");
+        assert_eq!(cloned_output, "clone:Alice");
     }
 
     #[cfg(not(feature = "web-rust"))]
@@ -5009,6 +6047,22 @@ mod tests {
         };
         assert!(err.to_string().contains("No such file")
             || err.to_string().contains("does_not_exist.tmpl"));
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_files_invalid_utf8_returns_invalid_utf8_error_code() {
+        let dir = tempdir().expect("temp dir should be created");
+        let template_path = dir.path().join("invalid.tmpl");
+        fs::write(&template_path, &[0xffu8, 0xfeu8])
+            .expect("invalid utf-8 template should be written");
+
+        let template_path = template_path.to_string_lossy();
+        let err = match Template::new("invalid").parse_files([template_path.as_ref()]) {
+            Ok(_) => panic!("parse_files should fail for invalid utf-8 template"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), TemplateErrorCode::ErrInvalidUTF8);
     }
 
     #[cfg(not(feature = "web-rust"))]
@@ -5315,6 +6369,145 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_attribute_name_with_static_prefix_is_merged() {
+        let template = Template::new("attrs")
+            .parse("<img on{{.Suffix}}=\"alert({{.Msg}})\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Suffix": "load", "Msg": "loaded"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<img onload=\"alert(&quot;loaded&quot;)\">");
+    }
+
+    #[test]
+    fn dynamic_attribute_name_bad_event_handler_is_rejected() {
+        let template = Template::new("attrs")
+            .parse("<input {{.Name}}=\"{{.Value}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "onchange", "Value": "doEvil()"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<input #ZgotmplZ=\"doEvil()\">");
+    }
+
+    #[test]
+    fn dynamic_attribute_name_bad_css_handler_is_rejected() {
+        let template = Template::new("attrs")
+            .parse("<div {{.Name}}=\"{{.Value}}\"></div>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "style", "Value": "color: expression(alert(1337))"}))
+            .expect("execute to succeed");
+
+        assert_eq!(
+            output,
+            "<div #ZgotmplZ=\"color: expression(alert(1337))\"></div>"
+        );
+    }
+
+    #[test]
+    fn dynamic_attribute_name_bad_url_handler_is_rejected() {
+        let template = Template::new("attrs")
+            .parse("<img {{.Name}}=\"{{.Value}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "src", "Value": "javascript:alert(1)"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<img #ZgotmplZ=\"javascript:alert(1)\">");
+    }
+
+    #[test]
+    fn dynamic_attribute_name_empty_value_is_rejected() {
+        let template = Template::new("attrs")
+            .parse("<input {{.Name}} name=n>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": ""}))
+            .expect("parse should succeed");
+
+        assert_eq!(output, "<input #ZgotmplZ name=n>");
+    }
+
+    #[test]
+    fn attr_type_map_plain_attribute_is_escaped_but_not_url_normalized() {
+        let template = Template::new("attrs")
+            .parse("<input accept-charset=\"{{.Value}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Value": "javascript:alert(1)"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<input accept-charset=\"javascript:alert(1)\">");
+    }
+
+    #[test]
+    fn attr_type_map_url_attribute_and_heuristics_are_applied() {
+        let template = Template::new("attrs")
+            .parse("<a action=\"{{.Value}}\" custom-src=\"{{.Value2}}\"></a>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "Value": "javascript:alert(1)",
+                "Value2": "javascript:alert(2)"
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<a action=\"#ZgotmplZ\" custom-src=\"#ZgotmplZ\"></a>");
+    }
+
+    #[test]
+    fn srcset_attribute_filters_each_element() {
+        let template = Template::new("srcset")
+            .parse("<img srcset=\"{{.Srcset}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Srcset": " /foo/bar.png 200w, /baz/boo(1).png"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<img srcset=\" /foo/bar.png 200w, /baz/boo(1).png\">"
+        );
+    }
+
+    #[test]
+    fn srcset_attribute_rejects_unsafe_elements() {
+        let template = Template::new("srcset")
+            .parse("<img srcset=\"{{.Srcset}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Srcset": "javascript:alert(1), /foo.png"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<img srcset=\"#ZgotmplZ, /foo.png\">");
+    }
+
+    #[test]
+    fn srcset_attribute_rejects_unsafe_metadata() {
+        let template = Template::new("srcset")
+            .parse("<img srcset=\"{{.Srcset}}\">")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Srcset": "/bogus#, javascript:alert(1)"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<img srcset=\"/bogus#,#ZgotmplZ\">");
+    }
+
+    #[test]
     fn html_comments_in_template_source_are_stripped() {
         let template = Template::new("comments")
             .parse("<div>a<!--hidden-->{{.X}}<!--{{.Y}}--></div>")
@@ -5341,6 +6534,97 @@ mod tests {
             output,
             "<script>const x = \"\\u003ctag\\u003e\"; const y = {\"a\":\"\\u003cb\\u003e\"};</script>"
         );
+    }
+
+    #[test]
+    fn script_template_context_escapes_template_literal_tokens() {
+        let template = Template::new("script")
+            .parse("<script>const s = `{{.S}}`;</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"S": "a`b${c}"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>const s = `a\\x60b\\$\\{c\\}`;</script>");
+    }
+
+    #[test]
+    fn script_regexp_context_escapes_regexp_delimiters() {
+        let template = Template::new("script")
+            .parse("<script>const r = /{{.R}}/i;</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"R": "a/b</script>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>const r = /a\\/b\\x3C\\/script\\x3E/i;</script>");
+    }
+
+    #[test]
+    fn script_line_comment_mode_ignores_insertions() {
+        let template = Template::new("script")
+            .parse("<script>// {{.A}}\nconst x = {{.B}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "inject", "B": 1}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>// \nconst x = 1;</script>");
+    }
+
+    #[test]
+    fn script_block_comment_mode_ignores_insertions() {
+        let template = Template::new("script")
+            .parse("<script>/* {{.A}} */const x = 1;</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "inject"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>/*  */const x = 1;</script>");
+    }
+
+    #[test]
+    fn script_html_like_comment_mode_ignores_insertions() {
+        let template = Template::new("script")
+            .parse("<script>before <!-- beep\nbetween\nbefore-->boop\n</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>before \nbetween\nbefore\n</script>");
+    }
+
+    #[test]
+    fn style_line_comment_mode_ignores_insertions() {
+        let template = Template::new("style")
+            .parse("<style>// {{.A}}\n.a { color: red; }</style>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "<x>"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<style>// \n.a { color: red; }</style>");
+    }
+
+    #[test]
+    fn style_block_comment_mode_ignores_insertions() {
+        let template = Template::new("style")
+            .parse("<style>/* {{.A}} */.a { color: red; }</style>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"A": "<x>"}))
+            .expect("execute to succeed");
+
+        assert_eq!(output, "<style>/*  */.a { color: red; }</style>");
     }
 
     #[test]
@@ -5476,6 +6760,7 @@ mod tests {
             .expect_err("execute should fail");
 
         assert!(error.to_string().contains("map has no entry"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrMissingKey);
     }
 
     #[test]
@@ -5898,6 +7183,20 @@ mod tests {
                 .to_string()
                 .contains("branches end in different contexts")
         );
+        assert_eq!(error.code(), TemplateErrorCode::ErrBranchEnd);
+    }
+
+    #[test]
+    fn execute_missing_template_returns_not_defined_error_code() {
+        let template = Template::new("main")
+            .parse("{{.Name}}")
+            .expect("parse should succeed");
+        let error = match template.execute_template_to_string("missing", &json!({"Name": "alice"})) {
+            Ok(_) => panic!("execution should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(error.code(), TemplateErrorCode::ErrNotDefined);
+        assert!(error.to_string().contains("is not defined"));
     }
 
     #[test]
@@ -5908,6 +7207,33 @@ mod tests {
         };
 
         assert!(error.to_string().contains("no such template"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrNoSuchTemplate);
+    }
+
+    #[test]
+    fn template_error_info_exposes_name_and_reason() {
+        let error = match Template::new("main").parse("<div>{{template \"missing\" .}}</div>") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        let info = error.info();
+        assert_eq!(info.name, Some("missing".to_string()));
+        assert!(info.reason.contains("no such template"));
+        assert!(info.reason.contains("`missing`"));
+        assert_eq!(info.line, None);
+    }
+
+    #[test]
+    fn template_error_line_parser_supports_simple_errors() {
+        let err = TemplateError::Parse("line 12: unclosed action (missing }})".to_string());
+        let info = err.info();
+        assert_eq!(info.line, Some(12));
+        assert_eq!(err.line(), Some(12));
+        assert_eq!(err.name(), None);
+        assert_eq!(
+            err.reason(),
+            "line 12: unclosed action (missing }})".to_string()
+        );
     }
 
     #[test]
@@ -6041,6 +7367,7 @@ mod tests {
         };
 
         assert!(error.to_string().contains("non-text context"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
     }
 
     #[test]
