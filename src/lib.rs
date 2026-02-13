@@ -6602,6 +6602,19 @@ mod tests {
     }
 
     #[test]
+    fn script_hashbang_comment_mode_ignores_insertions() {
+        let template = Template::new("script")
+            .parse("<script>#! beep\n</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<script>\n</script>");
+    }
+
+    #[test]
     fn style_line_comment_mode_ignores_insertions() {
         let template = Template::new("style")
             .parse("<style>// {{.A}}\n.a { color: red; }</style>")
