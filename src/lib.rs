@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(not(feature = "web-rust"))]
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -410,6 +411,10 @@ impl Template {
         Ok(self)
     }
 
+    /// Parse templates from file paths.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(not(feature = "web-rust"))]
     pub fn parse_files<I, P>(mut self, paths: I) -> Result<Self>
     where
         I: IntoIterator<Item = P>,
@@ -445,6 +450,25 @@ impl Template {
         Ok(self)
     }
 
+    /// Parse templates from file paths.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(feature = "web-rust")]
+    pub fn parse_files<I, P>(self, _paths: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        self.ensure_not_executed()?;
+        Err(TemplateError::Parse(
+            "parse_files is not supported in web-rust builds".to_string(),
+        ))
+    }
+
+    /// Parse templates from glob pattern.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(not(feature = "web-rust"))]
     pub fn parse_glob(self, pattern: &str) -> Result<Self> {
         self.ensure_not_executed()?;
         let mut paths = Vec::new();
@@ -455,6 +479,21 @@ impl Template {
         self.parse_files(paths)
     }
 
+    /// Parse templates from glob pattern.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(feature = "web-rust")]
+    pub fn parse_glob(self, _pattern: &str) -> Result<Self> {
+        self.ensure_not_executed()?;
+        Err(TemplateError::Parse(
+            "parse_glob is not supported in web-rust builds".to_string(),
+        ))
+    }
+
+    /// Parse templates from file system pattern list.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(not(feature = "web-rust"))]
     pub fn parse_fs<I, S>(self, patterns: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
@@ -463,6 +502,21 @@ impl Template {
         self.ensure_not_executed()?;
         let paths = expand_glob_patterns(patterns)?;
         self.parse_files(paths)
+    }
+
+    /// Parse templates from file system pattern list.
+    ///
+    /// Note: this API is not available in `web-rust` builds.
+    #[cfg(feature = "web-rust")]
+    pub fn parse_fs<I, S>(self, _patterns: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ensure_not_executed()?;
+        Err(TemplateError::Parse(
+            "parse_fs is not supported in web-rust builds".to_string(),
+        ))
     }
 
     pub fn execute<T: Serialize, W: Write>(&self, writer: &mut W, data: &T) -> Result<()> {
@@ -1015,6 +1069,10 @@ pub fn must(result: Result<Template>) -> Template {
     }
 }
 
+/// Parse templates from file paths.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(not(feature = "web-rust"))]
 pub fn parse_files<I, P>(paths: I) -> Result<Template>
 where
     I: IntoIterator<Item = P>,
@@ -1034,12 +1092,44 @@ where
     Template::new(name).parse_files(paths)
 }
 
+/// Parse templates from file paths.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(feature = "web-rust")]
+pub fn parse_files<I, P>(_: I) -> Result<Template>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    Err(TemplateError::Parse(
+        "parse_files is not supported in web-rust builds".to_string(),
+    ))
+}
+
+/// Parse templates from glob pattern.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(not(feature = "web-rust"))]
 pub fn parse_glob(pattern: &str) -> Result<Template> {
     let paths = expand_glob_patterns([pattern])?;
     let name = template_name_from_path(&paths[0])?;
     Template::new(name).parse_files(paths)
 }
 
+/// Parse templates from glob pattern.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(feature = "web-rust")]
+pub fn parse_glob(_pattern: &str) -> Result<Template> {
+    Err(TemplateError::Parse(
+        "parse_glob is not supported in web-rust builds".to_string(),
+    ))
+}
+
+/// Parse templates from file system pattern list.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(not(feature = "web-rust"))]
 pub fn parse_fs<I, S>(patterns: I) -> Result<Template>
 where
     I: IntoIterator<Item = S>,
@@ -1050,6 +1140,21 @@ where
     Template::new(name).parse_files(paths)
 }
 
+/// Parse templates from file system pattern list.
+///
+/// Note: this API is not available in `web-rust` builds.
+#[cfg(feature = "web-rust")]
+pub fn parse_fs<I, S>(_: I) -> Result<Template>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    Err(TemplateError::Parse(
+        "parse_fs is not supported in web-rust builds".to_string(),
+    ))
+}
+
+#[cfg(not(feature = "web-rust"))]
 fn template_name_from_path(path: &Path) -> Result<String> {
     path.file_name()
         .and_then(|part| part.to_str())
@@ -2528,6 +2633,7 @@ fn strip_html_comments(source: &str) -> String {
     output
 }
 
+#[cfg(not(feature = "web-rust"))]
 fn expand_glob_patterns<I, S>(patterns: I) -> Result<Vec<std::path::PathBuf>>
 where
     I: IntoIterator<Item = S>,
@@ -2564,11 +2670,20 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
             tokens.push(Token::Text(source[cursor..start].to_string()));
         }
 
-        let mut action_start = start + left_delim.len();
-        if source[action_start..].starts_with('-') {
+    let mut action_start = start + left_delim.len();
+    if source[action_start..].starts_with('-') {
+        let mut next_chars = source[action_start + 1..].chars();
+        let should_treat_as_unary_minus = match next_chars.next() {
+            Some(ch) if ch.is_ascii_digit() || ch == '.' => true,
+            Some(_) => false,
+            None => false,
+        };
+
+        if !should_treat_as_unary_minus {
             action_start += 1;
             trim_last_text_whitespace(&mut tokens);
         }
+    }
 
         let end_offset = source[action_start..].find(right_delim).ok_or_else(|| {
             TemplateError::Parse(format!("unclosed action (missing `{right_delim}`)"))
@@ -3271,13 +3386,6 @@ fn parse_term(token: &str) -> Result<Term> {
     if token == "$" {
         return Ok(Term::RootPath(Vec::new()));
     }
-    if let Some(path) = token.strip_prefix('.') {
-        return Ok(Term::DotPath(parse_path(path)));
-    }
-    if let Some(reference) = token.strip_prefix('$') {
-        let (name, path) = parse_variable_reference(reference)?;
-        return Ok(Term::Variable { name, path });
-    }
 
     if token.starts_with('"') || token.starts_with('\'') || token.starts_with('`') {
         let (text, consumed) = parse_string_literal_prefix(token)?;
@@ -3299,14 +3407,42 @@ fn parse_term(token: &str) -> Result<Term> {
         return Ok(Term::Literal(Value::Json(JsonValue::Null)));
     }
 
-    if let Ok(value) = token.parse::<i64>() {
-        return Ok(Term::Literal(Value::from(value)));
+    if let Some(value) = parse_number_literal(token) {
+        return Ok(Term::Literal(value));
     }
-    if let Ok(value) = token.parse::<u64>() {
-        return Ok(Term::Literal(Value::from(value)));
+
+    if token.starts_with('.') {
+    if token.chars().nth(1).is_some_and(|ch| ch.is_ascii_digit()) {
+        return Err(TemplateError::Parse(format!(
+            "unsupported token `{token}` in expression"
+        )));
     }
-    if let Ok(value) = token.parse::<f64>() {
-        return Ok(Term::Literal(Value::from(value)));
+    }
+
+    if let Some(path) = token.strip_prefix('.') {
+        return Ok(Term::DotPath(parse_path(path)));
+    }
+    if let Some(reference) = token.strip_prefix('$') {
+        let (name, path) = parse_variable_reference(reference)?;
+        return Ok(Term::Variable { name, path });
+    }
+
+    if token.len() > 1 && token.as_bytes()[0] == b'0' {
+        return Err(TemplateError::Parse(format!(
+            "unsupported token `{token}` in expression"
+        )));
+    }
+
+    if !token.starts_with('+') && !token.starts_with('-') {
+        if let Ok(value) = token.parse::<i64>() {
+            return Ok(Term::Literal(Value::from(value)));
+        }
+        if let Ok(value) = token.parse::<u64>() {
+            return Ok(Term::Literal(Value::from(value)));
+        }
+        if let Ok(value) = token.parse::<f64>() {
+            return Ok(Term::Literal(Value::from(value)));
+        }
     }
 
     if is_identifier(token) {
@@ -3316,6 +3452,303 @@ fn parse_term(token: &str) -> Result<Term> {
     Err(TemplateError::Parse(format!(
         "unsupported token `{token}` in expression"
     )))
+}
+
+fn parse_number_literal(token: &str) -> Option<Value> {
+    if token.is_empty() {
+        return None;
+    }
+
+    if token.contains('_') && has_invalid_underscore_placement(token) {
+        return None;
+    }
+
+    let (sign, rest) = match token.as_bytes()[0] as char {
+        '+' => (1.0_f64, &token[1..]),
+        '-' => (-1.0_f64, &token[1..]),
+        _ => (1.0_f64, token),
+    };
+
+    let normalized = token_without_underscore(rest);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = parse_prefixed_integer_literal(&normalized) {
+        return Some(apply_sign_to_numeric_value(value, sign));
+    }
+
+    if let Some(value) = parse_decimal_number(&normalized) {
+        return Some(apply_sign_to_numeric_value(value, sign));
+    }
+
+    if let Some(value) = parse_hex_number(&normalized) {
+        return Some(apply_sign_to_numeric_value(value, sign));
+    }
+
+    None
+}
+
+fn apply_sign_to_numeric_value(value: Value, sign: f64) -> Value {
+    if (sign - 1.0).abs() < f64::EPSILON {
+        return value;
+    }
+
+    match value {
+        Value::Json(JsonValue::Number(number)) => {
+            if let Some(integer) = number.as_i64() {
+                if integer == i64::MIN {
+                    return Value::from(-(integer as f64));
+                }
+                return Value::from(-integer);
+            }
+            if let Some(integer) = number.as_u64() {
+                if let Ok(signed) = i64::try_from(integer) {
+                    return Value::from(-signed);
+                }
+                return Value::from(-(integer as f64));
+            }
+            if let Some(float) = number.as_f64() {
+                return int_or_float_value(-float);
+            }
+            Value::Json(JsonValue::Number(number))
+        }
+        _ => value,
+    }
+}
+
+fn has_invalid_underscore_placement(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let trimmed = raw
+        .strip_prefix('+')
+        .or_else(|| raw.strip_prefix('-'))
+        .unwrap_or(raw);
+    let is_hex_prefixed = trimmed.starts_with("0x") || trimmed.starts_with("0X");
+
+    if bytes.is_empty() {
+        return false;
+    }
+
+    if bytes[0] == b'_' || *bytes.last().unwrap() == b'_' {
+        return true;
+    }
+
+    for i in 1..bytes.len() {
+        if bytes[i - 1] == b'_' && bytes[i] == b'_' {
+            return true;
+        }
+    }
+
+    for i in 0..bytes.len() {
+        if bytes[i] != b'_' {
+            continue;
+        }
+
+        let prev = bytes.get(i.wrapping_sub(1)).copied();
+        let next = bytes.get(i + 1).copied();
+
+        if matches!(prev, Some(b'.' | b'+' | b'-'))
+            || (!is_hex_prefixed && matches!(prev, Some(b'e' | b'E')))
+        {
+            return true;
+        }
+        if matches!(next, Some(b'.' | b'+' | b'-'))
+            || (!is_hex_prefixed && matches!(next, Some(b'e' | b'E')))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn parse_prefixed_integer_literal(raw: &str) -> Option<Value> {
+    if raw.starts_with("0x") || raw.starts_with("0X") {
+        if raw.contains('.') || raw.contains('p') || raw.contains('P') {
+            return None;
+        }
+        return parse_radix_integer_literal(&raw[2..], 16);
+    }
+
+    if raw.starts_with("0b") || raw.starts_with("0B") {
+        return parse_radix_integer_literal(&raw[2..], 2);
+    }
+
+    if raw.starts_with("0o") || raw.starts_with("0O") {
+        return parse_radix_integer_literal(&raw[2..], 8);
+    }
+
+    if raw.len() > 1 && raw.starts_with('0') {
+        if raw.contains('.') || raw.contains('e') || raw.contains('E') {
+            return None;
+        }
+        return parse_radix_integer_literal(raw, 8);
+    }
+
+    None
+}
+
+fn parse_radix_integer_literal(raw: &str, radix: u32) -> Option<Value> {
+    let value = parse_radix_integer(raw, radix)?;
+    numeric_value_from_u128(value)
+}
+
+fn parse_radix_integer(raw: &str, radix: u32) -> Option<u128> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut value: u128 = 0;
+    for ch in raw.chars() {
+        let digit = hex_digit_value(ch)? as u32;
+        if digit >= radix {
+            return None;
+        }
+        value = value.checked_mul(radix as u128)?.checked_add(digit as u128)?;
+    }
+    Some(value)
+}
+
+fn numeric_value_from_u128(value: u128) -> Option<Value> {
+    if let Ok(integer) = i64::try_from(value) {
+        return Some(Value::from(integer));
+    }
+    if let Ok(integer) = u64::try_from(value) {
+        return Some(Value::from(integer));
+    }
+    Some(Value::from(value as f64))
+}
+
+fn token_without_underscore(raw: &str) -> String {
+    raw.chars().filter(|ch| *ch != '_').collect()
+}
+
+fn parse_decimal_number(raw: &str) -> Option<Value> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    if raw.contains('p') || raw.contains('P') {
+        return None;
+    }
+
+    if raw.contains('.') || raw.contains('e') || raw.contains('E') {
+        return raw.parse::<f64>().ok().map(int_or_float_value);
+    }
+
+    if raw.len() > 1 && raw.starts_with('0') {
+        let value = parse_radix_integer(raw, 8)?;
+        return numeric_value_from_u128(value);
+    }
+
+    raw.parse::<i64>()
+        .ok()
+        .map(Value::from)
+        .or_else(|| raw.parse::<u64>().ok().map(Value::from))
+        .or_else(|| raw.parse::<f64>().ok().map(Value::from))
+}
+
+fn parse_hex_number(raw: &str) -> Option<Value> {
+    if !(raw.starts_with("0x") || raw.starts_with("0X")) {
+        return None;
+    }
+
+    let body = &raw[2..];
+    if body.is_empty() {
+        return None;
+    }
+
+    let (mantissa, exponent) = match body.find(|ch| ch == 'p' || ch == 'P') {
+        Some(position) => (&body[..position], &body[position + 1..]),
+        None => (body, "0"),
+    };
+
+    let mut split = mantissa.splitn(2, '.');
+    let integer_part = split.next()?;
+    let fraction_part = split.next();
+    if split.next().is_some() {
+        return None;
+    }
+
+    if integer_part.is_empty() && fraction_part.is_none() {
+        return None;
+    }
+
+    let has_fraction = fraction_part.is_some();
+    let has_exponent = raw.contains('p') || raw.contains('P');
+    if has_fraction && !has_exponent {
+        return None;
+    }
+
+    let mut value = parse_hex_integer(integer_part)? as f64;
+    if let Some(fraction) = fraction_part {
+        let mut divisor = 16.0_f64;
+        for ch in fraction.chars() {
+            let digit = hex_digit_value(ch)? as f64;
+            value += digit / divisor;
+            divisor *= 16.0;
+        }
+    }
+
+    if !has_fraction && !has_exponent {
+        let int_value = parse_hex_integer(integer_part)?;
+        if let Ok(int) = i64::try_from(int_value) {
+            return Some(Value::from(int));
+        }
+        if let Ok(uint) = u64::try_from(int_value) {
+            return Some(Value::from(uint));
+        }
+    }
+
+    let exp = match exponent.parse::<i32>() {
+        Ok(exp) => exp,
+        Err(_) => return None,
+    };
+
+    value *= 2f64.powi(exp);
+    Some(int_or_float_value(value))
+}
+
+fn int_or_float_value(value: f64) -> Value {
+    if !value.is_finite() {
+        return Value::from(value);
+    }
+
+    if value.fract() != 0.0 {
+        return Value::from(value);
+    }
+
+    if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        return Value::from(value as i64);
+    }
+
+    if value >= 0.0 && value <= u64::MAX as f64 {
+        return Value::from(value as u64);
+    }
+
+    Value::from(value)
+}
+
+fn parse_hex_integer(raw: &str) -> Option<u128> {
+    if raw.is_empty() {
+        return Some(0);
+    }
+
+    let mut value: u128 = 0;
+    for ch in raw.chars() {
+        let digit = hex_digit_value(ch)? as u128;
+        value = value.checked_mul(16)? + digit as u128;
+    }
+    Some(value)
+}
+
+fn hex_digit_value(ch: char) -> Option<u8> {
+    match ch {
+        '0'..='9' => Some((ch as u8) - b'0'),
+        'a'..='f' => Some(10 + (ch as u8) - b'a'),
+        'A'..='F' => Some(10 + (ch as u8) - b'A'),
+        _ => None,
+    }
 }
 
 fn parse_variable_reference(reference: &str) -> Result<(String, Vec<String>)> {
@@ -4163,6 +4596,7 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    #[cfg(not(feature = "web-rust"))]
     use tempfile::tempdir;
 
     use super::*;
@@ -4281,6 +4715,7 @@ mod tests {
         assert_eq!(output, "ALICE <span>x</span>");
     }
 
+    #[cfg(not(feature = "web-rust"))]
     #[test]
     fn parse_glob_loads_templates() {
         let dir = tempdir().expect("temp dir should be created");
@@ -4305,6 +4740,176 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<ul><li>x</li><li>&lt;y&gt;</li></ul>");
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_files_requires_paths() {
+        let err = match Template::new("page").parse_files(Vec::<&str>::new()) {
+            Ok(_) => panic!("parse_files should fail without paths"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("parse_files requires at least one path"));
+
+        let err = match parse_files::<Vec<&str>, &str>(Vec::new()) {
+            Ok(_) => panic!("parse_files should fail without paths"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_files requires at least one path"));
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_files_fails_for_missing_file() {
+        let err = match Template::new("page").parse_files(vec!["does_not_exist.tmpl"]) {
+            Ok(_) => panic!("parse_files should fail for missing file"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("No such file")
+            || err.to_string().contains("does_not_exist.tmpl"));
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_glob_no_match_fails() {
+        let err = match parse_glob("*.does_not_exist") {
+            Ok(_) => panic!("parse_glob should fail when no matches"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("glob pattern matched no files"));
+
+        let err = match Template::new("page").parse_fs(vec!["*.does_not_exist"]) {
+            Ok(_) => panic!("parse_fs should fail when no matches"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("glob pattern matched no files"));
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_glob_rejects_invalid_pattern() {
+        let err = match Template::new("page").parse_glob("[") {
+            Ok(_) => panic!("parse_glob should reject invalid pattern"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("glob"));
+
+        let err = match parse_glob("[") {
+            Ok(_) => panic!("parse_glob should reject invalid pattern"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("glob"));
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_fs_accepts_multiple_patterns() {
+        let dir = tempdir().expect("temp dir should be created");
+        let first_path = dir.path().join("a.tmpl");
+        let second_path = dir.path().join("b.tmpl");
+        fs::write(&first_path, "first").expect("first template should be written");
+        fs::write(&second_path, "{{define \"second\"}}second{{end}}")
+            .expect("second template should be written");
+
+        let first = first_path.to_string_lossy();
+        let second = second_path.to_string_lossy();
+
+        let template = Template::new("a.tmpl")
+            .parse_fs([first.as_ref(), second.as_ref()])
+            .expect("parse_fs should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "first");
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn parse_fs_supports_glob_patterns() {
+        let dir = tempdir().expect("temp dir should be created");
+        let first_path = dir.path().join("file1.tmpl");
+        let second_path = dir.path().join("file2.tmpl");
+        fs::write(&first_path, "first").expect("first template should be written");
+        fs::write(&second_path, "second").expect("second template should be written");
+
+        let pattern = format!("{}/*.tmpl", dir.path().display());
+        let template = Template::new("file1.tmpl")
+            .parse_fs([pattern.as_str()])
+            .expect("parse_fs should succeed with glob pattern");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "first");
+    }
+
+    #[cfg(feature = "web-rust")]
+    #[test]
+    fn parse_files_is_not_supported_in_web_rust() {
+        let err = match Template::new("page").parse_files(vec!["template.tmpl"]) {
+            Ok(_) => panic!("parse_files should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_files is not supported in web-rust builds"));
+
+        let err = match parse_files(vec!["template.tmpl"]) {
+            Ok(_) => panic!("parse_files should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_files is not supported in web-rust builds"));
+    }
+
+    #[cfg(feature = "web-rust")]
+    #[test]
+    fn parse_glob_is_not_supported_in_web_rust() {
+        let err = match Template::new("page").parse_glob("*.tmpl") {
+            Ok(_) => panic!("parse_glob should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_glob is not supported in web-rust builds"));
+
+        let err = match parse_glob("*.tmpl") {
+            Ok(_) => panic!("parse_glob should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_glob is not supported in web-rust builds"));
+    }
+
+    #[cfg(feature = "web-rust")]
+    #[test]
+    fn parse_fs_is_not_supported_in_web_rust() {
+        let err = match Template::new("page").parse_fs(vec!["*.tmpl"]) {
+            Ok(_) => panic!("parse_fs should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_fs is not supported in web-rust builds"));
+
+        let err = match parse_fs(vec!["*.tmpl"]) {
+            Ok(_) => panic!("parse_fs should not be supported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("parse_fs is not supported in web-rust builds"));
     }
 
     #[test]
@@ -4937,6 +5542,129 @@ mod tests {
         };
 
         assert!(error.to_string().contains("no such template"));
+    }
+
+    #[test]
+    fn parse_numbers_supports_go_style_numeric_literals() {
+        let template = Template::new("numbers")
+            .parse("{{1_2}}|{{1_2.3_4}}|{{0x0_1.e_0p+02}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "12|12.34|7.5");
+    }
+
+    #[test]
+    fn parse_numbers_supports_go_style_numeric_bases_and_octal_zero_prefix() {
+        let template = Template::new("numbers-base")
+            .parse(
+                "{{print 1234}}|{{print 12_34}}|{{print 0b101}}|{{print 0b_1_0_1}}|{{print 0B101}}|{{print 0o377}}|{{print 0o_3_7_7}}|{{print 0O377}}|{{print 0377}}|{{print 0x123}}|{{print 0x1_23}}|{{print 0X123ABC}}|{{print 123.4}}|{{print 0_0_1_2_3.4}}|{{print +0x1.ep+2}}|{{print +0x_1.e_0p+0_2}}|{{print +0X1.EP+2}}|{{print 1_2_3_4 7.5_00_00_00}}|{{print 1234 0x0_1.e_0p+02}}",
+            )
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "1234|1234|5|5|5|255|255|255|255|291|291|1194684|123.4|123.4|7.5|7.5|7.5|12347.5|12347.5"
+        );
+    }
+
+    #[test]
+    fn parse_numbers_supports_leading_dot_and_sign_prefixed_formats() {
+        let template = Template::new("numbers-dot")
+            .parse("{{.5}}|{{+.5}}|{{-.5}}|{{.5e2}}|{{-0.5e-1}}|{{+0x1p+2}}|{{-0x1p-2}}|{{.0e1}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "0.5|0.5|-0.5|50|-0.05|4|-0.25|0");
+    }
+
+    #[test]
+    fn parse_numbers_supports_signed_prefixed_integers() {
+        let template = Template::new("numbers-signed-prefix")
+            .parse("{{print -0b101}}|{{print +0B101}}|{{print -0o377}}|{{print +0377}}|{{print -0x1f}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "-5|5|-255|255|-31");
+    }
+
+    #[test]
+    fn parse_numbers_reject_complex_like_literals() {
+        let error = match Template::new("complex-literal")
+            .parse("{{1.5i}}")
+        {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported token")
+                || error.to_string().contains("illegal number syntax")
+                || error.to_string().contains("bad number syntax"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_numbers_reject_invalid_underscore_forms() {
+        let tests = [
+            "{{1_}}",
+            "{{1__2}}",
+            "{{0x1_}}",
+            "{{0x1p+_2}}",
+            "{{0x1p+2_}}",
+            "{{0b1_.}}",
+            "{{+_1}}",
+            "{{.0a}}",
+            "{{.5_}}",
+            "{{09}}",
+            "{{-09}}",
+            "{{+09}}",
+            "{{0_9}}",
+        ];
+
+        for source in tests {
+            let error = match Template::new("invalid-numeric").parse(source) {
+                Ok(_) => panic!("parse should fail: {source}"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.to_string().contains("unsupported token")
+                    || error.to_string().contains("bad number syntax")
+                    || error.to_string().contains("illegal number syntax")
+                    || error.to_string().contains("is not defined"),
+                "unexpected error message: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_numbers_supports_scientific_notation_without_hex_prefix() {
+        let template = Template::new("numbers-exp")
+            .parse("{{print 1e1}}|{{print 1e+2}}|{{print 1e-2}}|{{print +1e3}}|{{print -1e3}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "10|100|0.01|1000|-1000");
     }
 
     #[test]

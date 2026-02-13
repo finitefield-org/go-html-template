@@ -26,6 +26,7 @@ Go の `html/template` に近い使い方を Rust で提供するクレートで
 - Go 互換型: `HTML` / `HTMLAttr` / `JS` / `JSStr` / `CSS` / `URL` / `Srcset`（`Value` へ変換可）
 - `Option` 相当: `missingkey=default|invalid|zero|error`
 - `parse_files` / `parse_glob` / `parse_fs`（method + top-level helper）
+- `web-rust` feature を有効化した場合、`parse_files` / `parse_glob` / `parse_fs` は `Parse` エラーで即時失敗します。
 - 実行後の `parse*` / `clone_template` を禁止（Go 互換寄り制約）
 - top-level helper: `must`, `parse_files`, `parse_glob`, `parse_fs`
 - escape helper: `HTMLEscape*`, `JSEscape*`, `URLQueryEscaper`, `IsTrue`
@@ -67,6 +68,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+`web-rust` を使う場合は依存に feature を付けます。
+
+```toml
+[dependencies]
+go_html_template = { version = "0.1.0", features = ["web-rust"] }
+```
+
+## `web-rust` feature
+
+`web-rust` feature を有効化すると、`std` のファイル入出力 API が使えない環境向けに、以下のヘルパーは即時エラーを返します。
+
+- `Template::parse_files`
+- `Template::parse_glob`
+- `Template::parse_fs`
+- `parse_files`, `parse_glob`, `parse_fs`
+
+`web-rust` では文字列ベースの `parse` API を利用してください。
 
 ## Status
 
