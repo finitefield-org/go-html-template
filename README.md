@@ -78,14 +78,35 @@ go_html_template = { version = "0.1.0", features = ["web-rust"] }
 
 ## `web-rust` feature
 
-`web-rust` feature を有効化すると、`std` のファイル入出力 API が使えない環境向けに、以下のヘルパーは即時エラーを返します。
+`web-rust` feature を有効化すると、`std` のファイル入出力 API が使えない環境向けに、ファイル読み込み系のヘルパーを無効化します。
 
-- `Template::parse_files`
-- `Template::parse_glob`
-- `Template::parse_fs`
-- `parse_files`, `parse_glob`, `parse_fs`
+### 動作方針
 
-`web-rust` では文字列ベースの `parse` API を利用してください。
+- 無効化されるAPI（実行時に `TemplateError::Parse`）
+  - `Template::parse_files`
+  - `Template::parse_glob`
+  - `Template::parse_fs`
+  - `parse_files`
+  - `parse_glob`
+  - `parse_fs`
+- `Template::parse` と `execute*` 系は通常どおり利用できます。
+- `web-rust` 側では、テンプレートは文字列を使って読み込む想定です。
+
+```rust
+let main_tpl = Template::new("page")
+    .parse("<h1>{{.Title}}</h1>{{template \"item\" .}}")
+    .unwrap();
+let item_tpl = Template::new("item")
+    .parse("<li>{{.}}</li>")
+    .unwrap();
+```
+
+上位構造で `include_str!` や埋め込みデータから文字列を供給し、同一プロセス内で `parse` する形が実運用です。
+
+### `std` のみ依存する既存 API との違い
+
+- Go 実装と同様の `parse_files` / `parse_glob` / `parse_fs` によるファイル探索は使えません。
+- `parse` 時点の文法・実行時挙動は通常ビルドと同等です。
 
 ## Status
 
