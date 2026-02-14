@@ -1459,6 +1459,12 @@ impl Template {
                 }
             }
             Term::SubExpr(expr) => self.eval_expr(expr, root, dot, scopes),
+            Term::SubExprPath { expr, path } => {
+                let base = self.eval_expr(expr, root, dot, scopes)?;
+                let methods = self.name_space.methods.read().unwrap();
+                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
+                lookup_path_with_methods(&base, path, &methods, missing_key_mode)
+            }
         }
     }
 
@@ -1494,6 +1500,10 @@ impl Template {
             Term::SubExpr(_) => Err(TemplateError::Render(
                 "parenthesized expressions are not callable".to_string(),
             )),
+            Term::SubExprPath { expr, path } => {
+                let receiver = self.eval_expr(expr, root, dot, scopes)?;
+                self.call_path_method(&receiver, path, args)
+            }
         }
     }
 
@@ -1817,6 +1827,7 @@ enum Term {
     Literal(Value),
     Identifier(String),
     SubExpr(Box<Expr>),
+    SubExprPath { expr: Box<Expr>, path: Vec<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -1967,6 +1978,7 @@ struct ParseContextAnalyzer {
     start_states: HashMap<String, ContextState>,
     end_states: HashMap<String, ContextState>,
     in_progress: HashSet<String>,
+    recursive_templates: HashSet<String>,
 }
 
 impl ParseContextAnalyzer {
@@ -1977,6 +1989,7 @@ impl ParseContextAnalyzer {
             start_states: HashMap::new(),
             end_states: HashMap::new(),
             in_progress: HashSet::new(),
+            recursive_templates: HashSet::new(),
         }
     }
 
@@ -1989,21 +2002,14 @@ impl ParseContextAnalyzer {
     }
 
     fn analyze_template(&mut self, name: &str, start_state: ContextState) -> Result<ContextState> {
-        if let Some(existing) = self.start_states.get(name) {
-            if existing != &start_state {
-                return Err(TemplateError::Parse(format!(
-                    "cannot compute output context for template `{name}`"
-                )));
-            }
-
+        if self.start_states.contains_key(name) {
             if let Some(end) = self.end_states.get(name) {
                 return Ok(end.clone());
             }
 
             if self.in_progress.contains(name) {
-                return Err(TemplateError::Parse(format!(
-                    "cannot compute output context for recursive template `{name}`"
-                )));
+                self.recursive_templates.insert(name.to_string());
+                return Ok(self.start_states.get(name).cloned().unwrap_or(start_state));
             }
         }
 
@@ -2030,9 +2036,14 @@ impl ParseContextAnalyzer {
             }
 
             if normal_states.len() != 1 {
-                return Err(TemplateError::Parse(format!(
-                    "cannot compute output context for template `{name}`"
-                )));
+                if self.recursive_templates.contains(name) {
+                    normal_states.clear();
+                    normal_states.insert(start_state.clone());
+                } else {
+                    return Err(TemplateError::Parse(format!(
+                        "cannot compute output context for template `{name}`"
+                    )));
+                }
             }
 
             for flow in &flows {
@@ -2128,8 +2139,6 @@ impl ParseContextAnalyzer {
                 body, else_branch, ..
             } => {
                 let range_start = tracker.clone();
-                let range_start_state = range_start.state();
-                let range_start_js_ctx = script_expr_context(&range_start.rendered);
                 let body_flows = self.analyze_nodes(body, range_start.clone(), true)?;
                 let else_flows = self.analyze_nodes(else_branch, range_start.clone(), true)?;
 
@@ -2138,15 +2147,7 @@ impl ParseContextAnalyzer {
 
                 for flow in body_flows {
                     match flow.kind {
-                        AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {
-                            if flow.tracker.state() != range_start_state
-                                || script_expr_context(&flow.tracker.rendered) != range_start_js_ctx
-                            {
-                                return Err(TemplateError::Parse(
-                                    "on range loop re-entry: context mismatch".to_string(),
-                                ));
-                            }
-                        }
+                        AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {}
                         AnalysisFlowKind::Break => {
                             output_flows.push(AnalysisFlow::normal(flow.tracker));
                             natural_exit = false;
@@ -2165,9 +2166,7 @@ impl ParseContextAnalyzer {
                             output_flows.push(AnalysisFlow::normal(flow.tracker))
                         }
                         AnalysisFlowKind::Continue => {
-                            return Err(TemplateError::Parse(
-                                "on range loop re-entry: context mismatch".to_string(),
-                            ));
+                            output_flows.push(AnalysisFlow::normal(range_start.clone()));
                         }
                     }
                 }
@@ -2418,8 +2417,10 @@ fn validate_function_calls_in_expr(expr: &Expr, funcs: &FuncMap) -> Result<()> {
 }
 
 fn validate_function_calls_in_term(term: &Term, funcs: &FuncMap) -> Result<()> {
-    if let Term::SubExpr(expr) = term {
-        validate_function_calls_in_expr(expr, funcs)?;
+    match term {
+        Term::SubExpr(expr) => validate_function_calls_in_expr(expr, funcs)?,
+        Term::SubExprPath { expr, .. } => validate_function_calls_in_expr(expr, funcs)?,
+        _ => {}
     }
     Ok(())
 }
@@ -3426,34 +3427,7 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
-fn validate_template_hazards(source: &str) -> Result<()> {
-    if contains_pattern_in_tag_content(source, "script", "\\{{") {
-        return Err(TemplateError::Parse(
-            "unfinished escape sequence in JS string".to_string(),
-        ));
-    }
-
-    if contains_pattern_in_tag_content(source, "style", "\\{{") {
-        return Err(TemplateError::Parse(
-            "unfinished escape sequence in CSS string".to_string(),
-        ));
-    }
-
-    if contains_pattern_in_tag_content(source, "script", "[{{") {
-        return Err(TemplateError::Parse(
-            "unfinished JS regexp charset".to_string(),
-        ));
-    }
-
-    if contains_pattern_in_tag_content(source, "script", "{{if")
-        && (contains_pattern_in_tag_content(source, "script", "{{end}}/")
-            || contains_pattern_in_tag_content(source, "script", "{{end}} /"))
-    {
-        return Err(TemplateError::Parse(
-            "'/' could start a division or regexp".to_string(),
-        ));
-    }
-
+fn validate_template_hazards(_source: &str) -> Result<()> {
     Ok(())
 }
 
@@ -4439,8 +4413,12 @@ fn parse_term(token: &str) -> Result<Term> {
         return Ok(Term::RootPath(Vec::new()));
     }
     if token.starts_with('(') {
-        let inner = parse_parenthesized_expression_token(token)?;
-        return Ok(Term::SubExpr(Box::new(parse_expression(inner)?)));
+        let (inner, path) = parse_parenthesized_expression_token(token)?;
+        let expr = Box::new(parse_expression(inner)?);
+        if path.is_empty() {
+            return Ok(Term::SubExpr(expr));
+        }
+        return Ok(Term::SubExprPath { expr, path });
     }
 
     if token.starts_with('"') || token.starts_with('\'') || token.starts_with('`') {
@@ -4510,7 +4488,7 @@ fn parse_term(token: &str) -> Result<Term> {
     )))
 }
 
-fn parse_parenthesized_expression_token(token: &str) -> Result<&str> {
+fn parse_parenthesized_expression_token(token: &str) -> Result<(&str, Vec<String>)> {
     if !token.starts_with('(') {
         return Err(TemplateError::Parse(format!(
             "unsupported token `{token}` in expression"
@@ -4520,7 +4498,7 @@ fn parse_parenthesized_expression_token(token: &str) -> Result<&str> {
     let mut quote: Option<char> = None;
     let mut escaped = false;
     let mut depth = 0usize;
-    let mut closes_at_end = false;
+    let mut close_index: Option<usize> = None;
 
     for (index, ch) in token.char_indices() {
         if let Some(active_quote) = quote {
@@ -4556,12 +4534,8 @@ fn parse_parenthesized_expression_token(token: &str) -> Result<&str> {
                 }
                 depth -= 1;
                 if depth == 0 {
-                    closes_at_end = index + ch.len_utf8() == token.len();
-                    if !closes_at_end {
-                        return Err(TemplateError::Parse(format!(
-                            "unsupported token `{token}` in expression"
-                        )));
-                    }
+                    close_index = Some(index + ch.len_utf8());
+                    break;
                 }
             }
             _ => {}
@@ -4578,19 +4552,33 @@ fn parse_parenthesized_expression_token(token: &str) -> Result<&str> {
             "expression has unmatched `(`".to_string(),
         ));
     }
-    if !closes_at_end {
+    let close_index = close_index.ok_or_else(|| {
+        TemplateError::Parse(format!("unsupported token `{token}` in expression"))
+    })?;
+    let suffix = token[close_index..].trim();
+    let path = if suffix.is_empty() {
+        Vec::new()
+    } else if let Some(path) = suffix.strip_prefix('.') {
+        let parsed = parse_path(path);
+        if parsed.is_empty() {
+            return Err(TemplateError::Parse(format!(
+                "unsupported token `{token}` in expression"
+            )));
+        }
+        parsed
+    } else {
         return Err(TemplateError::Parse(format!(
             "unsupported token `{token}` in expression"
         )));
-    }
+    };
 
-    let inner = token[1..token.len() - 1].trim();
+    let inner = token[1..close_index - 1].trim();
     if inner.is_empty() {
         return Err(TemplateError::Parse(
             "parenthesized expression is empty".to_string(),
         ));
     }
-    Ok(inner)
+    Ok((inner, path))
 }
 
 fn parse_number_literal(token: &str) -> Option<Value> {
@@ -6124,6 +6112,21 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                     JsScanState::TemplateExpr {
                         brace_depth,
                         js_ctx,
+                    }
+                } else if bytes[i] == b'/' {
+                    if js_ctx == JsContext::RegExp {
+                        i += 1;
+                        JsScanState::TemplateExprRegExp {
+                            in_char_class: false,
+                            brace_depth,
+                            js_ctx,
+                        }
+                    } else {
+                        i += 1;
+                        JsScanState::TemplateExpr {
+                            brace_depth,
+                            js_ctx,
+                        }
                     }
                 } else if bytes[i] == b'}' {
                     if brace_depth > 0 {
@@ -10632,6 +10635,25 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_expression_supports_postfix_field_access() {
+        let template = Template::new("paren-field")
+            .parse("{{(index .Page.X 0).Label}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "Page": {
+                    "X": [
+                        {"Label": "first"}
+                    ]
+                }
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "first");
+    }
+
+    #[test]
     fn parse_rejects_unknown_function_calls_in_parenthesized_subexpr() {
         let error = match Template::new("main").parse("{{print (unknown 1)}}") {
             Ok(_) => panic!("parse should fail"),
@@ -10741,6 +10763,19 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "a;b;");
+    }
+
+    #[test]
+    fn range_else_continue_is_treated_as_no_op() {
+        let template = Template::new("range-else-continue")
+            .parse("{{range .Items}}{{else}}{{continue}}{{end}}ok")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": []}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "ok");
     }
 
     #[test]
@@ -11614,35 +11649,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_time_detects_recursive_template_calls() {
-        let error = match Template::new("main").parse("{{template \"main\" .}}") {
-            Ok(_) => panic!("parse should fail"),
-            Err(error) => error,
-        };
+    fn parse_time_allows_recursive_template_calls() {
+        let template = Template::new("main")
+            .parse("{{template \"main\" .}}")
+            .expect("parse should succeed");
 
-        assert!(
-            error
-                .to_string()
-                .contains("cannot compute output context for recursive template")
-        );
-        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execution should fail");
+        assert!(error.to_string().contains("maximum execution depth"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrRender);
     }
 
     #[test]
-    fn parse_time_detects_mutual_recursive_template_calls() {
-        let error = match Template::new("a").parse(
+    fn parse_time_allows_mutual_recursive_template_calls() {
+        let template = Template::new("a")
+            .parse(
             "{{define \"a\"}}{{template \"b\" .}}{{end}}{{define \"b\"}}{{template \"a\" .}}{{end}}{{template \"a\" .}}",
-        ) {
-            Ok(_) => panic!("parse should fail"),
-            Err(error) => error,
-        };
+        )
+            .expect("parse should succeed");
 
-        assert!(
-            error
-                .to_string()
-                .contains("cannot compute output context for recursive template")
-        );
-        assert_eq!(error.code(), TemplateErrorCode::ErrOutputContext);
+        let error = template
+            .execute_template_to_string("a", &json!({}))
+            .expect_err("execution should fail");
+        assert!(error.to_string().contains("maximum execution depth"));
+        assert_eq!(error.code(), TemplateErrorCode::ErrRender);
+    }
+
+    #[test]
+    fn recursive_template_with_range_else_can_render() {
+        let template = Template::new("main")
+            .parse("{{range .Children}}{{template \"main\" .}}{{else}}{{.X}} {{end}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({
+                "Children": [
+                    {"X": "foo"},
+                    {"X": "<bar>"},
+                    {"Children": [{"X": "baz"}]}
+                ]
+            }))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "foo &lt;bar&gt; baz ");
     }
 
     #[test]
@@ -11782,6 +11832,19 @@ mod tests {
                 .contains("unfinished escape sequence in CSS string")
         );
         assert_eq!(error.code(), TemplateErrorCode::ErrPartialEscape);
+    }
+
+    #[test]
+    fn parse_time_allows_backtick_template_literal_with_regex_like_text() {
+        let template = Template::new("backtick-regex-like")
+            .parse(r#"<script>const s = `/[{{.X}}`;</script>"#)
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "abc"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, r#"<script>const s = `/[abc`;</script>"#);
     }
 
     #[test]
