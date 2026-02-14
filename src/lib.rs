@@ -1458,6 +1458,7 @@ impl Template {
                     )))
                 }
             }
+            Term::SubExpr(expr) => self.eval_expr(expr, root, dot, scopes),
         }
     }
 
@@ -1489,6 +1490,9 @@ impl Template {
             }
             Term::Literal(_) => Err(TemplateError::Render(
                 "literal values are not callable".to_string(),
+            )),
+            Term::SubExpr(_) => Err(TemplateError::Render(
+                "parenthesized expressions are not callable".to_string(),
             )),
         }
     }
@@ -1812,6 +1816,7 @@ enum Term {
     Variable { name: String, path: Vec<String> },
     Literal(Value),
     Identifier(String),
+    SubExpr(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -2385,21 +2390,36 @@ fn validate_function_calls_in_nodes(nodes: &[Node], funcs: &FuncMap) -> Result<(
 
 fn validate_function_calls_in_expr(expr: &Expr, funcs: &FuncMap) -> Result<()> {
     for (index, command) in expr.commands.iter().enumerate() {
-        if let Command::Call { name, args } = command {
-            if name == "call" {
-                continue;
+        match command {
+            Command::Value(term) => validate_function_calls_in_term(term, funcs)?,
+            Command::Call { name, args } => {
+                if name != "call" {
+                    if !(index == 0 && args.is_empty()) && !funcs.contains_key(name) {
+                        return Err(TemplateError::Parse(format!(
+                            "function `{name}` is not registered"
+                        )));
+                    }
+                    // At pipeline head, a bare identifier may resolve from dot/root data
+                    // at execution time (Go-compatible missingkey behavior).
+                }
+                for arg in args {
+                    validate_function_calls_in_term(arg, funcs)?;
+                }
             }
-            if index == 0 && args.is_empty() {
-                // At pipeline head, a bare identifier may resolve from dot/root data
-                // at execution time (Go-compatible missingkey behavior).
-                continue;
-            }
-            if !funcs.contains_key(name) {
-                return Err(TemplateError::Parse(format!(
-                    "function `{name}` is not registered"
-                )));
+            Command::Invoke { callee, args } => {
+                validate_function_calls_in_term(callee, funcs)?;
+                for arg in args {
+                    validate_function_calls_in_term(arg, funcs)?;
+                }
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_function_calls_in_term(term: &Term, funcs: &FuncMap) -> Result<()> {
+    if let Term::SubExpr(expr) = term {
+        validate_function_calls_in_expr(expr, funcs)?;
     }
     Ok(())
 }
@@ -4243,6 +4263,7 @@ fn split_pipeline(input: &str) -> Result<Vec<String>> {
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut paren_depth = 0usize;
 
     for ch in input.chars() {
         if let Some(active_quote) = quote {
@@ -4275,7 +4296,20 @@ fn split_pipeline(input: &str) -> Result<Vec<String>> {
                 quote = Some(ch);
                 current.push(ch);
             }
-            '|' => {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                if paren_depth == 0 {
+                    return Err(TemplateError::Parse(
+                        "expression has unmatched `)`".to_string(),
+                    ));
+                }
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '|' if paren_depth == 0 => {
                 let segment = current.trim();
                 if segment.is_empty() {
                     return Err(TemplateError::Parse(
@@ -4292,6 +4326,11 @@ fn split_pipeline(input: &str) -> Result<Vec<String>> {
     if quote.is_some() {
         return Err(TemplateError::Parse(
             "unterminated quoted string".to_string(),
+        ));
+    }
+    if paren_depth != 0 {
+        return Err(TemplateError::Parse(
+            "expression has unmatched `(`".to_string(),
         ));
     }
 
@@ -4314,6 +4353,7 @@ fn tokenize_terms(input: &str) -> Result<Vec<String>> {
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut paren_depth = 0usize;
 
     for ch in input.chars() {
         if let Some(active_quote) = quote {
@@ -4347,11 +4387,25 @@ fn tokenize_terms(input: &str) -> Result<Vec<String>> {
                 quote = Some(ch);
                 current.push(ch);
             }
-            ch if ch.is_whitespace() => {
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                if paren_depth == 0 {
+                    return Err(TemplateError::Parse(
+                        "expression has unmatched `)`".to_string(),
+                    ));
+                }
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            ch if ch.is_whitespace() && paren_depth == 0 => {
                 if !current.is_empty() {
                     terms.push(std::mem::take(&mut current));
                 }
             }
+            ch if ch.is_whitespace() => current.push(ch),
             _ => current.push(ch),
         }
     }
@@ -4359,6 +4413,11 @@ fn tokenize_terms(input: &str) -> Result<Vec<String>> {
     if quote.is_some() {
         return Err(TemplateError::Parse(
             "unterminated quoted string".to_string(),
+        ));
+    }
+    if paren_depth != 0 {
+        return Err(TemplateError::Parse(
+            "expression has unmatched `(`".to_string(),
         ));
     }
 
@@ -4378,6 +4437,10 @@ fn parse_term(token: &str) -> Result<Term> {
     }
     if token == "$" {
         return Ok(Term::RootPath(Vec::new()));
+    }
+    if token.starts_with('(') {
+        let inner = parse_parenthesized_expression_token(token)?;
+        return Ok(Term::SubExpr(Box::new(parse_expression(inner)?)));
     }
 
     if token.starts_with('"') || token.starts_with('\'') || token.starts_with('`') {
@@ -4445,6 +4508,89 @@ fn parse_term(token: &str) -> Result<Term> {
     Err(TemplateError::Parse(format!(
         "unsupported token `{token}` in expression"
     )))
+}
+
+fn parse_parenthesized_expression_token(token: &str) -> Result<&str> {
+    if !token.starts_with('(') {
+        return Err(TemplateError::Parse(format!(
+            "unsupported token `{token}` in expression"
+        )));
+    }
+
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut closes_at_end = false;
+
+    for (index, ch) in token.char_indices() {
+        if let Some(active_quote) = quote {
+            if active_quote == '`' {
+                if ch == '`' {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' | '`' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Err(TemplateError::Parse(
+                        "expression has unmatched `)`".to_string(),
+                    ));
+                }
+                depth -= 1;
+                if depth == 0 {
+                    closes_at_end = index + ch.len_utf8() == token.len();
+                    if !closes_at_end {
+                        return Err(TemplateError::Parse(format!(
+                            "unsupported token `{token}` in expression"
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if quote.is_some() {
+        return Err(TemplateError::Parse(
+            "unterminated quoted string".to_string(),
+        ));
+    }
+    if depth != 0 {
+        return Err(TemplateError::Parse(
+            "expression has unmatched `(`".to_string(),
+        ));
+    }
+    if !closes_at_end {
+        return Err(TemplateError::Parse(format!(
+            "unsupported token `{token}` in expression"
+        )));
+    }
+
+    let inner = token[1..token.len() - 1].trim();
+    if inner.is_empty() {
+        return Err(TemplateError::Parse(
+            "parenthesized expression is empty".to_string(),
+        ));
+    }
+    Ok(inner)
 }
 
 fn parse_number_literal(token: &str) -> Option<Value> {
@@ -5711,6 +5857,24 @@ fn current_js_mode(content: &str) -> EscapeMode {
     }
 }
 
+fn is_utf8_line_separator_2028(bytes: &[u8], index: usize) -> bool {
+    index + 2 < bytes.len()
+        && bytes[index] == 0xE2
+        && bytes[index + 1] == 0x80
+        && bytes[index + 2] == 0xA8
+}
+
+fn is_utf8_line_separator_2029(bytes: &[u8], index: usize) -> bool {
+    index + 2 < bytes.len()
+        && bytes[index] == 0xE2
+        && bytes[index + 1] == 0x80
+        && bytes[index + 2] == 0xA9
+}
+
+fn is_utf8_line_separator(bytes: &[u8], index: usize) -> bool {
+    is_utf8_line_separator_2028(bytes, index) || is_utf8_line_separator_2029(bytes, index)
+}
+
 fn current_js_scan_state(content: &str) -> JsScanState {
     let bytes = content.as_bytes();
     let mut state = JsScanState::Expr {
@@ -5788,13 +5952,13 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                             keep_terminator: true,
                         }
                     }
-                    ch if content[i..].starts_with('\u{2028}') => {
+                    _ if is_utf8_line_separator_2028(bytes, i) => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
                         JsScanState::Expr { js_ctx }
                     }
-                    ch if content[i..].starts_with('\u{2029}') => {
+                    _ if is_utf8_line_separator_2029(bytes, i) => {
                         let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
@@ -6124,9 +6288,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                         brace_depth,
                         js_ctx,
                     }
-                } else if content[i..].starts_with('\u{2028}')
-                    || content[i..].starts_with('\u{2029}')
-                {
+                } else if is_utf8_line_separator(bytes, i) {
                     i += 3;
                     JsScanState::TemplateExpr {
                         brace_depth,
@@ -6168,9 +6330,7 @@ fn current_js_scan_state(content: &str) -> JsScanState {
                 if bytes[i] == b'\n' || bytes[i] == b'\r' {
                     i += 1;
                     JsScanState::Expr { js_ctx }
-                } else if content[i..].starts_with('\u{2028}')
-                    || content[i..].starts_with('\u{2029}')
-                {
+                } else if is_utf8_line_separator(bytes, i) {
                     i += 3;
                     JsScanState::Expr { js_ctx }
                 } else {
@@ -6199,7 +6359,6 @@ fn current_js_scan_state(content: &str) -> JsScanState {
 
 fn filter_script_text(prefix: &str, text: &str) -> String {
     let bytes = text.as_bytes();
-    let content = text;
     let mut state = current_js_scan_state(prefix);
     let mut i = 0usize;
     let mut output = String::new();
@@ -6262,12 +6421,12 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                             keep_terminator: true,
                         }
                     }
-                    ch if content[i..].starts_with('\u{2028}') => {
+                    _ if is_utf8_line_separator_2028(bytes, i) => {
                         output.push('\u{2028}');
                         i += 3;
                         JsScanState::Expr { js_ctx }
                     }
-                    ch if content[i..].starts_with('\u{2029}') => {
+                    _ if is_utf8_line_separator_2029(bytes, i) => {
                         output.push('\u{2029}');
                         i += 3;
                         JsScanState::Expr { js_ctx }
@@ -6471,14 +6630,14 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                         brace_depth,
                         js_ctx,
                     }
-                } else if content[i..].starts_with('\u{2028}') {
+                } else if is_utf8_line_separator_2028(bytes, i) {
                     output.push('\u{2028}');
                     i += 3;
                     JsScanState::TemplateExpr {
                         brace_depth,
                         js_ctx,
                     }
-                } else if content[i..].starts_with('\u{2029}') {
+                } else if is_utf8_line_separator_2029(bytes, i) {
                     output.push('\u{2029}');
                     i += 3;
                     JsScanState::TemplateExpr {
@@ -8126,10 +8285,12 @@ fn escape_attr_unquoted(input: &str) -> String {
             '\'' => escaped.push_str("&#39;"),
             '`' => escaped.push_str("&#96;"),
             '=' => escaped.push_str("&#61;"),
+            '+' => escaped.push_str("&#43;"),
             ' ' => escaped.push_str("&#32;"),
             '\n' => escaped.push_str("&#10;"),
             '\r' => escaped.push_str("&#13;"),
             '\t' => escaped.push_str("&#9;"),
+            '\0' => escaped.push_str("&#xfffd;"),
             _ => escaped.push(ch),
         }
     }
@@ -8169,8 +8330,10 @@ fn escape_html(input: &str) -> String {
             '&' => escaped.push_str("&amp;"),
             '<' => escaped.push_str("&lt;"),
             '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
+            '"' => escaped.push_str("&#34;"),
             '\'' => escaped.push_str("&#39;"),
+            '+' => escaped.push_str("&#43;"),
+            '\0' => escaped.push('\u{FFFD}'),
             _ => escaped.push(ch),
         }
     }
@@ -8206,6 +8369,32 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<p>&lt;b&gt;Alice&lt;/b&gt;</p>");
+    }
+
+    #[test]
+    fn html_context_escapes_plus_nul_and_double_quote_go_compatibly() {
+        let template = Template::new("page")
+            .parse("<p>{{.Name}}</p>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Name": "Web + \"App\"\u{0000}"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<p>Web &#43; &#34;App&#34;\u{FFFD}</p>");
+    }
+
+    #[test]
+    fn unquoted_attribute_context_escapes_plus_and_nul_go_compatibly() {
+        let template = Template::new("attrs")
+            .parse("<div data-v={{.Value}}></div>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Value": "A+\u{0000}B"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<div data-v=A&#43;&#xfffd;B></div>");
     }
 
     #[test]
@@ -8872,7 +9061,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<div data-v=a&#32;b&#61;&lt;x&gt; title=\"&quot;q&quot; &amp; &lt;t&gt;\"></div>"
+            "<div data-v=a&#32;b&#61;&lt;x&gt; title=\"&#34;q&#34; &amp; &lt;t&gt;\"></div>"
         );
     }
 
@@ -8964,7 +9153,7 @@ mod tests {
             .execute_to_string(&json!({"Suffix": "load", "Msg": "loaded"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<img onload=\"alert(&quot;loaded&quot;)\">");
+        assert_eq!(output, "<img onload=\"alert(&#34;loaded&#34;)\">");
     }
 
     #[test]
@@ -9138,6 +9327,21 @@ mod tests {
             output,
             "<script>const x = \"\\u003ctag\\u003e\"; const y = {\"a\":\"\\u003cb\\u003e\"};</script>"
         );
+    }
+
+    #[test]
+    fn script_context_handles_utf8_and_unicode_line_separators() {
+        let template = Template::new("script")
+            .parse("<script>const s = \"あ\";\u{2028}const t = \"い\";\u{2029}const x = {{.X}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "<tag>"}))
+            .expect("execute should succeed");
+
+        assert!(output.contains("\u{2028}"));
+        assert!(output.contains("\u{2029}"));
+        assert!(output.contains("const x = \"\\u003ctag\\u003e\";"));
     }
 
     #[test]
@@ -10392,6 +10596,56 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_pipeline_can_be_used_as_function_argument() {
+        let template = Template::new("paren-pipeline")
+            .parse("{{printf \"%s\" (.Lang | printf \"%s!\")}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Lang": "ja"}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "ja!");
+    }
+
+    #[test]
+    fn template_call_accepts_parenthesized_data_expression() {
+        let template = Template::new("base")
+            .add_func("dict", |args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render("dict expects two args".to_string()));
+                }
+                let key = args[0].to_plain_string();
+                let value = JsonValue::String(args[1].to_plain_string());
+                let mut map = serde_json::Map::new();
+                map.insert(key, value);
+                Ok(Value::from(JsonValue::Object(map)))
+            })
+            .parse("{{define \"x\"}}{{.k}}{{end}}{{template \"x\" (dict \"k\" \"v\")}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "v");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_function_calls_in_parenthesized_subexpr() {
+        let error = match Template::new("main").parse("{{print (unknown 1)}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("function `unknown` is not registered")
+        );
+    }
+
+    #[test]
     fn slice_function_supports_string_and_array() {
         let template = Template::new("slice")
             .parse("{{slice .S 1 4}}|{{slice .A 1 3}}")
@@ -10401,7 +10655,7 @@ mod tests {
             .execute_to_string(&json!({"S": "abcdef", "A": ["x", "y", "z", "w"]}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "bcd|[&quot;y&quot;,&quot;z&quot;]");
+        assert_eq!(output, "bcd|[&#34;y&#34;,&#34;z&#34;]");
     }
 
     #[test]
