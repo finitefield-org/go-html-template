@@ -223,6 +223,7 @@ pub enum Value {
     SafeHtml(String),
     SafeHtmlAttr(String),
     SafeJs(String),
+    SafeJsStr(String),
     SafeCss(String),
     SafeUrl(String),
     SafeSrcset(String),
@@ -285,6 +286,7 @@ impl Value {
             Value::SafeHtml(value) => !value.is_empty(),
             Value::SafeHtmlAttr(value) => !value.is_empty(),
             Value::SafeJs(value) => !value.is_empty(),
+            Value::SafeJsStr(value) => !value.is_empty(),
             Value::SafeCss(value) => !value.is_empty(),
             Value::SafeUrl(value) => !value.is_empty(),
             Value::SafeSrcset(value) => !value.is_empty(),
@@ -316,6 +318,7 @@ impl Value {
             Value::SafeHtml(value) => value.clone(),
             Value::SafeHtmlAttr(value) => value.clone(),
             Value::SafeJs(value) => value.clone(),
+            Value::SafeJsStr(value) => value.clone(),
             Value::SafeCss(value) => value.clone(),
             Value::SafeUrl(value) => value.clone(),
             Value::SafeSrcset(value) => value.clone(),
@@ -363,6 +366,7 @@ impl Value {
             | Value::SafeHtml(_)
             | Value::SafeHtmlAttr(_)
             | Value::SafeJs(_)
+            | Value::SafeJsStr(_)
             | Value::SafeCss(_)
             | Value::SafeUrl(_)
             | Value::SafeSrcset(_)
@@ -391,7 +395,7 @@ impl From<JS> for Value {
 
 impl From<JSStr> for Value {
     fn from(value: JSStr) -> Self {
-        Value::SafeJs(value.0)
+        Value::SafeJsStr(value.0)
     }
 }
 
@@ -1116,7 +1120,7 @@ impl Template {
                         }
                     }
                     let value = self.eval_expr(expr, root, dot, scopes)?;
-                    output.push_str(&escape_value_for_mode(&value, mode)?);
+                    output.push_str(&escape_value_for_mode(&value, mode, output)?);
                 }
                 Node::SetVar {
                     name,
@@ -1702,7 +1706,7 @@ pub fn js_escape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> 
 }
 
 pub fn js_escape_string(value: &str) -> String {
-    escape_js_string_fragment(value, '"')
+    js_string_escaper(value)
 }
 
 pub fn js_escaper(args: &[Value]) -> String {
@@ -1710,7 +1714,7 @@ pub fn js_escaper(args: &[Value]) -> String {
     for arg in args {
         combined.push_str(&arg.to_plain_string());
     }
-    js_escape_string(&combined)
+    js_string_escaper(&combined)
 }
 
 pub fn url_query_escaper(args: &[Value]) -> String {
@@ -1913,10 +1917,20 @@ impl ContextTracker {
             && !matches!(
                 state.mode,
                 EscapeMode::ScriptExpr
+                    | EscapeMode::ScriptString { .. }
+                    | EscapeMode::ScriptJsonString { .. }
                     | EscapeMode::ScriptTemplate
                     | EscapeMode::ScriptRegexp
                     | EscapeMode::ScriptLineComment
                     | EscapeMode::ScriptBlockComment
+                    | EscapeMode::AttrQuoted {
+                        kind: AttrKind::Url,
+                        ..
+                    }
+                    | EscapeMode::AttrUnquoted {
+                        kind: AttrKind::Url
+                    }
+                    | EscapeMode::StyleString { .. }
             )
         {
             self.normalize();
@@ -1930,10 +1944,20 @@ impl ContextTracker {
             && !matches!(
                 mode,
                 EscapeMode::ScriptExpr
+                    | EscapeMode::ScriptString { .. }
+                    | EscapeMode::ScriptJsonString { .. }
                     | EscapeMode::ScriptTemplate
                     | EscapeMode::ScriptRegexp
                     | EscapeMode::ScriptLineComment
                     | EscapeMode::ScriptBlockComment
+                    | EscapeMode::AttrQuoted {
+                        kind: AttrKind::Url,
+                        ..
+                    }
+                    | EscapeMode::AttrUnquoted {
+                        kind: AttrKind::Url
+                    }
+                    | EscapeMode::StyleString { .. }
             )
         {
             self.normalize();
@@ -1951,6 +1975,13 @@ enum AnalysisFlowKind {
     Normal,
     Break,
     Continue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum UrlPartContext {
+    Path,
+    Query,
+    Fragment,
 }
 
 #[derive(Clone, Debug)]
@@ -2031,6 +2062,7 @@ impl ParseContextAnalyzer {
             let mut normal_states = HashSet::new();
             for flow in &flows {
                 if flow.kind == AnalysisFlowKind::Normal {
+                    validate_action_context_before_insertion(&flow.tracker)?;
                     normal_states.insert(flow.tracker.state());
                 }
             }
@@ -2147,7 +2179,13 @@ impl ParseContextAnalyzer {
 
                 for flow in body_flows {
                     match flow.kind {
-                        AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {}
+                        AnalysisFlowKind::Normal | AnalysisFlowKind::Continue => {
+                            if !range_reentry_context_matches(&range_start, &flow.tracker) {
+                                return Err(TemplateError::Parse(
+                                    "on range loop re-entry: context mismatch".to_string(),
+                                ));
+                            }
+                        }
                         AnalysisFlowKind::Break => {
                             output_flows.push(AnalysisFlow::normal(flow.tracker));
                             natural_exit = false;
@@ -2232,7 +2270,12 @@ fn dedup_analysis_flows(flows: Vec<AnalysisFlow>) -> Vec<AnalysisFlow> {
     for flow in flows {
         let state = flow.tracker.state();
         let rendered_key = match state.mode {
+            EscapeMode::AttrName
+            | EscapeMode::AttrQuoted { .. }
+            | EscapeMode::AttrUnquoted { .. } => flow.tracker.rendered.clone(),
             EscapeMode::ScriptExpr
+            | EscapeMode::ScriptString { .. }
+            | EscapeMode::ScriptJsonString { .. }
             | EscapeMode::ScriptTemplate
             | EscapeMode::ScriptRegexp
             | EscapeMode::ScriptLineComment
@@ -2278,6 +2321,12 @@ fn ensure_branch_normal_context(
         )));
     }
 
+    if has_url_part_ambiguity(left.iter().chain(right.iter())) {
+        return Err(TemplateError::Parse(format!(
+            "{{{{{branch_name}}}}} branches end in ambiguous context within URL"
+        )));
+    }
+
     if has_slash_ambiguity(left.iter().chain(right.iter())) {
         return Err(TemplateError::Parse(
             "'/' could start a division or regexp".to_string(),
@@ -2298,6 +2347,12 @@ fn ensure_single_normal_context(block_name: &str, flows: &[AnalysisFlow]) -> Res
     if normal_states.len() > 1 {
         return Err(TemplateError::Parse(format!(
             "{{{{{block_name}}}}} branches end in different contexts"
+        )));
+    }
+
+    if has_url_part_ambiguity(flows.iter()) {
+        return Err(TemplateError::Parse(format!(
+            "{{{{{block_name}}}}} branches end in ambiguous context within URL"
         )));
     }
 
@@ -2327,6 +2382,63 @@ where
         }
     }
     js_contexts.len() > 1
+}
+
+fn has_url_part_ambiguity<'a, I>(flows: I) -> bool
+where
+    I: IntoIterator<Item = &'a AnalysisFlow>,
+{
+    let mut url_parts = HashSet::new();
+    for flow in flows {
+        if flow.kind != AnalysisFlowKind::Normal {
+            continue;
+        }
+        if !matches!(
+            flow.tracker.state().mode,
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Url,
+                ..
+            } | EscapeMode::AttrUnquoted {
+                kind: AttrKind::Url
+            }
+        ) {
+            continue;
+        }
+        if let Some(part) = url_part_context(&flow.tracker.rendered) {
+            url_parts.insert(part);
+        }
+    }
+    url_parts.len() > 1
+}
+
+fn url_part_context(rendered: &str) -> Option<UrlPartContext> {
+    let context = current_tag_value_context(rendered)?;
+    if attr_kind(&context.attr_name) != AttrKind::Url {
+        return None;
+    }
+
+    let value = context.value_prefix;
+    if value.contains('#') {
+        Some(UrlPartContext::Fragment)
+    } else if value.contains('?') {
+        Some(UrlPartContext::Query)
+    } else {
+        Some(UrlPartContext::Path)
+    }
+}
+
+fn range_reentry_context_matches(start: &ContextTracker, candidate: &ContextTracker) -> bool {
+    let start_state = start.state();
+    let candidate_state = candidate.state();
+    if start_state != candidate_state {
+        return false;
+    }
+
+    if !matches!(start_state.mode, EscapeMode::ScriptExpr) {
+        return true;
+    }
+
+    script_expr_context(&start.rendered) == script_expr_context(&candidate.rendered)
 }
 
 fn is_empty_template_body(nodes: &[Node]) -> bool {
@@ -2519,10 +2631,12 @@ fn placeholder_for_mode(mode: EscapeMode) -> &'static str {
     match mode {
         EscapeMode::ScriptExpr => "0",
         EscapeMode::Html
+        | EscapeMode::Rcdata
         | EscapeMode::AttrQuoted { .. }
         | EscapeMode::AttrUnquoted { .. }
         | EscapeMode::AttrName
         | EscapeMode::ScriptString { .. }
+        | EscapeMode::ScriptJsonString { .. }
         | EscapeMode::ScriptTemplate
         | EscapeMode::ScriptRegexp
         | EscapeMode::ScriptLineComment
@@ -2553,6 +2667,7 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
                 String::new()
             }
         }
+        EscapeMode::Rcdata => "<textarea>".to_string(),
         EscapeMode::AttrName => "<a x".to_string(),
         EscapeMode::AttrQuoted { kind, quote } => {
             format!("<a {}={quote}x", attr_name_for_kind(kind))
@@ -2560,6 +2675,7 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
         EscapeMode::AttrUnquoted { kind } => format!("<a {}=x", attr_name_for_kind(kind)),
         EscapeMode::ScriptExpr => "<script>".to_string(),
         EscapeMode::ScriptString { quote } => format!("<script>{quote}"),
+        EscapeMode::ScriptJsonString { quote } => format!("<script>{quote}"),
         EscapeMode::ScriptTemplate => "<script>`".to_string(),
         EscapeMode::ScriptRegexp => "<script>/x".to_string(),
         EscapeMode::ScriptLineComment => "<script>//".to_string(),
@@ -2585,16 +2701,60 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
     }
 }
 
-fn is_in_unclosed_tag_context(rendered: &str) -> bool {
-    let Some(last_lt) = rendered.rfind('<') else {
-        return false;
-    };
-    let last_gt = rendered.rfind('>');
-    if let Some(last_gt) = last_gt {
-        if last_gt > last_lt {
-            return false;
+fn last_unclosed_tag_start(rendered: &str) -> Option<usize> {
+    let bytes = rendered.as_bytes();
+    let mut in_tag = false;
+    let mut quote: Option<u8> = None;
+    let mut tag_start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if !in_tag {
+            if byte == b'<' && i + 1 < bytes.len() {
+                let next = bytes[i + 1];
+                if next.is_ascii_alphabetic() || matches!(next, b'/' | b'!' | b'?') {
+                    in_tag = true;
+                    quote = None;
+                    tag_start = i;
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        match byte {
+            b'\'' | b'"' => {
+                quote = Some(byte);
+                i += 1;
+            }
+            b'>' => {
+                in_tag = false;
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
+
+    if in_tag {
+        Some(tag_start)
+    } else {
+        None
+    }
+}
+
+fn is_in_unclosed_tag_context(rendered: &str) -> bool {
+    let Some(last_lt) = last_unclosed_tag_start(rendered) else {
+        return false;
+    };
 
     let fragment = &rendered[last_lt + 1..];
     if fragment.is_empty() {
@@ -2718,6 +2878,7 @@ fn builtin_funcs() -> FuncMap {
                 Value::SafeHtml(v) => v.len(),
                 Value::SafeHtmlAttr(v) => v.len(),
                 Value::SafeJs(v) => v.len(),
+                Value::SafeJsStr(v) => v.len(),
                 Value::SafeCss(v) => v.len(),
                 Value::SafeUrl(v) => v.len(),
                 Value::SafeSrcset(v) => v.len(),
@@ -2893,6 +3054,7 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::SafeHtml(a), Value::SafeHtml(b)) => a == b,
         (Value::SafeHtmlAttr(a), Value::SafeHtmlAttr(b)) => a == b,
         (Value::SafeJs(a), Value::SafeJs(b)) => a == b,
+        (Value::SafeJsStr(a), Value::SafeJsStr(b)) => a == b,
         (Value::SafeCss(a), Value::SafeCss(b)) => a == b,
         (Value::SafeUrl(a), Value::SafeUrl(b)) => a == b,
         (Value::SafeSrcset(a), Value::SafeSrcset(b)) => a == b,
@@ -2937,6 +3099,7 @@ fn string_value(value: &Value) -> Option<String> {
         Value::SafeHtml(text) => Some(text.clone()),
         Value::SafeHtmlAttr(text) => Some(text.clone()),
         Value::SafeJs(text) => Some(text.clone()),
+        Value::SafeJsStr(text) => Some(text.clone()),
         Value::SafeCss(text) => Some(text.clone()),
         Value::SafeUrl(text) => Some(text.clone()),
         Value::SafeSrcset(text) => Some(text.clone()),
@@ -2984,6 +3147,7 @@ fn index_value(container: &Value, index: &Value) -> Result<Value> {
         }
         Value::SafeHtmlAttr(text)
         | Value::SafeJs(text)
+        | Value::SafeJsStr(text)
         | Value::SafeCss(text)
         | Value::SafeUrl(text)
         | Value::SafeSrcset(text) => {
@@ -3032,6 +3196,7 @@ fn value_to_json_string(value: &Value) -> Result<String> {
         Value::SafeHtml(text) => Ok(serde_json::to_string(text)?),
         Value::SafeHtmlAttr(text) => Ok(serde_json::to_string(text)?),
         Value::SafeJs(text) => Ok(serde_json::to_string(text)?),
+        Value::SafeJsStr(text) => Ok(serde_json::to_string(text)?),
         Value::SafeCss(text) => Ok(serde_json::to_string(text)?),
         Value::SafeUrl(text) => Ok(serde_json::to_string(text)?),
         Value::SafeSrcset(text) => Ok(serde_json::to_string(text)?),
@@ -3129,6 +3294,7 @@ fn format_printf_integer(value: &Value) -> String {
         Value::SafeHtml(value)
         | Value::SafeHtmlAttr(value)
         | Value::SafeJs(value)
+        | Value::SafeJsStr(value)
         | Value::SafeCss(value)
         | Value::SafeUrl(value)
         | Value::SafeSrcset(value) => value
@@ -3152,6 +3318,7 @@ fn format_printf_float(value: &Value) -> String {
         Value::SafeHtml(value)
         | Value::SafeHtmlAttr(value)
         | Value::SafeJs(value)
+        | Value::SafeJsStr(value)
         | Value::SafeCss(value)
         | Value::SafeUrl(value)
         | Value::SafeSrcset(value) => value
@@ -3199,6 +3366,7 @@ fn slice_value(base: &Value, indexes: &[Value]) -> Result<Value> {
         }
         Value::SafeHtmlAttr(text)
         | Value::SafeJs(text)
+        | Value::SafeJsStr(text)
         | Value::SafeCss(text)
         | Value::SafeUrl(text)
         | Value::SafeSrcset(text) => {
@@ -3266,6 +3434,7 @@ pub fn lookup_path(base: &Value, path: &[String]) -> Value {
         Value::SafeHtml(_)
         | Value::SafeHtmlAttr(_)
         | Value::SafeJs(_)
+        | Value::SafeJsStr(_)
         | Value::SafeCss(_)
         | Value::SafeUrl(_)
         | Value::SafeSrcset(_)
@@ -3427,46 +3596,142 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
-fn validate_template_hazards(_source: &str) -> Result<()> {
+fn validate_template_hazards(source: &str) -> Result<()> {
+    if source.contains("{{") {
+        return Ok(());
+    }
+    validate_unquoted_attr_hazards(source)
+}
+
+fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
+    let sanitized = source_without_actions(source);
+    let bytes = sanitized.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' || i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        while i < bytes.len() && !is_html_space(bytes[i]) && !matches!(bytes[i], b'>' | b'/' | b'=') {
+            i += 1;
+        }
+
+        if i < bytes.len() && bytes[i] == b'=' {
+            return Err(TemplateError::Parse(
+                "expected space, attr name, or end of tag".to_string(),
+            ));
+        }
+
+        loop {
+            while i < bytes.len() && is_html_space(bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+
+            if bytes[i] == b'>' {
+                i += 1;
+                break;
+            }
+            if bytes[i] == b'/' {
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'>' {
+                    i += 1;
+                    break;
+                }
+            }
+            if bytes[i] == b'=' {
+                return Err(TemplateError::Parse(
+                    "expected space, attr name, or end of tag".to_string(),
+                ));
+            }
+
+            let name_start = i;
+            while i < bytes.len()
+                && !is_html_space(bytes[i])
+                && !matches!(bytes[i], b'=' | b'>' | b'/')
+            {
+                i += 1;
+            }
+            if i <= name_start {
+                i += 1;
+                continue;
+            }
+
+            while i < bytes.len() && is_html_space(bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b'=' {
+                continue;
+            }
+
+            i += 1;
+            while i < bytes.len() && is_html_space(bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+
+            if bytes[i] == b'\'' || bytes[i] == b'"' {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let value_start = i;
+            while i < bytes.len() && !is_html_space(bytes[i]) && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i > value_start {
+                let value = String::from_utf8_lossy(&bytes[value_start..i]);
+                if value.contains('=')
+                    || value.contains('"')
+                    || value.contains('\'')
+                    || value.contains('`')
+                {
+                    return Err(TemplateError::Parse(format!(
+                        "in unquoted attr: {value:?}"
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn contains_pattern_in_tag_content(source: &str, tag_name: &str, pattern: &str) -> bool {
-    let lower = source.to_ascii_lowercase();
-    let open_pattern = format!("<{tag_name}");
-    let close_pattern = format!("</{tag_name}");
-    let mut cursor = 0usize;
-
-    while let Some(relative_open) = lower[cursor..].find(&open_pattern) {
-        let open = cursor + relative_open;
-        let after_open = open + open_pattern.len();
-        if let Some(ch) = lower[after_open..].chars().next() {
-            if !(ch.is_whitespace() || ch == '>' || ch == '/') {
-                cursor = after_open;
-                continue;
+fn source_without_actions(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
+            i += 2;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'}' && bytes[i + 1] == b'}' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
             }
+            out.push(' ');
+            continue;
         }
-
-        let Some(open_end_relative) = lower[after_open..].find('>') else {
-            return false;
-        };
-        let content_start = after_open + open_end_relative + 1;
-
-        let content_end = if let Some(relative_close) = lower[content_start..].find(&close_pattern)
-        {
-            content_start + relative_close
-        } else {
-            source.len()
-        };
-
-        if source[content_start..content_end].contains(pattern) {
-            return true;
-        }
-
-        cursor = content_end.saturating_add(close_pattern.len());
+        out.push(bytes[i] as char);
+        i += 1;
     }
-
-    false
+    out
 }
 
 fn strip_html_comments(source: &str) -> String {
@@ -4995,11 +5260,13 @@ enum AttrKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EscapeMode {
     Html,
+    Rcdata,
     AttrQuoted { kind: AttrKind, quote: char },
     AttrUnquoted { kind: AttrKind },
     AttrName,
     ScriptExpr,
     ScriptString { quote: char },
+    ScriptJsonString { quote: char },
     ScriptTemplate,
     ScriptRegexp,
     ScriptLineComment,
@@ -5018,85 +5285,17 @@ struct TagValueContext {
     value_prefix: String,
 }
 
-fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
+fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str) -> Result<String> {
     match (value, mode) {
         (Value::SafeHtml(raw), EscapeMode::Html) => return Ok(raw.clone()),
         (Value::SafeHtml(raw), EscapeMode::AttrName) => return Ok(html_name_filter(&raw)),
-        (Value::SafeHtmlAttr(raw), EscapeMode::AttrQuoted { .. })
-        | (Value::SafeHtmlAttr(raw), EscapeMode::AttrUnquoted { .. }) => return Ok(raw.clone()),
+        (Value::SafeHtmlAttr(raw), EscapeMode::AttrName) => return Ok(raw.clone()),
         (Value::SafeJs(raw), EscapeMode::ScriptExpr)
         | (Value::SafeJs(raw), EscapeMode::ScriptTemplate)
-        | (Value::SafeJs(raw), EscapeMode::ScriptRegexp)
-        | (Value::SafeJs(raw), EscapeMode::ScriptString { .. })
-        | (
-            Value::SafeJs(raw),
-            EscapeMode::AttrQuoted {
-                kind: AttrKind::Js, ..
-            },
-        )
-        | (Value::SafeJs(raw), EscapeMode::AttrUnquoted { kind: AttrKind::Js }) => {
+        | (Value::SafeJs(raw), EscapeMode::ScriptRegexp) => {
             return Ok(raw.clone());
         }
-        (Value::SafeCss(raw), EscapeMode::StyleExpr)
-        | (Value::SafeCss(raw), EscapeMode::StyleString { .. })
-        | (
-            Value::SafeCss(raw),
-            EscapeMode::AttrQuoted {
-                kind: AttrKind::Css,
-                ..
-            },
-        )
-        | (
-            Value::SafeCss(raw),
-            EscapeMode::AttrUnquoted {
-                kind: AttrKind::Css,
-            },
-        ) => {
-            return Ok(raw.clone());
-        }
-        (
-            Value::SafeUrl(raw),
-            EscapeMode::AttrQuoted {
-                kind: AttrKind::Url,
-                ..
-            },
-        )
-        | (
-            Value::SafeUrl(raw),
-            EscapeMode::AttrUnquoted {
-                kind: AttrKind::Url,
-            },
-        ) => {
-            return Ok(raw.clone());
-        }
-        (
-            Value::SafeSrcset(raw),
-            EscapeMode::AttrQuoted {
-                kind: AttrKind::Url,
-                ..
-            },
-        )
-        | (
-            Value::SafeSrcset(raw),
-            EscapeMode::AttrUnquoted {
-                kind: AttrKind::Url,
-            },
-        ) => {
-            return Ok(raw.clone());
-        }
-        (
-            Value::SafeSrcset(raw),
-            EscapeMode::AttrQuoted {
-                kind: AttrKind::Srcset,
-                ..
-            },
-        )
-        | (
-            Value::SafeSrcset(raw),
-            EscapeMode::AttrUnquoted {
-                kind: AttrKind::Srcset,
-            },
-        ) => {
+        (Value::SafeCss(raw), EscapeMode::StyleExpr) => {
             return Ok(raw.clone());
         }
         _ => {}
@@ -5104,37 +5303,118 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode) -> Result<String> {
 
     match mode {
         EscapeMode::Html => Ok(escape_html(&value.to_plain_string())),
+        EscapeMode::Rcdata => match value {
+            Value::SafeHtml(raw) => Ok(escape_html_norm(raw)),
+            _ => Ok(escape_html(&value.to_plain_string())),
+        },
         EscapeMode::AttrName => Ok(html_name_filter(&value.to_plain_string())),
         EscapeMode::AttrQuoted { kind, quote } => {
-            let text = match kind {
+            match kind {
+                AttrKind::Normal => match value {
+                    Value::SafeHtml(raw) => Ok(escape_html_norm(&strip_tags(raw))),
+                    _ => Ok(escape_html(&value.to_plain_string())),
+                },
                 AttrKind::Js => {
-                    let escaped = escape_js_string_fragment(&value.to_plain_string(), quote);
-                    format!("{quote}{escaped}{quote}")
+                    let text = js_val_escaper(value)?;
+                    Ok(escape_html(&text))
                 }
-                _ => transform_attr_value(&value.to_plain_string(), kind, Some(quote)),
-            };
-            Ok(escape_html(&text))
+                AttrKind::Css => {
+                    let text = match value {
+                        Value::SafeCss(raw) => raw.clone(),
+                        Value::SafeHtml(_)
+                        | Value::SafeHtmlAttr(_)
+                        | Value::SafeJs(_)
+                        | Value::SafeJsStr(_)
+                        | Value::SafeUrl(_)
+                        | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
+                        _ => css_value_filter(&value.to_plain_string()),
+                    };
+                    Ok(escape_html(&text))
+                }
+                AttrKind::Url | AttrKind::Srcset => {
+                    let text = transform_attr_value(value, kind, Some(quote), rendered_prefix);
+                    Ok(escape_html(&text))
+                }
+            }
         }
         EscapeMode::AttrUnquoted { kind } => {
-            let text = transform_attr_value(&value.to_plain_string(), kind, None);
-            Ok(escape_attr_unquoted(&text))
+            match kind {
+                AttrKind::Normal => match value {
+                    Value::SafeHtml(raw) => Ok(html_nospace_escaper_norm(&strip_tags(raw))),
+                    _ => Ok(html_nospace_escaper(&value.to_plain_string())),
+                },
+                AttrKind::Css => {
+                    let text = match value {
+                        Value::SafeCss(raw) => raw.clone(),
+                        Value::SafeHtml(_)
+                        | Value::SafeHtmlAttr(_)
+                        | Value::SafeJs(_)
+                        | Value::SafeJsStr(_)
+                        | Value::SafeUrl(_)
+                        | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
+                        _ => css_value_filter(&value.to_plain_string()),
+                    };
+                    Ok(escape_attr_unquoted(&text))
+                }
+                AttrKind::Url | AttrKind::Srcset | AttrKind::Js => {
+                    if kind == AttrKind::Js {
+                        let text = js_val_escaper(value)?;
+                        Ok(html_nospace_escaper(&text))
+                    } else {
+                        let text = transform_attr_value(value, kind, None, rendered_prefix);
+                        Ok(escape_attr_unquoted(&text))
+                    }
+                }
+            }
         }
         EscapeMode::ScriptExpr => escape_script_value(value),
         EscapeMode::ScriptTemplate => Ok(escape_js_string_fragment(&value.to_plain_string(), '`')),
         EscapeMode::ScriptRegexp => Ok(escape_js_string_fragment(&value.to_plain_string(), '/')),
         EscapeMode::ScriptLineComment | EscapeMode::ScriptBlockComment => Ok(String::new()),
-        EscapeMode::ScriptString { quote } => {
-            Ok(escape_js_string_fragment(&value.to_plain_string(), quote))
+        EscapeMode::ScriptString { quote: _ } => match value {
+            Value::SafeJsStr(raw) => Ok(js_string_escaper_norm(raw)),
+            _ => Ok(js_string_escaper(&value.to_plain_string())),
+        },
+        EscapeMode::ScriptJsonString { quote: _ } => match value {
+            Value::SafeJsStr(raw) => Ok(js_string_escaper_norm(raw)),
+            _ => Ok(js_string_escaper(&value.to_plain_string())),
+        },
+        EscapeMode::StyleExpr => {
+            if matches!(
+                value,
+                Value::SafeHtml(_)
+                    | Value::SafeHtmlAttr(_)
+                    | Value::SafeJs(_)
+                    | Value::SafeJsStr(_)
+                    | Value::SafeUrl(_)
+                    | Value::SafeSrcset(_)
+            ) {
+                return Ok("ZgotmplZ".to_string());
+            }
+            let filtered = css_value_filter(&value.to_plain_string());
+            if filtered == "ZgotmplZ" {
+                return Ok(filtered);
+            }
+            Ok(escape_css_text(&filtered))
         }
-        EscapeMode::StyleExpr => Ok(escape_css_text(&value.to_plain_string())),
         EscapeMode::StyleLineComment | EscapeMode::StyleBlockComment => Ok(String::new()),
         EscapeMode::StyleString { quote } => {
-            Ok(escape_css_string_fragment(&value.to_plain_string(), quote))
+            if let Some(url_part) = css_url_part_context(rendered_prefix) {
+                Ok(escape_css_url_value(value, url_part))
+            } else {
+                Ok(escape_css_string_fragment(&value.to_plain_string(), quote))
+            }
         }
     }
 }
 
 fn infer_escape_mode(rendered: &str) -> EscapeMode {
+    if current_unclosed_tag_content(rendered, "textarea").is_some()
+        || current_unclosed_tag_content(rendered, "title").is_some()
+    {
+        return EscapeMode::Rcdata;
+    }
+
     if let Some(context) = current_tag_value_context(rendered) {
         let kind = attr_kind(&context.attr_name);
         match kind {
@@ -5154,8 +5434,17 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
             }
             AttrKind::Css => {
                 return match style_attribute_mode(&context.value_prefix) {
+                    Some(EscapeMode::StyleExpr) | None => {
+                        if context.quoted {
+                            EscapeMode::AttrQuoted {
+                                kind,
+                                quote: context.quote.unwrap_or('"'),
+                            }
+                        } else {
+                            EscapeMode::AttrUnquoted { kind }
+                        }
+                    }
                     Some(mode) => mode,
-                    None => EscapeMode::StyleExpr,
                 };
             }
             _ => {}
@@ -5194,30 +5483,16 @@ fn in_css_attribute_context(rendered: &str) -> bool {
 }
 
 fn current_tag_value_context(rendered: &str) -> Option<TagValueContext> {
-    let last_gt = rendered.rfind('>');
-    let last_lt = rendered.rfind('<')?;
-    if let Some(last_gt) = last_gt {
-        if last_gt > last_lt {
-            return None;
-        }
-    }
-
+    let last_lt = last_unclosed_tag_start(rendered)?;
     let fragment = &rendered[last_lt + 1..];
     parse_open_tag_value_context(fragment)
 }
 
 fn current_attr_name_context(rendered: &str) -> bool {
-    let last_gt = rendered.rfind('>');
-    let last_lt = match rendered.rfind('<') {
+    let last_lt = match last_unclosed_tag_start(rendered) {
         Some(last_lt) => last_lt,
         None => return false,
     };
-
-    if let Some(last_gt) = last_gt {
-        if last_gt > last_lt {
-            return false;
-        }
-    }
 
     let fragment = &rendered[last_lt + 1..];
     if fragment.is_empty() {
@@ -5507,33 +5782,56 @@ fn attr_content_type(attr_name: &str) -> AttrContentType {
 
 fn html_name_filter(input: &str) -> String {
     if input.is_empty() {
-        return "#ZgotmplZ".to_string();
+        return "ZgotmplZ".to_string();
     }
 
     let name = input.to_ascii_lowercase();
     if !name.chars().all(|ch| ch.is_ascii_alphanumeric()) {
-        return "#ZgotmplZ".to_string();
+        return "ZgotmplZ".to_string();
     }
 
     if attr_content_type(&name) != AttrContentType::Plain {
-        return "#ZgotmplZ".to_string();
+        return "ZgotmplZ".to_string();
     }
 
     name
 }
 
-fn transform_attr_value(value: &str, kind: AttrKind, quote: Option<char>) -> String {
+fn transform_attr_value(
+    value: &Value,
+    kind: AttrKind,
+    quote: Option<char>,
+    rendered_prefix: &str,
+) -> String {
     match kind {
-        AttrKind::Normal => value.to_string(),
-        AttrKind::Url => normalize_url_for_attribute(value),
-        AttrKind::Srcset => filter_srcset_attribute_value(value),
+        AttrKind::Normal => value.to_plain_string(),
+        AttrKind::Url => {
+            let raw = value.to_plain_string();
+            let url_part = url_part_context(rendered_prefix).unwrap_or(UrlPartContext::Path);
+            if matches!(url_part, UrlPartContext::Path)
+                && !matches!(value, Value::SafeUrl(_))
+                && !is_safe_url(&raw)
+            {
+                return "#ZgotmplZ".to_string();
+            }
+            if matches!(value, Value::SafeUrl(_)) || matches!(url_part, UrlPartContext::Path) {
+                encode_url_attribute_value(&raw)
+            } else {
+                percent_encode_url(&raw)
+            }
+        }
+        AttrKind::Srcset => match value {
+            Value::SafeSrcset(raw) => raw.clone(),
+            Value::SafeUrl(raw) => normalize_url_for_attribute(raw).replace(',', "%2c"),
+            _ => filter_srcset_attribute_value(&value.to_plain_string()),
+        },
         AttrKind::Js => {
             let q = quote.unwrap_or('"');
-            escape_js_string_fragment(value, q)
+            escape_js_string_fragment(&value.to_plain_string(), q)
         }
         AttrKind::Css => match quote {
-            Some(q) => escape_css_string_fragment(value, q),
-            None => escape_css_text(value),
+            Some(q) => escape_css_string_fragment(&value.to_plain_string(), q),
+            None => escape_css_text(&value.to_plain_string()),
         },
     }
 }
@@ -5553,12 +5851,164 @@ fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
     }
 
     let content = current_unclosed_tag_content(rendered, "script")?;
-    Some(current_js_mode(content))
+    let mode = current_js_mode(content);
+    if is_script_type_json(script_tag)
+        && let EscapeMode::ScriptString { quote } = mode
+    {
+        return Some(EscapeMode::ScriptJsonString { quote });
+    }
+    Some(mode)
 }
 
 fn style_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let content = current_unclosed_tag_content(rendered, "style")?;
     Some(current_css_mode(content))
+}
+
+fn css_url_part_context(rendered: &str) -> Option<UrlPartContext> {
+    let prefix = css_prefix_for_context(rendered)?;
+    let value_prefix = current_css_url_value_prefix(&prefix)?;
+    if value_prefix.contains('#') {
+        Some(UrlPartContext::Fragment)
+    } else if value_prefix.contains('?') {
+        Some(UrlPartContext::Query)
+    } else {
+        Some(UrlPartContext::Path)
+    }
+}
+
+fn escape_css_url_value(value: &Value, url_part: UrlPartContext) -> String {
+    let raw = value.to_plain_string();
+    if matches!(url_part, UrlPartContext::Path)
+        && !matches!(value, Value::SafeUrl(_))
+        && !is_safe_url(&raw)
+    {
+        return "#ZgotmplZ".to_string();
+    }
+
+    if matches!(value, Value::SafeUrl(_)) || matches!(url_part, UrlPartContext::Path) {
+        encode_url_attribute_value(&raw)
+    } else {
+        percent_encode_url(&raw)
+    }
+}
+
+fn current_css_url_value_prefix(prefix: &str) -> Option<String> {
+    #[derive(Clone, Copy)]
+    enum State {
+        Expr,
+        SingleQuote { is_url: bool, start: usize },
+        DoubleQuote { is_url: bool, start: usize },
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = prefix.as_bytes();
+    let mut state = State::Expr;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        state = match state {
+            State::Expr => match bytes[i] {
+                b'\'' => {
+                    let is_url = ends_with_css_url_start(&prefix[..i]);
+                    i += 1;
+                    State::SingleQuote { is_url, start: i }
+                }
+                b'"' => {
+                    let is_url = ends_with_css_url_start(&prefix[..i]);
+                    i += 1;
+                    State::DoubleQuote { is_url, start: i }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    i += 2;
+                    State::LineComment
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    State::BlockComment
+                }
+                _ => {
+                    i += 1;
+                    State::Expr
+                }
+            },
+            State::SingleQuote { is_url, start } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    State::SingleQuote { is_url, start }
+                } else if bytes[i] == b'\'' {
+                    i += 1;
+                    State::Expr
+                } else {
+                    i += 1;
+                    State::SingleQuote { is_url, start }
+                }
+            }
+            State::DoubleQuote { is_url, start } => {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    State::DoubleQuote { is_url, start }
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    State::Expr
+                } else {
+                    i += 1;
+                    State::DoubleQuote { is_url, start }
+                }
+            }
+            State::LineComment => {
+                if bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\x0c' {
+                    i += 1;
+                    State::Expr
+                } else if is_utf8_line_separator(bytes, i) {
+                    i += 3;
+                    State::Expr
+                } else {
+                    i += 1;
+                    State::LineComment
+                }
+            }
+            State::BlockComment => {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    i += 2;
+                    State::Expr
+                } else {
+                    i += 1;
+                    State::BlockComment
+                }
+            }
+        };
+    }
+
+    match state {
+        State::SingleQuote { is_url: true, start } | State::DoubleQuote { is_url: true, start } => {
+            Some(prefix[start..].to_string())
+        }
+        _ => None,
+    }
+}
+
+fn ends_with_css_url_start(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches(is_html_space_char);
+    let Some(before_paren) = trimmed.strip_suffix('(') else {
+        return false;
+    };
+    let before_paren = before_paren.trim_end_matches(is_html_space_char);
+    if before_paren.len() < 3 {
+        return false;
+    }
+    let start = before_paren.len() - 3;
+    if !before_paren[start..].eq_ignore_ascii_case("url") {
+        return false;
+    }
+
+    if start == 0 {
+        return true;
+    }
+
+    let prev = before_paren.as_bytes()[start - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-')
 }
 
 fn current_unclosed_script_tag(rendered: &str) -> Option<&str> {
@@ -5583,6 +6033,19 @@ fn is_script_type_javascript(script_tag: &str) -> bool {
         Some(type_value) => is_js_type_mime(&type_value),
         None => true,
     }
+}
+
+fn is_script_type_json(script_tag: &str) -> bool {
+    let Some(type_value) = script_type_attribute(script_tag) else {
+        return false;
+    };
+    let lower = type_value.trim().to_ascii_lowercase();
+    let mime = lower
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    mime == "application/json" || mime.ends_with("+json")
 }
 
 fn script_type_attribute(script_tag: &str) -> Option<String> {
@@ -6357,7 +6820,12 @@ fn current_js_scan_state(content: &str) -> JsScanState {
         };
     }
 
-    state
+    match state {
+        JsScanState::Expr { js_ctx } => JsScanState::Expr {
+            js_ctx: next_js_ctx(&content[segment_start..], js_ctx),
+        },
+        _ => state,
+    }
 }
 
 fn filter_script_text(prefix: &str, text: &str) -> String {
@@ -7057,19 +7525,11 @@ fn find_close_tag(content: &str, start: usize, tag: &[u8]) -> Option<usize> {
         return find_style_close_tag(content, start);
     }
 
-    let bytes = content.as_bytes();
-    if start >= bytes.len() {
+    if start >= content.len() {
         return None;
     }
-
-    let mut i = start;
-    while i + 2 < bytes.len() {
-        if bytes[i] == b'<' && bytes[i + 1] == b'/' && matches_html_tag(&bytes[i + 2..], tag) {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    let tag_name = std::str::from_utf8(tag).ok()?;
+    index_tag_end(&content[start..], tag_name).map(|offset| start + offset)
 }
 
 fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
@@ -7948,6 +8408,251 @@ fn current_css_mode(content: &str) -> EscapeMode {
     }
 }
 
+fn ends_with_css_keyword(css: &str, keyword: &str) -> bool {
+    let trimmed = css.trim_end_matches(is_html_space_char);
+    if trimmed.len() < keyword.len() {
+        return false;
+    }
+
+    let start = trimmed.len() - keyword.len();
+    if !trimmed[start..].eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+
+    if start == 0 {
+        return true;
+    }
+
+    let prev = trimmed[..start].chars().next_back();
+    match prev {
+        Some(ch) => !is_css_nmchar(ch as u32),
+        None => true,
+    }
+}
+
+fn is_css_nmchar(codepoint: u32) -> bool {
+    if (0x30..=0x39).contains(&codepoint)
+        || (0x41..=0x5A).contains(&codepoint)
+        || (0x61..=0x7A).contains(&codepoint)
+        || codepoint == 0x5F
+        || codepoint == 0x2D
+    {
+        return true;
+    }
+
+    if codepoint < 0x80 {
+        return false;
+    }
+    if codepoint > 0x10FFFF {
+        return false;
+    }
+    if (0xD800..=0xDFFF).contains(&codepoint) {
+        return false;
+    }
+    if matches!(codepoint, 0xFFFE | 0xFFFF) {
+        return false;
+    }
+    true
+}
+
+fn is_html_space_char(ch: char) -> bool {
+    matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' ')
+}
+
+fn is_css_space_byte(byte: u8) -> bool {
+    matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+fn hex_decode(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0_u32, |acc, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u32,
+            b'a'..=b'f' => (byte - b'a' + 10) as u32,
+            b'A'..=b'F' => (byte - b'A' + 10) as u32,
+            _ => 0_u32,
+        };
+        (acc << 4) | digit
+    })
+}
+
+fn skip_css_space(css: &str) -> &str {
+    let bytes = css.as_bytes();
+    if bytes.is_empty() {
+        return css;
+    }
+
+    match bytes[0] {
+        b'\r' => {
+            if bytes.len() > 1 && bytes[1] == b'\n' {
+                &css[2..]
+            } else {
+                &css[1..]
+            }
+        }
+        b'\n' | b'\t' | b'\x0c' | b' ' => &css[1..],
+        _ => css,
+    }
+}
+
+fn decode_css(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut output = String::with_capacity(css.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            let ch = css[i..]
+                .chars()
+                .next()
+                .expect("valid utf-8 char boundary while decoding css");
+            output.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            let mut end = i;
+            while end < bytes.len() && end - start < 6 && bytes[end].is_ascii_hexdigit() {
+                end += 1;
+            }
+
+            let value = hex_decode(&bytes[start..end]);
+            let ch = char::from_u32(value).unwrap_or('\u{FFFD}');
+            output.push(ch);
+            i = end;
+
+            if i < bytes.len() {
+                if bytes[i] == b'\r' {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                } else if is_css_space_byte(bytes[i]) {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        if bytes[i] == b'\r' {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\n' | b'\x0c') {
+            i += 1;
+            continue;
+        }
+
+        let ch = css[i..]
+            .chars()
+            .next()
+            .expect("valid utf-8 char boundary while decoding css escape");
+        output.push(ch);
+        i += ch.len_utf8();
+    }
+
+    output
+}
+
+fn css_value_filter(css: &str) -> String {
+    let decoded = decode_css(css);
+    let lower = decoded.to_ascii_lowercase();
+    let collapsed_alnum = lower
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    let escape_tail_alnum = css_escape_tail_alnum(css);
+
+    let forbidden = [
+        "<!--",
+        "-->",
+        "<![cdata[",
+        "]]>",
+        "</style",
+        "/*",
+        "//",
+        "[href=~",
+        "@import",
+    ];
+    if forbidden.iter().any(|needle| lower.contains(needle)) {
+        return "ZgotmplZ".to_string();
+    }
+    if collapsed_alnum.contains("expression")
+        || collapsed_alnum.contains("mozbinding")
+        || escape_tail_alnum.contains("expression")
+        || escape_tail_alnum.contains("mozbinding")
+    {
+        return "ZgotmplZ".to_string();
+    }
+
+    if decoded.contains('<')
+        || decoded.contains('>')
+        || decoded.contains('"')
+        || decoded.contains('\'')
+        || decoded.contains('`')
+        || decoded.contains('\0')
+    {
+        return "ZgotmplZ".to_string();
+    }
+
+    decoded
+}
+
+fn css_escape_tail_alnum(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut output = String::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+
+            if bytes[i].is_ascii_hexdigit() {
+                let start = i;
+                while i < bytes.len() && i - start < 6 && bytes[i].is_ascii_hexdigit() {
+                    i += 1;
+                }
+                let tail = bytes[i - 1].to_ascii_lowercase();
+                if tail.is_ascii_alphanumeric() {
+                    output.push(tail as char);
+                }
+
+                if i < bytes.len() && is_css_space_byte(bytes[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let ch = bytes[i].to_ascii_lowercase();
+            if ch.is_ascii_alphanumeric() {
+                output.push(ch as char);
+            }
+            i += 1;
+            continue;
+        }
+
+        let ch = bytes[i].to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch as char);
+        }
+        i += 1;
+    }
+
+    output
+}
+
 fn current_css_scan_state(content: &str) -> CssScanState {
     let bytes = content.as_bytes();
     let mut state = CssScanState::Expr;
@@ -8036,15 +8741,25 @@ fn current_css_scan_state(content: &str) -> CssScanState {
 }
 
 fn escape_script_value(value: &Value) -> Result<String> {
+    js_val_escaper(value)
+}
+
+fn js_val_escaper(value: &Value) -> Result<String> {
     match value {
-        Value::SafeHtml(raw) => Ok(raw.clone()),
-        Value::SafeHtmlAttr(raw)
-        | Value::SafeJs(raw)
+        Value::SafeJs(raw) => Ok(raw.clone()),
+        Value::SafeJsStr(raw) => Ok(format!("\"{raw}\"")),
+        Value::SafeHtml(raw)
+        | Value::SafeHtmlAttr(raw)
         | Value::SafeCss(raw)
         | Value::SafeUrl(raw)
         | Value::SafeSrcset(raw) => {
             let encoded = serde_json::to_string(raw)?;
             Ok(sanitize_json_for_script(&encoded))
+        }
+        Value::Json(JsonValue::Null) => Ok(" null ".to_string()),
+        Value::Json(JsonValue::Bool(_) | JsonValue::Number(_)) => {
+            let encoded = serde_json::to_string(value_json(value))?;
+            Ok(format!(" {} ", sanitize_json_for_script(&encoded)))
         }
         Value::Json(json) => {
             let encoded = serde_json::to_string(json)?;
@@ -8058,6 +8773,13 @@ fn escape_script_value(value: &Value) -> Result<String> {
             let encoded = serde_json::to_string("<no value>")?;
             Ok(sanitize_json_for_script(&encoded))
         }
+    }
+}
+
+fn value_json(value: &Value) -> &JsonValue {
+    match value {
+        Value::Json(json) => json,
+        _ => unreachable!("value_json only accepts Value::Json"),
     }
 }
 
@@ -8093,14 +8815,30 @@ fn is_safe_url(input: &str) -> bool {
 
 fn encode_url_attribute_value(input: &str) -> String {
     let mut encoded = String::new();
-    for &byte in input.as_bytes() {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'%' {
+            if i + 2 < bytes.len() && bytes[i + 1].is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit() {
+                encoded.push('%');
+                encoded.push(bytes[i + 1] as char);
+                encoded.push(bytes[i + 2] as char);
+                i += 3;
+                continue;
+            }
+            encoded.push_str("%25");
+            i += 1;
+            continue;
+        }
         if is_safe_url_attr_byte(byte) {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
-            encoded.push(hex_upper((byte >> 4) & 0x0F));
-            encoded.push(hex_upper(byte & 0x0F));
+            encoded.push(hex_lower((byte >> 4) & 0x0F));
+            encoded.push(hex_lower(byte & 0x0F));
         }
+        i += 1;
     }
     encoded
 }
@@ -8192,15 +8930,11 @@ fn is_safe_url_attr_byte(byte: u8) -> bool {
                 | b'!'
                 | b'$'
                 | b'&'
-                | b'\''
-                | b'('
-                | b')'
                 | b'*'
                 | b'+'
                 | b','
                 | b';'
                 | b'='
-                | b'%'
         )
 }
 
@@ -8245,38 +8979,181 @@ fn escape_js_string_fragment(input: &str, quote: char) -> String {
     escaped
 }
 
-fn escape_css_text(input: &str) -> String {
-    let mut escaped = String::new();
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | ',' | ':' | ';') {
-            escaped.push(ch);
-        } else {
-            escaped.push_str(&format!("\\{:X} ", ch as u32));
-        }
-    }
-    escaped
-}
-
-fn escape_css_string_fragment(input: &str, quote: char) -> String {
+fn js_string_escaper(input: &str) -> String {
     let mut escaped = String::new();
     for ch in input.chars() {
         match ch {
             '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\A "),
-            '\r' => escaped.push_str("\\D "),
-            '<' => escaped.push_str("\\3C "),
-            '>' => escaped.push_str("\\3E "),
-            c if c == quote => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\{:X} ", c as u32)),
+            '/' => escaped.push_str("\\/"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            '\u{007F}' => escaped.push_str("\\u007f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '"' => escaped.push_str("\\u0022"),
+            '\'' => escaped.push_str("\\u0027"),
+            '+' => escaped.push_str("\\u002b"),
+            '`' => escaped.push_str("\\u0060"),
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", c as u32)),
             _ => escaped.push(ch),
         }
     }
     escaped
 }
 
+fn js_string_escaper_norm(input: &str) -> String {
+    let mut escaped = String::new();
+    for ch in input.chars() {
+        match ch {
+            '/' => escaped.push_str("\\/"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            '\u{007F}' => escaped.push_str("\\u007f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '"' => escaped.push_str("\\u0022"),
+            '\'' => escaped.push_str("\\u0027"),
+            '+' => escaped.push_str("\\u002b"),
+            '`' => escaped.push_str("\\u0060"),
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn js_regexp_escaper(input: &str) -> String {
+    if input.is_empty() {
+        return "(?:)".to_string();
+    }
+
+    let mut escaped = String::new();
+    for ch in input.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '/' => escaped.push_str("\\/"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            '\u{007F}' => escaped.push_str("\\u007f"),
+            '<' => escaped.push_str("\\u003c"),
+            '>' => escaped.push_str("\\u003e"),
+            '&' => escaped.push_str("\\u0026"),
+            '"' => escaped.push_str("\\u0022"),
+            '\'' => escaped.push_str("\\u0027"),
+            '+' => escaped.push_str("\\u002b"),
+            '$' | '(' | ')' | '*' | '-' | '.' | '?' | '[' | ']' | '^' | '{' | '|' | '}' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            c if (c as u32) < 0x20 => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_css_text(input: &str) -> String {
+    css_escaper(input)
+}
+
+fn css_escaper(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    let mut written = 0usize;
+
+    for (index, ch) in input.char_indices() {
+        let Some(replacement) = css_escape_replacement(ch) else {
+            continue;
+        };
+
+        escaped.push_str(&input[written..index]);
+        escaped.push_str(replacement);
+
+        let next_index = index + ch.len_utf8();
+        if replacement != r"\\" {
+            let needs_space = match input.as_bytes().get(next_index).copied() {
+                None => true,
+                Some(byte) => byte.is_ascii_hexdigit() || is_css_space_byte(byte),
+            };
+            if needs_space {
+                escaped.push(' ');
+            }
+        }
+        written = next_index;
+    }
+
+    if written == 0 {
+        return input.to_string();
+    }
+
+    escaped.push_str(&input[written..]);
+    escaped
+}
+
+fn css_escape_replacement(ch: char) -> Option<&'static str> {
+    match ch {
+        '\0' => Some("\\0"),
+        '\t' => Some("\\9"),
+        '\n' => Some("\\a"),
+        '\x0c' => Some("\\c"),
+        '\r' => Some("\\d"),
+        '"' => Some("\\22"),
+        '&' => Some("\\26"),
+        '\'' => Some("\\27"),
+        '(' => Some("\\28"),
+        ')' => Some("\\29"),
+        '+' => Some("\\2b"),
+        '/' => Some("\\2f"),
+        ':' => Some("\\3a"),
+        ';' => Some("\\3b"),
+        '<' => Some("\\3c"),
+        '>' => Some("\\3e"),
+        '\\' => Some(r"\\"),
+        '{' => Some("\\7b"),
+        '}' => Some("\\7d"),
+        _ => None,
+    }
+}
+
+fn escape_css_string_fragment(input: &str, _quote: char) -> String {
+    css_escaper(input)
+}
+
+fn index_tag_end(source: &str, tag: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    let mut rest = source;
+    let tag_len = tag.len();
+
+    while let Some(relative) = rest.find("</") {
+        let tag_start = relative + 2;
+        let candidate = &rest[tag_start..];
+        if candidate.len() >= tag_len
+            && candidate[..tag_len].eq_ignore_ascii_case(tag)
+            && is_html_tag_boundary(candidate.as_bytes().get(tag_len).copied())
+        {
+            return Some(offset + relative);
+        }
+
+        let consumed = relative + 2;
+        offset += consumed;
+        rest = &rest[consumed..];
+    }
+
+    None
+}
 fn escape_attr_unquoted(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -8307,8 +9184,8 @@ fn percent_encode_url(input: &str) -> String {
             encoded.push(byte as char);
         } else {
             encoded.push('%');
-            encoded.push(hex_upper((byte >> 4) & 0x0F));
-            encoded.push(hex_upper(byte & 0x0F));
+            encoded.push(hex_lower((byte >> 4) & 0x0F));
+            encoded.push(hex_lower(byte & 0x0F));
         }
     }
     encoded
@@ -8318,19 +9195,27 @@ fn is_unreserved_url_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
-fn hex_upper(value: u8) -> char {
+fn hex_lower(value: u8) -> char {
     match value {
         0..=9 => (b'0' + value) as char,
-        10..=15 => (b'A' + (value - 10)) as char,
+        10..=15 => (b'a' + (value - 10)) as char,
         _ => '0',
     }
 }
 
 fn escape_html(input: &str) -> String {
+    escape_html_with_amp(input, true)
+}
+
+fn escape_html_norm(input: &str) -> String {
+    escape_html_with_amp(input, false)
+}
+
+fn escape_html_with_amp(input: &str, escape_amp: bool) -> String {
     let mut escaped = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
-            '&' => escaped.push_str("&amp;"),
+            '&' if escape_amp => escaped.push_str("&amp;"),
             '<' => escaped.push_str("&lt;"),
             '>' => escaped.push_str("&gt;"),
             '"' => escaped.push_str("&#34;"),
@@ -8341,6 +9226,162 @@ fn escape_html(input: &str) -> String {
         }
     }
     escaped
+}
+
+fn is_noncharacter_scalar(codepoint: u32) -> bool {
+    (0xFDD0..=0xFDEF).contains(&codepoint) || (codepoint & 0xFFFE) == 0xFFFE
+}
+
+fn html_nospace_escaper(input: &str) -> String {
+    html_nospace_escaper_with_amp(input, true)
+}
+
+fn html_nospace_escaper_norm(input: &str) -> String {
+    html_nospace_escaper_with_amp(input, false)
+}
+
+fn html_nospace_escaper_with_amp(input: &str, escape_amp: bool) -> String {
+    if input.is_empty() {
+        return "ZgotmplZ".to_string();
+    }
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\0' => escaped.push_str("&#xfffd;"),
+            '\t' => escaped.push_str("&#9;"),
+            '\n' => escaped.push_str("&#10;"),
+            '\u{000B}' => escaped.push_str("&#11;"),
+            '\u{000C}' => escaped.push_str("&#12;"),
+            '\r' => escaped.push_str("&#13;"),
+            ' ' => escaped.push_str("&#32;"),
+            '"' => escaped.push_str("&#34;"),
+            '\'' => escaped.push_str("&#39;"),
+            '&' if escape_amp => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '+' => escaped.push_str("&#43;"),
+            '=' => escaped.push_str("&#61;"),
+            '`' => escaped.push_str("&#96;"),
+            c if is_noncharacter_scalar(c as u32) => {
+                escaped.push_str(&format!("&#x{:x};", c as u32));
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn parse_tag_at(source: &str, start: usize) -> Option<(usize, bool, String)> {
+    let bytes = source.as_bytes();
+    let mut i = start + 1;
+    if i >= bytes.len() {
+        return None;
+    }
+
+    let mut is_close = false;
+    if bytes[i] == b'/' {
+        is_close = true;
+        i += 1;
+        if i >= bytes.len() {
+            return None;
+        }
+    }
+
+    if !bytes[i].is_ascii_alphabetic() {
+        return None;
+    }
+
+    let name_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+        i += 1;
+    }
+    let name = source[name_start..i].to_ascii_lowercase();
+
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'\'' | b'"' => {
+                quote = Some(b);
+                i += 1;
+            }
+            b'>' => return Some((i + 1, is_close, name)),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn strip_tags(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            let next = input[i..]
+                .find('<')
+                .map(|rel| i + rel)
+                .unwrap_or(bytes.len());
+            output.push_str(&input[i..next]);
+            i = next;
+            continue;
+        }
+
+        if input[i..].starts_with("<!--") {
+            if let Some(close_rel) = input[i + 4..].find("-->") {
+                i += 4 + close_rel + 3;
+                continue;
+            }
+            output.push('<');
+            i += 1;
+            continue;
+        }
+
+        let Some((end, is_close, name)) = parse_tag_at(input, i) else {
+            output.push('<');
+            i += 1;
+            continue;
+        };
+
+        if !is_close && name == "script" {
+            let mut cursor = end;
+            let mut found = None;
+            while cursor < bytes.len() {
+                let Some(rel) = input[cursor..].find('<') else {
+                    break;
+                };
+                let candidate = cursor + rel;
+                if let Some((close_end, close_is_close, close_name)) = parse_tag_at(input, candidate)
+                    && close_is_close
+                    && close_name == "script"
+                {
+                    found = Some(close_end);
+                    break;
+                }
+                cursor = candidate + 1;
+            }
+
+            if let Some(close_end) = found {
+                i = close_end;
+            } else {
+                i = bytes.len();
+            }
+            continue;
+        }
+
+        i = end;
+    }
+
+    output
 }
 
 #[cfg(test)]
@@ -9080,7 +10121,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<a href=\"https://example.com/q?a=b%20c&amp;x=%3Cy%3E\">go</a>"
+            "<a href=\"https://example.com/q?a=b%20c&amp;x=%3cy%3e\">go</a>"
         );
     }
 
@@ -9169,7 +10210,7 @@ mod tests {
             .execute_to_string(&json!({"Name": "onchange", "Value": "doEvil()"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<input #ZgotmplZ=\"doEvil()\">");
+        assert_eq!(output, "<input ZgotmplZ=\"doEvil()\">");
     }
 
     #[test]
@@ -9184,7 +10225,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<div #ZgotmplZ=\"color: expression(alert(1337))\"></div>"
+            "<div ZgotmplZ=\"color: expression(alert(1337))\"></div>"
         );
     }
 
@@ -9198,7 +10239,7 @@ mod tests {
             .execute_to_string(&json!({"Name": "src", "Value": "javascript:alert(1)"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<img #ZgotmplZ=\"javascript:alert(1)\">");
+        assert_eq!(output, "<img ZgotmplZ=\"javascript:alert(1)\">");
     }
 
     #[test]
@@ -9213,7 +10254,7 @@ mod tests {
             .execute_to_string(&json!({"A": "</script>"}))
             .expect("execute to succeed");
 
-        assert_eq!(output, "<a style=\"\\3C \\2F script\\3E \"></a>");
+        assert_eq!(output, "<a style=\"ZgotmplZ\"></a>");
     }
 
     #[test]
@@ -9226,7 +10267,7 @@ mod tests {
             .execute_to_string(&json!({"Name": ""}))
             .expect("parse should succeed");
 
-        assert_eq!(output, "<input #ZgotmplZ name=n>");
+        assert_eq!(output, "<input ZgotmplZ name=n>");
     }
 
     #[test]
@@ -9273,7 +10314,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<img srcset=\" /foo/bar.png 200w, /baz/boo(1).png\">"
+            "<img srcset=\" /foo/bar.png 200w, /baz/boo%281%29.png\">"
         );
     }
 
@@ -9910,7 +10951,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<script>const s = `${/\\}/.test(\"x\") ? 1 : 0}`;</script>"
+            "<script>const s = `${/\\}/.test(\"x\") ?  1  : 0}`;</script>"
         );
     }
 
@@ -9924,7 +10965,7 @@ mod tests {
             .execute_to_string(&json!({"A": "inject", "B": 1}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>// \nconst x = 1;</script>");
+        assert_eq!(output, "<script>// \nconst x =  1 ;</script>");
     }
 
     #[test]
@@ -9937,7 +10978,7 @@ mod tests {
             .execute_to_string(&json!({"A": "inject", "B": 1}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>// \r\nconst x = 1;</script>");
+        assert_eq!(output, "<script>// \r\nconst x =  1 ;</script>");
     }
 
     #[test]
@@ -9950,7 +10991,7 @@ mod tests {
             .execute_to_string(&json!({"A": "inject", "B": 1}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>// \rconst x = 1;</script>");
+        assert_eq!(output, "<script>// \rconst x =  1 ;</script>");
     }
 
     #[test]
@@ -9963,7 +11004,7 @@ mod tests {
             .execute_to_string(&json!({"A": "inject", "B": 1}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>// \u{2028}const x = 1;</script>");
+        assert_eq!(output, "<script>// \u{2028}const x =  1 ;</script>");
     }
 
     #[test]
@@ -9976,7 +11017,7 @@ mod tests {
             .execute_to_string(&json!({"A": "inject", "B": 1}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>// \u{2029}const x = 1;</script>");
+        assert_eq!(output, "<script>// \u{2029}const x =  1 ;</script>");
     }
 
     #[test]
@@ -9989,7 +11030,7 @@ mod tests {
             .execute_to_string(&json!({"Y": 2}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const x = 1;\u{2028}const y = 2;</script>");
+        assert_eq!(output, "<script>const x = 1;\u{2028}const y =  2 ;</script>");
     }
 
     #[test]
@@ -10002,7 +11043,7 @@ mod tests {
             .execute_to_string(&json!({"Y": 2}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const x = 1;\u{2029}const y = 2;</script>");
+        assert_eq!(output, "<script>const x = 1;\u{2029}const y =  2 ;</script>");
     }
 
     #[test]
@@ -10250,7 +11291,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<style>// </style>\n.a{color: \\3C \\2F style\\3E }</style>"
+            "<style>// </style>\n.a{color: ZgotmplZ}</style>"
         );
     }
 
@@ -10296,7 +11337,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<style>/* </style> */.a{color: \\3C \\2F style\\3E }</style>"
+            "<style>/* </style> */.a{color: ZgotmplZ}</style>"
         );
     }
 
@@ -10314,7 +11355,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<style>.a{content:\"</style>\";color: \\3C \\2F style\\3E }</style>"
+            "<style>.a{content:\"</style>\";color: ZgotmplZ}</style>"
         );
     }
 
@@ -10330,7 +11371,7 @@ mod tests {
             .execute_to_string(&json!({"A": "</script>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<style>.a{color: \\3C \\2F script\\3E }</style>");
+        assert_eq!(output, "<style>.a{color: ZgotmplZ}</style>");
     }
 
     #[test]
@@ -10343,7 +11384,7 @@ mod tests {
             .execute_to_string(&json!({"S": "a'b\\c"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<style>.x{content:'a\\'b\\\\c';}</style>");
+        assert_eq!(output, "<style>.x{content:'a\\27 b\\\\c';}</style>");
     }
 
     #[test]
@@ -10358,7 +11399,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<script>const s = \"\\\"\\x3C/script\\x3E\\x3Cx\\x3E\";</script>"
+            "<script>const s = \"\\u0022\\u003c\\/script\\u003e\\u003cx\\u003e\";</script>"
         );
     }
 
@@ -10372,7 +11413,7 @@ mod tests {
             .execute_to_string(&json!({"Query": "a=b c&x=<y>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "a%3Db%20c%26x%3D%3Cy%3E");
+        assert_eq!(output, "a%3db%20c%26x%3d%3cy%3e");
     }
 
     #[test]
@@ -11543,7 +12584,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_types_can_bypass_matching_context_escaping() {
+    fn safe_types_follow_contextual_escaping_rules() {
         let template = Template::new("safe-types")
             .add_func("to_url", |args: &[Value]| {
                 let input = args.first().map(Value::to_plain_string).unwrap_or_default();
@@ -11572,7 +12613,7 @@ mod tests {
 
         assert_eq!(
             output,
-            "<a href=\"javascript:alert(1)\">go</a><script>const s=\"\\\"</script>\";</script><style>.x{content:\"\\\"</style>\";}</style>"
+            "<a href=\"javascript:alert%281%29\">go</a><script>const s=\"\\\\\\u0022\\u003c\\/script\\u003e\";</script><style>.x{content:\"\\\\\\22\\3c\\2fstyle\\3e \";}</style>"
         );
     }
 
@@ -11590,7 +12631,7 @@ mod tests {
             .execute_to_string(&json!({"A": "O'Reilly & <x>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<a title=\"O'Reilly & <x>\"></a>");
+        assert_eq!(output, "<a title=\"O&#39;Reilly &amp; &lt;x&gt;\"></a>");
     }
 
     #[test]
@@ -11876,6 +12917,1421 @@ mod tests {
         );
         assert_eq!(error.code(), TemplateErrorCode::ErrSlashAmbig);
     }
+
+    #[test]
+    fn go_test_errors_non_error_cases_parse_successfully() {
+        let cases = [
+            "{{if .Cond}}<a>{{else}}<b>{{end}}",
+            "{{if .Cond}}<a>{{end}}",
+            "{{if .Cond}}{{else}}<b>{{end}}",
+            "{{with .Cond}}<div>{{end}}",
+            "{{range .Items}}<a>{{end}}",
+            "<a href='/foo?{{range .Items}}&{{.K}}={{.V}}{{end}}'>",
+            "{{range .Items}}<a{{if .X}}{{end}}>{{end}}",
+            "{{range .Items}}<a{{if .X}}{{end}}>{{continue}}{{end}}",
+            "{{range .Items}}<a{{if .X}}{{end}}>{{break}}{{end}}",
+            "{{range .Items}}<a{{if .X}}{{end}}>{{if .X}}{{break}}{{end}}{{end}}",
+            "<script>var a = `${a+b}`</script>`",
+            "<script>var tmpl = `asd`;</script>",
+            "<script>var tmpl = `${1}`;</script>",
+            "<script>var tmpl = `${return ``}`;</script>",
+            "<script>var tmpl = `${return {{.}} }`;</script>",
+            "<script>var tmpl = `${ let a = {1:1} {{.}} }`;</script>",
+        ];
+
+        for (idx, source) in cases.iter().enumerate() {
+            Template::new(format!("go-errors-ok-{idx}"))
+                .parse(source)
+                .unwrap_or_else(|error| panic!("expected parse success for {source:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn go_test_errors_range_loop_and_output_context_cases_match_go_behavior() {
+        let range_reentry = [
+            "{{range .Items}}<a{{end}}",
+            "\n{{range .Items}} x='<a{{end}}",
+        ];
+        for source in range_reentry {
+            let error = match Template::new("go-range-reentry").parse(source) {
+                Ok(_) => panic!("parse should fail for range re-entry mismatch"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("on range loop re-entry"),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+
+        let range_flow_mismatch = [
+            "{{range .Items}}<a{{if .X}}{{break}}{{end}}>{{end}}",
+            "{{range .Items}}<a{{if .X}}{{continue}}{{end}}>{{end}}",
+            "{{range .Items}}{{if .X}}{{break}}{{end}}<a{{if .Y}}{{continue}}{{end}}>{{if .Z}}{{continue}}{{end}}{{end}}",
+        ];
+        for source in range_flow_mismatch {
+            let error = match Template::new("go-range-flow-mismatch").parse(source) {
+                Ok(_) => panic!("parse should fail for range branch mismatch"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("{{range}} branches end in different contexts")
+                    || error.to_string().contains("on range loop re-entry"),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+
+        let slash_ambiguity = match Template::new("go-slash-ambig")
+            .parse(r#"<script>{{if false}}var x = 1{{end}}/-{{"1.5"}}/i.test(x)</script>"#)
+        {
+            Ok(_) => panic!("parse should fail for slash ambiguity"),
+            Err(error) => error,
+        };
+        assert!(
+            slash_ambiguity
+                .to_string()
+                .contains("could start a division or regexp"),
+            "unexpected slash ambiguity error: {slash_ambiguity}"
+        );
+
+        let output_context = match Template::new("go-output-context").parse(
+            r#"<script>reverseList = [{{template "t"}}]</script>{{define "t"}}{{if .Tail}}{{template "t" .Tail}}{{end}}{{.Head}}",{{end}}"#,
+        ) {
+            Ok(_) => panic!("parse should fail when recursive template output context cannot be computed"),
+            Err(error) => error,
+        };
+        assert!(
+            output_context
+                .to_string()
+                .contains("cannot compute output context for template")
+                || output_context
+                    .to_string()
+                    .contains("could start a division or regexp"),
+            "unexpected output-context error: {output_context}"
+        );
+    }
+
+    #[test]
+    fn go_test_next_js_ctx_matches_go_table() {
+        let tests = [
+            (JsContext::RegExp, ";"),
+            (JsContext::RegExp, "}"),
+            (JsContext::DivOp, ")"),
+            (JsContext::DivOp, "]"),
+            (JsContext::RegExp, "("),
+            (JsContext::RegExp, "["),
+            (JsContext::RegExp, "{"),
+            (JsContext::RegExp, "="),
+            (JsContext::RegExp, "+="),
+            (JsContext::RegExp, "*="),
+            (JsContext::RegExp, "*"),
+            (JsContext::RegExp, "!"),
+            (JsContext::RegExp, "+"),
+            (JsContext::RegExp, "-"),
+            (JsContext::DivOp, "--"),
+            (JsContext::DivOp, "++"),
+            (JsContext::DivOp, "x--"),
+            (JsContext::RegExp, "x---"),
+            (JsContext::RegExp, "return"),
+            (JsContext::RegExp, "return "),
+            (JsContext::RegExp, "return\t"),
+            (JsContext::RegExp, "return\n"),
+            (JsContext::RegExp, "return\u{2028}"),
+            (JsContext::DivOp, "x"),
+            (JsContext::DivOp, "x "),
+            (JsContext::DivOp, "x\t"),
+            (JsContext::DivOp, "x\n"),
+            (JsContext::DivOp, "x\u{2028}"),
+            (JsContext::DivOp, "preturn"),
+            (JsContext::DivOp, "0"),
+            (JsContext::DivOp, "0."),
+            (JsContext::RegExp, "=\u{00A0}"),
+        ];
+
+        for (want, input) in tests {
+            assert_eq!(next_js_ctx(input, JsContext::RegExp), want, "{input:?}");
+            assert_eq!(next_js_ctx(input, JsContext::DivOp), want, "{input:?}");
+        }
+
+        assert_eq!(next_js_ctx("   ", JsContext::RegExp), JsContext::RegExp);
+        assert_eq!(next_js_ctx("   ", JsContext::DivOp), JsContext::DivOp);
+    }
+
+    #[test]
+    fn go_test_is_js_mime_type_matches_go_table() {
+        let tests = [
+            ("application/javascript;version=1.8", true),
+            ("application/javascript;version=1.8;foo=bar", true),
+            ("application/javascript/version=1.8", false),
+            ("text/javascript", true),
+            ("application/json", true),
+            ("application/ld+json", true),
+            ("module", true),
+        ];
+
+        for (input, want) in tests {
+            assert_eq!(is_js_type_mime(input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_js_val_escaper_matches_go_table_core() {
+        let tests: Vec<(JsonValue, &str, bool)> = vec![
+            (json!(42), " 42 ", false),
+            (json!(-42), " -42 ", false),
+            (json!(9007199254740992_u64), " 9007199254740992 ", false),
+            (json!(9007199254740993_u64), " 9007199254740993 ", false),
+            (json!(1.0), " 1.0 ", false),
+            (json!(-0.5), " -0.5 ", false),
+            (json!(""), "\"\"", false),
+            (json!("foo"), "\"foo\"", false),
+            (json!("\r\n\u{2028}\u{2029}"), "\"\\r\\n\\u2028\\u2029\"", false),
+            (json!("\t\u{000B}"), "\"\\t\\u000b\"", false),
+            (json!({"X": 1, "Y": 2}), "{\"X\":1,\"Y\":2}", false),
+            (json!([]), "[]", false),
+            (json!([42, "foo", null]), "[42,\"foo\",null]", false),
+            (
+                json!(["<!--", "</script>", "-->"]),
+                "[\"\\u003c!--\",\"\\u003c/script\\u003e\",\"--\\u003e\"]",
+                false,
+            ),
+            (json!("<!--"), "\"\\u003c!--\"", false),
+            (json!("-->"), "\"--\\u003e\"", false),
+            (json!("<![CDATA["), "\"\\u003c![CDATA[\"", false),
+            (json!("]]>"), "\"]]\\u003e\"", false),
+            (json!("</script"), "\"\\u003c/script\"", false),
+            (json!("𝄞"), "\"𝄞\"", false),
+            (JsonValue::Null, " null ", false),
+        ];
+
+        for (value, want, skip_nest) in tests {
+            let got = js_val_escaper(&Value::Json(value.clone()))
+                .unwrap_or_else(|error| panic!("js_val_escaper failed for {value:?}: {error}"));
+            assert_eq!(got, want, "{value:?}");
+
+            if skip_nest {
+                continue;
+            }
+
+            let nested = JsonValue::Array(vec![value.clone()]);
+            let nested_got = js_val_escaper(&Value::Json(nested))
+                .unwrap_or_else(|error| panic!("nested js_val_escaper failed for {value:?}: {error}"));
+            let nested_want = format!("[{}]", want.trim());
+            assert_eq!(nested_got, nested_want, "nested {value:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_js_str_escaper_matches_go_table() {
+        let tests = [
+            ("", ""),
+            ("foo", "foo"),
+            ("\u{0000}", "\\u0000"),
+            ("\t", "\\t"),
+            ("\n", "\\n"),
+            ("\r", "\\r"),
+            ("\u{2028}", "\\u2028"),
+            ("\u{2029}", "\\u2029"),
+            ("\\", "\\\\"),
+            ("\\n", "\\\\n"),
+            ("foo\r\nbar", "foo\\r\\nbar"),
+            ("\"", "\\u0022"),
+            ("'", "\\u0027"),
+            ("&amp;", "\\u0026amp;"),
+            ("</script>", "\\u003c\\/script\\u003e"),
+            ("<![CDATA[", "\\u003c![CDATA["),
+            ("]]>", "]]\\u003e"),
+            ("<!--", "\\u003c!--"),
+            ("-->", "--\\u003e"),
+            (
+                "+ADw-script+AD4-alert(1)+ADw-/script+AD4-",
+                "\\u002bADw-script\\u002bAD4-alert(1)\\u002bADw-\\/script\\u002bAD4-",
+            ),
+        ];
+
+        for (input, want) in tests {
+            let got = js_string_escaper(input);
+            assert_eq!(got, want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_js_regexp_escaper_matches_go_table() {
+        let tests = [
+            ("", "(?:)"),
+            ("foo", "foo"),
+            ("\u{0000}", "\\u0000"),
+            ("\t", "\\t"),
+            ("\n", "\\n"),
+            ("\r", "\\r"),
+            ("\u{2028}", "\\u2028"),
+            ("\u{2029}", "\\u2029"),
+            ("\\", "\\\\"),
+            ("\\n", "\\\\n"),
+            ("foo\r\nbar", "foo\\r\\nbar"),
+            ("\"", "\\u0022"),
+            ("'", "\\u0027"),
+            ("&amp;", "\\u0026amp;"),
+            ("</script>", "\\u003c\\/script\\u003e"),
+            ("<![CDATA[", "\\u003c!\\[CDATA\\["),
+            ("]]>", "\\]\\]\\u003e"),
+            ("<!--", "\\u003c!\\-\\-"),
+            ("-->", "\\-\\-\\u003e"),
+            ("*", "\\*"),
+            ("+", "\\u002b"),
+            ("?", "\\?"),
+            ("[](){}", "\\[\\]\\(\\)\\{\\}"),
+            ("$foo|x.y", "\\$foo\\|x\\.y"),
+            ("x^y", "x\\^y"),
+        ];
+
+        for (input, want) in tests {
+            let got = js_regexp_escaper(input);
+            assert_eq!(got, want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_js_escapers_on_lower7_and_selected_high_codepoints() {
+        let input = concat!(
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\"#$%&'()*+,-./",
+            "0123456789:;<=>?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz{|}~\x7f",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{1D11E}",
+        );
+
+        let want_js_str = concat!(
+            "\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007",
+            "\\u0008\\t\\n\\u000b\\f\\r\\u000e\\u000f",
+            "\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017",
+            "\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f",
+            " !\\u0022#$%\\u0026\\u0027()*\\u002b,-.\\/",
+            "0123456789:;\\u003c=\\u003e?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\\\]^_",
+            "\\u0060abcdefghijklmno",
+            "pqrstuvwxyz{|}~\\u007f",
+            "\u{00A0}\u{0100}\\u2028\\u2029\u{FEFF}\u{1D11E}",
+        );
+        assert_eq!(js_string_escaper(input), want_js_str);
+
+        let want_js_regexp = concat!(
+            "\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007",
+            "\\u0008\\t\\n\\u000b\\f\\r\\u000e\\u000f",
+            "\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017",
+            "\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f",
+            " !\\u0022#\\$%\\u0026\\u0027\\(\\)\\*\\u002b,\\-\\.\\/",
+            "0123456789:;\\u003c=\\u003e\\?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ\\[\\\\\\]\\^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz\\{\\|\\}~\\u007f",
+            "\u{00A0}\u{0100}\\u2028\\u2029\u{FEFF}\u{1D11E}",
+        );
+        assert_eq!(js_regexp_escaper(input), want_js_regexp);
+
+        let mut by_char = String::new();
+        for ch in input.chars() {
+            by_char.push_str(&js_string_escaper(&ch.to_string()));
+        }
+        assert_eq!(by_char, want_js_str);
+
+        let mut regexp_by_char = String::new();
+        for ch in input.chars() {
+            regexp_by_char.push_str(&js_regexp_escaper(&ch.to_string()));
+        }
+        assert_eq!(regexp_by_char, want_js_regexp);
+    }
+
+    #[test]
+    fn go_test_srcset_filter_matches_go_table() {
+        let tests = [
+            (
+                "one ok",
+                "http://example.com/img.png",
+                "http://example.com/img.png",
+            ),
+            ("one ok with metadata", " /img.png 200w", " /img.png 200w"),
+            ("one bad", "javascript:alert(1) 200w", "#ZgotmplZ"),
+            ("two ok", "foo.png, bar.png", "foo.png, bar.png"),
+            (
+                "left bad",
+                "javascript:alert(1), /foo.png",
+                "#ZgotmplZ, /foo.png",
+            ),
+            ("right bad", "/bogus#, javascript:alert(1)", "/bogus#,#ZgotmplZ"),
+        ];
+
+        for (name, input, want) in tests {
+            let got = filter_srcset_attribute_value(input);
+            assert_eq!(got, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn go_test_url_normalizer_matches_go_table() {
+        let tests = [
+            ("", ""),
+            (
+                "http://example.com:80/foo/bar?q=foo%20&bar=x+y#frag",
+                "http://example.com:80/foo/bar?q=foo%20&bar=x+y#frag",
+            ),
+            (" ", "%20"),
+            ("%7c", "%7c"),
+            ("%7C", "%7C"),
+            ("%2", "%252"),
+            ("%", "%25"),
+            ("%z", "%25z"),
+            ("/foo|bar/%5c\u{1234}", "/foo%7cbar/%5c%e1%88%b4"),
+        ];
+
+        for (input, want) in tests {
+            let got = encode_url_attribute_value(input);
+            assert_eq!(got, want, "{input:?}");
+            assert_eq!(encode_url_attribute_value(want), want, "not idempotent: {want}");
+        }
+    }
+
+    #[test]
+    fn go_test_url_filters_match_go_table() {
+        let input = concat!(
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\"#$%&'()*+,-./",
+            "0123456789:;<=>?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz{|}~\x7f",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{1D11E}",
+        );
+
+        let want_url_escaper = concat!(
+            "%00%01%02%03%04%05%06%07%08%09%0a%0b%0c%0d%0e%0f",
+            "%10%11%12%13%14%15%16%17%18%19%1a%1b%1c%1d%1e%1f",
+            "%20%21%22%23%24%25%26%27%28%29%2a%2b%2c-.%2f",
+            "0123456789%3a%3b%3c%3d%3e%3f",
+            "%40ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ%5b%5c%5d%5e_",
+            "%60abcdefghijklmno",
+            "pqrstuvwxyz%7b%7c%7d~%7f",
+            "%c2%a0%c4%80%e2%80%a8%e2%80%a9%ef%bb%bf%f0%9d%84%9e",
+        );
+        assert_eq!(percent_encode_url(input), want_url_escaper);
+
+        let want_url_normalizer = concat!(
+            "%00%01%02%03%04%05%06%07%08%09%0a%0b%0c%0d%0e%0f",
+            "%10%11%12%13%14%15%16%17%18%19%1a%1b%1c%1d%1e%1f",
+            "%20!%22#$%25&%27%28%29*+,-./",
+            "0123456789:;%3c=%3e?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[%5c]%5e_",
+            "%60abcdefghijklmno",
+            "pqrstuvwxyz%7b%7c%7d~%7f",
+            "%c2%a0%c4%80%e2%80%a8%e2%80%a9%ef%bb%bf%f0%9d%84%9e",
+        );
+        assert_eq!(encode_url_attribute_value(input), want_url_normalizer);
+    }
+
+    #[test]
+    fn go_test_ends_with_css_keyword_matches_go_table() {
+        let tests = [
+            ("", "url", false),
+            ("url", "url", true),
+            ("URL", "url", true),
+            ("Url", "url", true),
+            ("url", "important", false),
+            ("important", "important", true),
+            ("image-url", "url", false),
+            ("imageurl", "url", false),
+            ("image url", "url", true),
+        ];
+
+        for (css, keyword, want) in tests {
+            let got = ends_with_css_keyword(css, keyword);
+            assert_eq!(got, want, "css={css:?} keyword={keyword:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_is_css_nmchar_matches_go_table() {
+        let tests = [
+            (0x0000_u32, false),
+            ('0' as u32, true),
+            ('9' as u32, true),
+            ('A' as u32, true),
+            ('Z' as u32, true),
+            ('a' as u32, true),
+            ('z' as u32, true),
+            ('_' as u32, true),
+            ('-' as u32, true),
+            (':' as u32, false),
+            (';' as u32, false),
+            (' ' as u32, false),
+            (0x007f_u32, false),
+            (0x0080_u32, true),
+            (0x1234_u32, true),
+            (0xD800_u32, false),
+            (0xDC00_u32, false),
+            (0xFFFE_u32, false),
+            (0x10000_u32, true),
+            (0x110000_u32, false),
+        ];
+
+        for (codepoint, want) in tests {
+            let got = is_css_nmchar(codepoint);
+            assert_eq!(got, want, "codepoint=U+{codepoint:04X}");
+        }
+    }
+
+    #[test]
+    fn go_test_decode_css_matches_go_table() {
+        let tests = [
+            ("", ""),
+            ("foo", "foo"),
+            ("foo\\", "foo"),
+            ("foo\\\\", "foo\\"),
+            ("\\", ""),
+            (r"\A", "\n"),
+            (r"\a", "\n"),
+            (r"\0a", "\n"),
+            (r"\00000a", "\n"),
+            (r"\000000a", "\u{0000}a"),
+            (r"\1234 5", "\u{1234}5"),
+            (r"\1234\20 5", "\u{1234} 5"),
+            (r"\1234\A 5", "\u{1234}\n5"),
+            ("\\1234\t5", "\u{1234}5"),
+            ("\\1234\n5", "\u{1234}5"),
+            ("\\1234\r\n5", "\u{1234}5"),
+            (r"\12345", "\u{12345}"),
+            ("\\\\", "\\"),
+            ("\\\\ ", "\\ "),
+            ("\\\"", "\""),
+            ("\\'", "'"),
+            ("\\.", "."),
+            ("\\. .", ". ."),
+            (
+                r"The \3c i\3equick\3c/i\3e,\d\A\3cspan style=\27 color:brown\27\3e brown\3c/span\3e  fox jumps\2028over the \3c canine class=\22lazy\22 \3e dog\3c/canine\3e",
+                "The <i>quick</i>,\r\n<span style='color:brown'>brown</span> fox jumps\u{2028}over the <canine class=\"lazy\">dog</canine>",
+            ),
+        ];
+
+        for (input, want) in tests {
+            let got = decode_css(input);
+            assert_eq!(got, want, "{input:?}");
+
+            let recoded = css_escaper(&got);
+            let redecode = decode_css(&recoded);
+            assert_eq!(
+                redecode, want,
+                "escape/decode should round-trip for {input:?}: {recoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_hex_decode_matches_go_table() {
+        let mut i = 0usize;
+        while i < 0x200000 {
+            let lower = format!("{i:x}");
+            assert_eq!(hex_decode(lower.as_bytes()) as usize, i, "{lower}");
+
+            let upper = lower.to_ascii_uppercase();
+            assert_eq!(hex_decode(upper.as_bytes()) as usize, i, "{upper}");
+            i += 101;
+        }
+    }
+
+    #[test]
+    fn go_test_skip_css_space_matches_go_table() {
+        let tests = [
+            ("", ""),
+            ("foo", "foo"),
+            ("\n", ""),
+            ("\r\n", ""),
+            ("\r", ""),
+            ("\t", ""),
+            (" ", ""),
+            ("\x0c", ""),
+            (" foo", "foo"),
+            ("  foo", " foo"),
+            (r"\20", r"\20"),
+        ];
+
+        for (input, want) in tests {
+            let got = skip_css_space(input);
+            assert_eq!(got, want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_css_escaper_matches_go_table() {
+        let input = concat!(
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\"#$%&'()*+,-./",
+            "0123456789:;<=>?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz{|}~\x7f",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{1D11E}",
+        );
+
+        let want = concat!(
+            "\\0\x01\x02\x03\x04\x05\x06\x07",
+            "\x08\\9 \\a\x0b\\c \\d\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17",
+            "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\\22#$%\\26\\27\\28\\29*\\2b,-.\\2f ",
+            "0123456789\\3a\\3b\\3c=\\3e?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz\\7b|\\7d~\u{007f}",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{1D11E}",
+        );
+
+        let got = css_escaper(input);
+        assert_eq!(got, want);
+        assert_eq!(decode_css(&got), input);
+    }
+
+    #[test]
+    fn go_test_css_value_filter_matches_go_table() {
+        let tests = [
+            ("", ""),
+            ("foo", "foo"),
+            ("0", "0"),
+            ("0px", "0px"),
+            ("-5px", "-5px"),
+            ("1.25in", "1.25in"),
+            ("+.33em", "+.33em"),
+            ("100%", "100%"),
+            ("12.5%", "12.5%"),
+            (".foo", ".foo"),
+            ("#bar", "#bar"),
+            ("corner-radius", "corner-radius"),
+            ("-moz-corner-radius", "-moz-corner-radius"),
+            ("#000", "#000"),
+            ("#48f", "#48f"),
+            ("#123456", "#123456"),
+            ("U+00-FF, U+980-9FF", "U+00-FF, U+980-9FF"),
+            ("color: red", "color: red"),
+            ("<!--", "ZgotmplZ"),
+            ("-->", "ZgotmplZ"),
+            ("<![CDATA[", "ZgotmplZ"),
+            ("]]>", "ZgotmplZ"),
+            ("</style", "ZgotmplZ"),
+            ("\"", "ZgotmplZ"),
+            ("'", "ZgotmplZ"),
+            ("`", "ZgotmplZ"),
+            ("\x00", "ZgotmplZ"),
+            ("/* foo */", "ZgotmplZ"),
+            ("//", "ZgotmplZ"),
+            ("[href=~", "ZgotmplZ"),
+            ("expression(alert(1337))", "ZgotmplZ"),
+            ("-expression(alert(1337))", "ZgotmplZ"),
+            ("expression", "ZgotmplZ"),
+            ("Expression", "ZgotmplZ"),
+            ("EXPRESSION", "ZgotmplZ"),
+            ("-moz-binding", "ZgotmplZ"),
+            ("-expr\x00ession(alert(1337))", "ZgotmplZ"),
+            (r"-expr\0ession(alert(1337))", "ZgotmplZ"),
+            (r"-express\69on(alert(1337))", "ZgotmplZ"),
+            (r"-express\69 on(alert(1337))", "ZgotmplZ"),
+            (r"-exp\72 ession(alert(1337))", "ZgotmplZ"),
+            (r"-exp\52 ession(alert(1337))", "ZgotmplZ"),
+            (r"-exp\000052 ession(alert(1337))", "ZgotmplZ"),
+            (r"-expre\0000073sion", "-expre\u{0007}3sion"),
+            (r"@import url evil.css", "ZgotmplZ"),
+            ("<", "ZgotmplZ"),
+            (">", "ZgotmplZ"),
+        ];
+
+        for (input, want) in tests {
+            let got = css_value_filter(input);
+            assert_eq!(got, want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_errors_branch_and_end_context_cases_match_go_table() {
+        let tests = [
+            ("{{if .Cond}}<a{{end}}", "{{if}} branches"),
+            ("{{if .Cond}}\n{{else}}\n<a{{end}}", "{{if}} branches"),
+            (
+                "{{if .Cond}}<a href=\"foo\">{{else}}<a href=\"bar>{{end}}",
+                "{{if}} branches",
+            ),
+            (
+                "<a {{if .Cond}}href='{{else}}title='{{end}}{{.X}}'>",
+                "{{if}} branches",
+            ),
+            ("\n{{with .X}}<a{{end}}", "{{with}} branches"),
+            ("\n{{with .X}}<a>{{else}}<a{{end}}", "{{with}} branches"),
+            ("<a b=1 c={{.H}}", "ends in a non-text context"),
+            ("<script>foo();", "ends in a non-text context"),
+        ];
+
+        for (source, want) in tests {
+            let error = match Template::new("go-errors-branch-end").parse(source) {
+                Ok(_) => panic!("parse should fail: {source:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(want),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_errors_partial_escape_and_charset_cases_match_go_table() {
+        let tests = [
+            (
+                r#"<a onclick="alert('Hello \"#,
+                "unfinished escape sequence in JS string",
+            ),
+            (
+                r#"<a onclick='alert("Hello\, World\"#,
+                "unfinished escape sequence in JS string",
+            ),
+            (
+                r#"<a onclick='alert(/x+\"#,
+                "unfinished escape sequence in JS string",
+            ),
+            (r#"<a onclick="/foo[\]/"#, "unfinished JS regexp charset"),
+        ];
+
+        for (source, want) in tests {
+            let error = match Template::new("go-errors-partial").parse(source) {
+                Ok(_) => panic!("parse should fail: {source:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(want),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_errors_ambiguous_url_and_unquoted_attr_cases_match_go_table() {
+        let tests = [
+            (
+                r#"<a href="{{if .F}}/foo?a={{else}}/bar/{{end}}{{.H}}">"#,
+                "ambiguous context",
+            ),
+            (r#"<input type=button value=onclick=>"#, "in unquoted attr"),
+            (r#"<input type=button value= onclick=>"#, "in unquoted attr"),
+            (r#"<input type=button value= 1+1=2>"#, "in unquoted attr"),
+            (r#"<a class=`foo>"#, "in unquoted attr"),
+            (r#"<a style=font:'Arial'>"#, "in unquoted attr"),
+            (
+                r#"<a=foo>"#,
+                "expected space, attr name, or end of tag",
+            ),
+        ];
+
+        for (source, want) in tests {
+            let error = match Template::new("go-errors-attrs").parse(source) {
+                Ok(_) => panic!("parse should fail: {source:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(want),
+                "unexpected error for {source:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_html_nospace_escaper_matches_go_table_core() {
+        let input = concat!(
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\"#$%&'()*+,-./",
+            "0123456789:;<=>?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz{|}~\x7f",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{FDEC}\u{1D11E}",
+            "erroneous0",
+        );
+
+        let want = concat!(
+            "&#xfffd;\x01\x02\x03\x04\x05\x06\x07",
+            "\x08&#9;&#10;&#11;&#12;&#13;\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17",
+            "\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            "&#32;!&#34;#$%&amp;&#39;()*&#43;,-./",
+            "0123456789:;&lt;&#61;&gt;?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "&#96;abcdefghijklmno",
+            "pqrstuvwxyz{|}~\u{007f}",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}&#xfdec;\u{1D11E}",
+            "erroneous0",
+        );
+
+        assert_eq!(html_nospace_escaper(input), want);
+    }
+
+    #[test]
+    fn go_test_strip_tags_matches_go_table() {
+        let tests = [
+            ("", ""),
+            ("Hello, World!", "Hello, World!"),
+            ("foo&amp;bar", "foo&amp;bar"),
+            (r#"Hello <a href="www.example.com/">World</a>!"#, "Hello World!"),
+            ("Foo <textarea>Bar</textarea> Baz", "Foo Bar Baz"),
+            ("Foo <!-- Bar --> Baz", "Foo  Baz"),
+            ("<", "<"),
+            ("foo < bar", "foo < bar"),
+            (
+                r#"Foo<script type="text/javascript">alert(1337)</script>Bar"#,
+                "FooBar",
+            ),
+            (r#"Foo<div title="1>2">Bar"#, "FooBar"),
+            ("I <3 Ponies!", "I <3 Ponies!"),
+            (r#"<script>foo()</script>"#, ""),
+        ];
+
+        for (input, want) in tests {
+            assert_eq!(strip_tags(input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_find_end_tag_matches_go_table() {
+        let tests = [
+            ("", "tag", -1),
+            ("hello </textarea> hello", "textarea", 6),
+            ("hello </TEXTarea> hello", "textarea", 6),
+            ("hello </textAREA>", "textarea", 6),
+            ("hello </textarea", "textareax", -1),
+            ("hello </textarea>", "tag", -1),
+            ("hello tag </textarea", "tag", -1),
+            ("hello </tag> </other> </textarea> <other>", "textarea", 22),
+            ("</textarea> <other>", "textarea", 0),
+            ("<div> </div> </TEXTAREA>", "textarea", 13),
+            ("<div> </div> </TEXTAREA\t>", "textarea", 13),
+            ("<div> </div> </TEXTAREA >", "textarea", 13),
+            ("<div> </div> </TEXTAREAfoo", "textarea", -1),
+            ("</TEXTAREAfoo </textarea>", "textarea", 14),
+            ("<</script >", "script", 1),
+            ("</script>", "textarea", -1),
+        ];
+
+        for (input, tag, want) in tests {
+            let got = index_tag_end(input, tag).map(|value| value as i32).unwrap_or(-1);
+            assert_eq!(got, want, "{input:?}/{tag:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_typed_content_core_matches_go_table() {
+        let typed_values = vec![
+            Value::from(r#"<b> "foo%" O'Reilly &bar;"#),
+            Value::from(CSS(r#"a[href =~ "//example.com"]#foo"#.to_string())),
+            Value::from(HTML(r#"Hello, <b>World</b> &amp;tc!"#.to_string())),
+            Value::from(HTMLAttr(r#" dir="ltr""#.to_string())),
+            Value::from(JS(r#"c && alert("Hello, World!");"#.to_string())),
+            Value::from(JSStr(r#"Hello, World & O'Reilly\u0021"#.to_string())),
+            Value::from(URL(r#"greeting=H%69,&addressee=(World)"#.to_string())),
+            Value::from(Srcset(
+                r#"greeting=H%69,&addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#.to_string(),
+            )),
+            Value::from(URL(r#",foo/,"#.to_string())),
+        ];
+
+        let tests: [(&str, [&str; 9]); 12] = [
+            (
+                r#"<style>{{.}} { color: blue }</style>"#,
+                [
+                    "ZgotmplZ",
+                    r#"a[href =~ "//example.com"]#foo"#,
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                ],
+            ),
+            (
+                r#"<div style="{{.}}">"#,
+                [
+                    "ZgotmplZ",
+                    r#"a[href =~ &#34;//example.com&#34;]#foo"#,
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                ],
+            ),
+            (
+                "{{.}}",
+                [
+                    "&lt;b&gt; &#34;foo%&#34; O&#39;Reilly &amp;bar;",
+                    r#"a[href =~ &#34;//example.com&#34;]#foo"#,
+                    r#"Hello, <b>World</b> &amp;tc!"#,
+                    r#" dir=&#34;ltr&#34;"#,
+                    r#"c &amp;&amp; alert(&#34;Hello, World!&#34;);"#,
+                    r#"Hello, World &amp; O&#39;Reilly\u0021"#,
+                    r#"greeting=H%69,&amp;addressee=(World)"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<a{{.}}>"#,
+                [
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    r#" dir="ltr""#,
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                    "ZgotmplZ",
+                ],
+            ),
+            (
+                r#"<a title={{.}}>"#,
+                [
+                    r#"&lt;b&gt;&#32;&#34;foo%&#34;&#32;O&#39;Reilly&#32;&amp;bar;"#,
+                    r#"a[href&#32;&#61;~&#32;&#34;//example.com&#34;]#foo"#,
+                    r#"Hello,&#32;World&#32;&amp;tc!"#,
+                    r#"&#32;dir&#61;&#34;ltr&#34;"#,
+                    r#"c&#32;&amp;&amp;&#32;alert(&#34;Hello,&#32;World!&#34;);"#,
+                    r#"Hello,&#32;World&#32;&amp;&#32;O&#39;Reilly\u0021"#,
+                    r#"greeting&#61;H%69,&amp;addressee&#61;(World)"#,
+                    r#"greeting&#61;H%69,&amp;addressee&#61;(World)&#32;2x,&#32;https://golang.org/favicon.ico&#32;500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<a title='{{.}}'>"#,
+                [
+                    r#"&lt;b&gt; &#34;foo%&#34; O&#39;Reilly &amp;bar;"#,
+                    r#"a[href =~ &#34;//example.com&#34;]#foo"#,
+                    r#"Hello, World &amp;tc!"#,
+                    r#" dir=&#34;ltr&#34;"#,
+                    r#"c &amp;&amp; alert(&#34;Hello, World!&#34;);"#,
+                    r#"Hello, World &amp; O&#39;Reilly\u0021"#,
+                    r#"greeting=H%69,&amp;addressee=(World)"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<textarea>{{.}}</textarea>"#,
+                [
+                    r#"&lt;b&gt; &#34;foo%&#34; O&#39;Reilly &amp;bar;"#,
+                    r#"a[href =~ &#34;//example.com&#34;]#foo"#,
+                    r#"Hello, &lt;b&gt;World&lt;/b&gt; &amp;tc!"#,
+                    r#" dir=&#34;ltr&#34;"#,
+                    r#"c &amp;&amp; alert(&#34;Hello, World!&#34;);"#,
+                    r#"Hello, World &amp; O&#39;Reilly\u0021"#,
+                    r#"greeting=H%69,&amp;addressee=(World)"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<script>alert({{.}})</script>"#,
+                [
+                    r#""\u003cb\u003e \"foo%\" O'Reilly \u0026bar;""#,
+                    r#""a[href =~ \"//example.com\"]#foo""#,
+                    r#""Hello, \u003cb\u003eWorld\u003c/b\u003e \u0026amp;tc!""#,
+                    r#"" dir=\"ltr\"""#,
+                    r#"c && alert("Hello, World!");"#,
+                    r#""Hello, World & O'Reilly\u0021""#,
+                    r#""greeting=H%69,\u0026addressee=(World)""#,
+                    r#""greeting=H%69,\u0026addressee=(World) 2x, https://golang.org/favicon.ico 500.5w""#,
+                    r#"",foo/,""#,
+                ],
+            ),
+            (
+                r#"<button onclick="alert({{.}})">"#,
+                [
+                    r#"&#34;\u003cb\u003e \&#34;foo%\&#34; O&#39;Reilly \u0026bar;&#34;"#,
+                    r#"&#34;a[href =~ \&#34;//example.com\&#34;]#foo&#34;"#,
+                    r#"&#34;Hello, \u003cb\u003eWorld\u003c/b\u003e \u0026amp;tc!&#34;"#,
+                    r#"&#34; dir=\&#34;ltr\&#34;&#34;"#,
+                    r#"c &amp;&amp; alert(&#34;Hello, World!&#34;);"#,
+                    r#"&#34;Hello, World &amp; O&#39;Reilly\u0021&#34;"#,
+                    r#"&#34;greeting=H%69,\u0026addressee=(World)&#34;"#,
+                    r#"&#34;greeting=H%69,\u0026addressee=(World) 2x, https://golang.org/favicon.ico 500.5w&#34;"#,
+                    r#"&#34;,foo/,&#34;"#,
+                ],
+            ),
+            (
+                r#"<script>alert("{{.}}")</script>"#,
+                [
+                    r#"\u003cb\u003e \u0022foo%\u0022 O\u0027Reilly \u0026bar;"#,
+                    r#"a[href =~ \u0022\/\/example.com\u0022]#foo"#,
+                    r#"Hello, \u003cb\u003eWorld\u003c\/b\u003e \u0026amp;tc!"#,
+                    r#" dir=\u0022ltr\u0022"#,
+                    r#"c \u0026\u0026 alert(\u0022Hello, World!\u0022);"#,
+                    r#"Hello, World \u0026 O\u0027Reilly\u0021"#,
+                    r#"greeting=H%69,\u0026addressee=(World)"#,
+                    r#"greeting=H%69,\u0026addressee=(World) 2x, https:\/\/golang.org\/favicon.ico 500.5w"#,
+                    r#",foo\/,"#,
+                ],
+            ),
+            (
+                r#"<a href="?q={{.}}">"#,
+                [
+                    r#"%3cb%3e%20%22foo%25%22%20O%27Reilly%20%26bar%3b"#,
+                    r#"a%5bhref%20%3d~%20%22%2f%2fexample.com%22%5d%23foo"#,
+                    r#"Hello%2c%20%3cb%3eWorld%3c%2fb%3e%20%26amp%3btc%21"#,
+                    r#"%20dir%3d%22ltr%22"#,
+                    r#"c%20%26%26%20alert%28%22Hello%2c%20World%21%22%29%3b"#,
+                    r#"Hello%2c%20World%20%26%20O%27Reilly%5cu0021"#,
+                    r#"greeting=H%69,&amp;addressee=%28World%29"#,
+                    r#"greeting%3dH%2569%2c%26addressee%3d%28World%29%202x%2c%20https%3a%2f%2fgolang.org%2ffavicon.ico%20500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<style>body { background: url('?img={{.}}') }</style>"#,
+                [
+                    r#"%3cb%3e%20%22foo%25%22%20O%27Reilly%20%26bar%3b"#,
+                    r#"a%5bhref%20%3d~%20%22%2f%2fexample.com%22%5d%23foo"#,
+                    r#"Hello%2c%20%3cb%3eWorld%3c%2fb%3e%20%26amp%3btc%21"#,
+                    r#"%20dir%3d%22ltr%22"#,
+                    r#"c%20%26%26%20alert%28%22Hello%2c%20World%21%22%29%3b"#,
+                    r#"Hello%2c%20World%20%26%20O%27Reilly%5cu0021"#,
+                    r#"greeting=H%69,&addressee=%28World%29"#,
+                    r#"greeting%3dH%2569%2c%26addressee%3d%28World%29%202x%2c%20https%3a%2f%2fgolang.org%2ffavicon.ico%20500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+        ];
+
+        for (case_idx, (input, want)) in tests.iter().enumerate() {
+            let pre = input
+                .find("{{.}}")
+                .unwrap_or_else(|| panic!("missing placeholder in case {case_idx}: {input}"));
+            let post = input.len() - (pre + 5);
+            let source = input.replace("{{.}}", "{{typed .}}");
+
+            let values = typed_values.clone();
+            let template = Template::new(format!("go-typed-core-{case_idx}"))
+                .add_func("typed", move |args: &[Value]| {
+                    let index = args
+                        .first()
+                        .and_then(|value| match value {
+                            Value::Json(JsonValue::Number(number)) => number.as_u64(),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            TemplateError::Render(
+                                "typed expects numeric index argument".to_string(),
+                            )
+                        })? as usize;
+                    values.get(index).cloned().ok_or_else(|| {
+                        TemplateError::Render(format!("typed index out of range: {index}"))
+                    })
+                })
+                .parse(&source)
+                .unwrap_or_else(|error| panic!("failed to parse case {case_idx}: {error}"));
+
+            for (value_index, want_segment) in want.iter().enumerate() {
+                let rendered = template
+                    .execute_to_string(&json!(value_index))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to execute case {case_idx} with value {value_index}: {error}"
+                        )
+                    });
+                let got_segment = &rendered[pre..rendered.len() - post];
+                assert_eq!(
+                    got_segment, *want_segment,
+                    "case {case_idx}, value {value_index}, input {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn go_test_typed_content_extended_matches_go_table() {
+        let typed_values = vec![
+            Value::from(r#"<b> "foo%" O'Reilly &bar;"#),
+            Value::from(CSS(r#"a[href =~ "//example.com"]#foo"#.to_string())),
+            Value::from(HTML(r#"Hello, <b>World</b> &amp;tc!"#.to_string())),
+            Value::from(HTMLAttr(r#" dir="ltr""#.to_string())),
+            Value::from(JS(r#"c && alert("Hello, World!");"#.to_string())),
+            Value::from(JSStr(r#"Hello, World & O'Reilly\u0021"#.to_string())),
+            Value::from(URL(r#"greeting=H%69,&addressee=(World)"#.to_string())),
+            Value::from(Srcset(
+                r#"greeting=H%69,&addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#
+                    .to_string(),
+            )),
+            Value::from(URL(r#",foo/,"#.to_string())),
+        ];
+
+        let tests: [(&str, [&str; 9]); 11] = [
+            (
+                r#"<script type="text/javascript">alert("{{.}}")</script>"#,
+                [
+                    r#"\u003cb\u003e \u0022foo%\u0022 O\u0027Reilly \u0026bar;"#,
+                    r#"a[href =~ \u0022\/\/example.com\u0022]#foo"#,
+                    r#"Hello, \u003cb\u003eWorld\u003c\/b\u003e \u0026amp;tc!"#,
+                    r#" dir=\u0022ltr\u0022"#,
+                    r#"c \u0026\u0026 alert(\u0022Hello, World!\u0022);"#,
+                    r#"Hello, World \u0026 O\u0027Reilly\u0021"#,
+                    r#"greeting=H%69,\u0026addressee=(World)"#,
+                    r#"greeting=H%69,\u0026addressee=(World) 2x, https:\/\/golang.org\/favicon.ico 500.5w"#,
+                    r#",foo\/,"#,
+                ],
+            ),
+            (
+                r#"<script type="text/javascript">alert({{.}})</script>"#,
+                [
+                    r#""\u003cb\u003e \"foo%\" O'Reilly \u0026bar;""#,
+                    r#""a[href =~ \"//example.com\"]#foo""#,
+                    r#""Hello, \u003cb\u003eWorld\u003c/b\u003e \u0026amp;tc!""#,
+                    r#"" dir=\"ltr\"""#,
+                    r#"c && alert("Hello, World!");"#,
+                    r#""Hello, World & O'Reilly\u0021""#,
+                    r#""greeting=H%69,\u0026addressee=(World)""#,
+                    r#""greeting=H%69,\u0026addressee=(World) 2x, https://golang.org/favicon.ico 500.5w""#,
+                    r#"",foo/,""#,
+                ],
+            ),
+            (
+                r#"<script type="text/template">{{.}}</script>"#,
+                [
+                    r#"&lt;b&gt; &#34;foo%&#34; O&#39;Reilly &amp;bar;"#,
+                    r#"a[href =~ &#34;//example.com&#34;]#foo"#,
+                    r#"Hello, <b>World</b> &amp;tc!"#,
+                    r#" dir=&#34;ltr&#34;"#,
+                    r#"c &amp;&amp; alert(&#34;Hello, World!&#34;);"#,
+                    r#"Hello, World &amp; O&#39;Reilly\u0021"#,
+                    r#"greeting=H%69,&amp;addressee=(World)"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#",foo/,"#,
+                ],
+            ),
+            (
+                r#"<button onclick='alert("{{.}}")'>"#,
+                [
+                    r#"\u003cb\u003e \u0022foo%\u0022 O\u0027Reilly \u0026bar;"#,
+                    r#"a[href =~ \u0022\/\/example.com\u0022]#foo"#,
+                    r#"Hello, \u003cb\u003eWorld\u003c\/b\u003e \u0026amp;tc!"#,
+                    r#" dir=\u0022ltr\u0022"#,
+                    r#"c \u0026\u0026 alert(\u0022Hello, World!\u0022);"#,
+                    r#"Hello, World \u0026 O\u0027Reilly\u0021"#,
+                    r#"greeting=H%69,\u0026addressee=(World)"#,
+                    r#"greeting=H%69,\u0026addressee=(World) 2x, https:\/\/golang.org\/favicon.ico 500.5w"#,
+                    r#",foo\/,"#,
+                ],
+            ),
+            (
+                r#"<img srcset="{{.}}">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset={{.}}>"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"&#32;dir&#61;%22ltr%22"#,
+                    r#"#ZgotmplZ,&#32;World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting&#61;H%69%2c&amp;addressee&#61;%28World%29"#,
+                    r#"greeting&#61;H%69,&amp;addressee&#61;(World)&#32;2x,&#32;https://golang.org/favicon.ico&#32;500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset="{{.}} 2x, https://golang.org/ 500.5w">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset="http://godoc.org/ {{.}}, https://golang.org/ 500.5w">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset="http://godoc.org/?q={{.}} 2x, https://golang.org/ 500.5w">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset="http://godoc.org/ 2x, {{.}} 500.5w">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+            (
+                r#"<img srcset="http://godoc.org/ 2x, https://golang.org/ {{.}}">"#,
+                [
+                    "#ZgotmplZ",
+                    "#ZgotmplZ",
+                    r#"Hello,#ZgotmplZ"#,
+                    r#" dir=%22ltr%22"#,
+                    r#"#ZgotmplZ, World!%22%29;"#,
+                    r#"Hello,#ZgotmplZ"#,
+                    r#"greeting=H%69%2c&amp;addressee=%28World%29"#,
+                    r#"greeting=H%69,&amp;addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#,
+                    r#"%2cfoo/%2c"#,
+                ],
+            ),
+        ];
+
+        for (case_idx, (input, want)) in tests.iter().enumerate() {
+            let pre = input
+                .find("{{.}}")
+                .unwrap_or_else(|| panic!("missing placeholder in case {case_idx}: {input}"));
+            let post = input.len() - (pre + 5);
+            let source = input.replace("{{.}}", "{{typed .}}");
+
+            let values = typed_values.clone();
+            let template = Template::new(format!("go-typed-ext-{case_idx}"))
+                .add_func("typed", move |args: &[Value]| {
+                    let index = args
+                        .first()
+                        .and_then(|value| match value {
+                            Value::Json(JsonValue::Number(number)) => number.as_u64(),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            TemplateError::Render(
+                                "typed expects numeric index argument".to_string(),
+                            )
+                        })? as usize;
+                    values.get(index).cloned().ok_or_else(|| {
+                        TemplateError::Render(format!("typed index out of range: {index}"))
+                    })
+                })
+                .parse(&source)
+                .unwrap_or_else(|error| panic!("failed to parse case {case_idx}: {error}"));
+
+            for (value_index, want_segment) in want.iter().enumerate() {
+                let rendered = template
+                    .execute_to_string(&json!(value_index))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "failed to execute case {case_idx} with value {value_index}: {error}"
+                        )
+                    });
+                let got_segment = &rendered[pre..rendered.len() - post];
+                assert_eq!(
+                    got_segment, *want_segment,
+                    "case {case_idx}, value {value_index}, input {input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attr_context_distinguishes_href_and_title_prefixes() {
+        assert_eq!(
+            infer_escape_mode("<a href='"),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Url,
+                quote: '\'',
+            }
+        );
+        assert_eq!(
+            infer_escape_mode("<a title='"),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Normal,
+                quote: '\'',
+            }
+        );
+        assert_eq!(
+            infer_escape_mode("<a href='x"),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Url,
+                quote: '\'',
+            }
+        );
+        assert_eq!(
+            infer_escape_mode("<a title='x"),
+            EscapeMode::AttrQuoted {
+                kind: AttrKind::Normal,
+                quote: '\'',
+            }
+        );
+    }
+
+    #[test]
+    fn go_test_stringer_like_values_render_as_strings() {
+        struct MyStringer {
+            v: i32,
+        }
+
+        impl Serialize for MyStringer {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&format!("string={}", self.v))
+            }
+        }
+
+        struct Errorer {
+            v: i32,
+        }
+
+        impl Serialize for Errorer {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&format!("error={}", self.v))
+            }
+        }
+
+        let template = Template::new("x").parse("{{.}}").expect("parse should succeed");
+
+        let stringer_output = template
+            .execute_to_string(&MyStringer { v: 3 })
+            .expect("execute should succeed");
+        assert_eq!(stringer_output, "string=3");
+
+        let errorer_output = template
+            .execute_to_string(&Errorer { v: 7 })
+            .expect("execute should succeed");
+        assert_eq!(errorer_output, "error=7");
+    }
+
+    #[test]
+    fn go_test_strings_in_scripts_with_json_content_type_are_correctly_escaped() {
+        let tests = [
+            "",
+            "\u{FFFD}",
+            "\u{0000}",
+            "\u{001F}",
+            "\t",
+            "<>",
+            "'\"",
+            "ASCII letters",
+            "ʕ⊙ϖ⊙ʔ",
+            "🍕",
+        ];
+
+        const PREFIX: &str = "<script type=\"application/ld+json\">";
+        const SUFFIX: &str = "</script>";
+        let template = Template::new("go-json-script-string")
+            .parse(r#"<script type="application/ld+json">"{{.}}"</script>"#)
+            .expect("parse should succeed");
+
+        for input in tests {
+            let rendered = template
+                .execute_to_string(&input)
+                .expect("execute should succeed");
+            let payload = rendered
+                .strip_prefix(PREFIX)
+                .and_then(|value| value.strip_suffix(SUFFIX))
+                .expect("rendered output should have script wrapper");
+            let output: String =
+                serde_json::from_str(payload).expect("script payload should be valid JSON string");
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
+    fn go_test_skip_escape_comments_matches_go_behavior() {
+        let template = Template::new("comments")
+            .parse("{{/* A comment */}}{{ 1 }}{{/* Another comment */}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "1");
+    }
+
+    #[test]
+    fn go_test_escaping_nil_nonempty_interfaces_equivalent() {
+        #[derive(Serialize)]
+        struct NonEmptyLike {
+            #[serde(rename = "E")]
+            e: Option<String>,
+        }
+
+        #[derive(Serialize)]
+        struct EmptyLike {
+            #[serde(rename = "E")]
+            e: Option<JsonValue>,
+        }
+
+        let template = Template::new("x").parse("{{.E}}").expect("parse should succeed");
+
+        let got = template
+            .execute_to_string(&NonEmptyLike { e: None })
+            .expect("execute should succeed");
+        let want = template
+            .execute_to_string(&EmptyLike { e: None })
+            .expect("execute should succeed");
+
+        assert_eq!(got, want);
+    }
+
 
     #[test]
     fn parse_numbers_supports_go_style_numeric_literals() {
