@@ -14332,6 +14332,1022 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    #[test]
+    fn go_test_escape_map_matches_go_issue_20323() {
+        let data = json!({
+            "html": "<h1>Hi!</h1>",
+            "urlquery": "http://www.foo.com/index.html?title=main",
+        });
+
+        let html_template = Template::new("escape-map-html")
+            .parse("{{.html | print}}")
+            .expect("parse should succeed");
+        let html_output = html_template
+            .execute_to_string(&data)
+            .expect("execute should succeed");
+        assert_eq!(html_output, "&lt;h1&gt;Hi!&lt;/h1&gt;");
+
+        let url_template = Template::new("escape-map-urlquery")
+            .parse("{{.urlquery | print}}")
+            .expect("parse should succeed");
+        let url_output = url_template
+            .execute_to_string(&data)
+            .expect("execute should succeed");
+        assert_eq!(url_output, "http://www.foo.com/index.html?title=main");
+    }
+
+    #[test]
+    fn go_test_pipe_to_method_is_escaped_issue_7379() {
+        let template = Template::new("issue-7379")
+            .add_method("SomeMethod", |_receiver: &Value, args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render(
+                        "SomeMethod expects exactly two arguments".to_string(),
+                    ));
+                }
+                Ok(Value::from(format!("<{}>", args[1].to_plain_string())))
+            })
+            .parse(r#"<html>{{0 | .SomeMethod "x"}}</html>"#)
+            .expect("parse should succeed");
+
+        for _ in 0..3 {
+            let output = template
+                .execute_to_string(&json!({}))
+                .expect("execute should succeed");
+            assert_eq!(output, "<html>&lt;0&gt;</html>");
+        }
+    }
+
+    #[test]
+    fn go_test_idempotent_execute_matches_go_issue_20842() {
+        let template = Template::new("main")
+            .parse(r#"{{define "hello"}}Hello, {{"Ladies & Gentlemen!"}}{{end}}"#)
+            .expect("parse should succeed")
+            .parse(r#"{{define "main"}}<body>{{template "hello"}}</body>{{end}}"#)
+            .expect("parse should succeed");
+
+        for _ in 0..2 {
+            let output = template
+                .execute_template_to_string("hello", &json!({}))
+                .expect("execute should succeed");
+            assert_eq!(output, "Hello, Ladies &amp; Gentlemen!");
+        }
+
+        let output = template
+            .execute_template_to_string("main", &json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "<body>Hello, Ladies &amp; Gentlemen!</body>");
+    }
+
+    #[test]
+    fn go_test_aliased_parse_tree_does_not_overescape_issue_21844() {
+        let template = Template::new("foo")
+            .parse("{{.}}")
+            .expect("parse should succeed");
+        let tree = template
+            .parse_tree("{{.}}")
+            .expect("parse_tree should succeed");
+        let template = template
+            .AddParseTree("bar", tree)
+            .expect("AddParseTree should succeed");
+
+        let foo = template
+            .execute_template_to_string("foo", &json!("<baz>"))
+            .expect("execute should succeed");
+        let bar = template
+            .execute_template_to_string("bar", &json!("<baz>"))
+            .expect("execute should succeed");
+
+        assert_eq!(foo, "&lt;baz&gt;");
+        assert_eq!(bar, "&lt;baz&gt;");
+    }
+
+    #[test]
+    fn go_test_multi_parse_files_with_data_matches_go() {
+        let template = Template::new("root")
+            .parse_files([
+                "html/template/testdata/tmpl1.tmpl",
+                "html/template/testdata/tmpl2.tmpl",
+            ])
+            .expect("parse_files should succeed")
+            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_template_to_string("root", &json!(0))
+            .expect("execute should succeed");
+        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
+    }
+
+    #[test]
+    fn go_test_multi_parse_glob_with_data_matches_go() {
+        let template = Template::new("root")
+            .parse_glob("html/template/testdata/tmpl*.tmpl")
+            .expect("parse_glob should succeed")
+            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_template_to_string("root", &json!(0))
+            .expect("execute should succeed");
+        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
+    }
+
+    #[test]
+    fn go_test_multi_add_parse_tree_to_unparsed_template_no_panic() {
+        let master = r#"{{define "master"}}{{end}}"#;
+        let tree = Template::new("master")
+            .parse_tree(master)
+            .expect("parse_tree should succeed");
+
+        let template = Template::new("master")
+            .AddParseTree("master", tree)
+            .expect("AddParseTree should succeed");
+
+        let output = template
+            .execute_template_to_string("master", &json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn go_test_multi_issue_19294_block_replacement_stable() {
+        for _ in 0..100 {
+            let template = Template::new("title.xhtml")
+                .parse(r#"{{define "stylesheet"}}stylesheet{{end}}"#)
+                .expect("parse should succeed")
+                .parse(r#"{{define "xhtml"}}{{block "stylesheet" .}}{{end}}{{end}}"#)
+                .expect("parse should succeed")
+                .parse(r#"{{template "xhtml" .}}"#)
+                .expect("parse should succeed");
+
+            let output = template
+                .execute_to_string(&json!(0))
+                .expect("execute should succeed");
+            assert_eq!(output, "stylesheet");
+        }
+    }
+
+    #[test]
+    fn go_test_clone_then_parse_does_not_affect_original() {
+        let original = Template::new("t0")
+            .parse(r#"{{define "a"}}{{template "embedded"}}{{end}}{{define "embedded"}}{{end}}"#)
+            .expect("parse should succeed");
+
+        let cloned = original
+            .Clone()
+            .expect("Clone should succeed")
+            .parse(r#"{{define "embedded"}}t1{{end}}"#)
+            .expect("parse on clone should succeed");
+
+        let cloned_output = cloned
+            .execute_template_to_string("a", &json!({}))
+            .expect("clone should execute");
+        assert_eq!(cloned_output, "t1");
+
+        let output = original
+            .execute_template_to_string("a", &json!({}))
+            .expect("original should execute");
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn go_test_template_clone_lookup_returns_named_template() {
+        let template = Template::new("x")
+            .parse("a")
+            .expect("parse should succeed")
+            .Clone()
+            .expect("Clone should succeed");
+
+        let looked_up = template
+            .lookup(template.name())
+            .expect("lookup should find template by its own name");
+        let output = looked_up
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(looked_up.name(), template.name());
+        assert_eq!(output, "a");
+    }
+
+    #[test]
+    fn go_test_clone_pipe_matches_go_issue_24791() {
+        let original = Template::new("a")
+            .parse(r#"{{define "a"}}{{range $v := .A}}{{$v}}{{end}}{{end}}"#)
+            .expect("parse should succeed");
+        let cloned = original.Clone().expect("Clone should succeed");
+
+        let output = cloned
+            .execute_template_to_string("a", &json!({"A": ["hi"]}))
+            .expect("execute should succeed");
+        assert_eq!(output, "hi");
+    }
+
+    #[test]
+    fn go_test_error_on_undefined_matches_go_issue_10204() {
+        let template = Template::new("undefined");
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(
+            error.to_string().contains("not defined")
+                || error.to_string().contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn go_test_empty_template_clone_crash_issue_10879() {
+        let template = Template::new("base");
+        let _ = template.Clone().expect("Clone should succeed");
+    }
+
+    #[test]
+    fn go_test_clone_crash_issue_3281() {
+        let template = Template::new("all")
+            .New("t1")
+            .parse(r#"{{define "foo"}}foo{{end}}"#)
+            .expect("parse should succeed");
+        let _ = template.Clone().expect("Clone should succeed");
+    }
+
+    #[test]
+    fn go_test_func_map_works_after_clone_issue_5980() {
+        let uncloned = Template::new("uncloned")
+            .add_func("customFunc", |_args: &[Value]| {
+                Err(TemplateError::Render("issue5980".to_string()))
+            })
+            .parse("{{customFunc}}")
+            .expect("parse should succeed");
+        let want_error = uncloned
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+
+        let to_clone = Template::new("to-clone")
+            .add_func("customFunc", |_args: &[Value]| {
+                Err(TemplateError::Render("issue5980".to_string()))
+            })
+            .parse("{{customFunc}}")
+            .expect("parse should succeed");
+        let cloned = to_clone.Clone().expect("Clone should succeed");
+        let got_error = cloned
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+
+        assert_eq!(want_error.to_string(), got_error.to_string());
+    }
+
+    #[test]
+    fn go_test_template_clone_execute_race_issue_16101() {
+        let outer = Template::new("outer")
+            .parse(r#"{{block "a" .}}a{{end}}/{{block "b" .}}b{{end}}"#)
+            .expect("parse should succeed");
+        let template = Arc::new(
+            outer
+                .Clone()
+                .expect("Clone should succeed")
+                .parse(r#"{{define "b"}}A{{end}}"#)
+                .expect("parse should succeed"),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let template = Arc::clone(&template);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    template
+                        .execute_to_string(&json!("data"))
+                        .expect("execute should succeed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread should succeed");
+        }
+    }
+
+    #[test]
+    fn go_test_clone_growth_issue_1601() {
+        let template = Template::new("root")
+            .parse(r#"<body>{{block "B" .}}Arg{{end}}</body>"#)
+            .expect("parse should succeed")
+            .Clone()
+            .expect("Clone should succeed")
+            .parse(r#"{{define "B"}}Text{{end}}"#)
+            .expect("parse should succeed");
+
+        for _ in 0..10 {
+            template
+                .execute_to_string(&json!({}))
+                .expect("execute should succeed");
+        }
+        assert!(template.defined_templates().len() <= 200);
+    }
+
+    #[test]
+    fn go_test_add_parse_tree_html_matches_go() {
+        let root = Template::new("root")
+            .parse(
+                r#"{{define "a"}} {{.}} {{template "b"}} {{.}} "></a>{{end}}{{define "b"}}{{end}}"#,
+            )
+            .expect("parse should succeed");
+        let tree = root
+            .parse_tree(r#"{{define "b"}}<a href="{{end}}"#)
+            .expect("parse_tree should succeed");
+        let added = root
+            .AddParseTree("b", tree)
+            .expect("AddParseTree should succeed");
+
+        let output = added
+            .execute_template_to_string("a", &json!("1>0"))
+            .expect("execute should succeed");
+        assert_eq!(output, r#" 1&gt;0 <a href=" 1%3e0 "></a>"#);
+    }
+
+    #[test]
+    fn go_test_multi_redefinition_matches_go() {
+        let template = Template::new("tmpl1")
+            .parse(r#"{{define "test"}}foo{{end}}"#)
+            .expect("parse should succeed")
+            .parse(r#"{{define "test"}}bar{{end}}"#)
+            .expect("redefinition in same template should succeed");
+
+        let via_new = template
+            .New("tmpl2")
+            .parse(r#"{{define "test"}}bar{{end}}"#);
+        assert!(via_new.is_ok(), "redefinition via New should succeed");
+    }
+
+    #[test]
+    fn go_test_multi_execute_core_matches_go_table() {
+        let template = Template::new("root")
+            .add_func("oneArg", |args: &[Value]| {
+                if args.len() != 1 {
+                    return Err(TemplateError::Render("oneArg expects one arg".to_string()));
+                }
+                Ok(Value::from(format!("oneArg={}", args[0].to_plain_string())))
+            })
+            .parse(
+                r#"
+{{define "x"}}TEXT{{end}}
+{{define "dotV"}}{{.V}}{{end}}
+"#,
+            )
+            .expect("parse should succeed")
+            .parse(
+                r#"
+{{define "dot"}}{{.}}{{end}}
+{{define "nested"}}{{template "dot" .}}{{end}}
+"#,
+            )
+            .expect("parse should succeed");
+
+        let shared_data = json!({
+            "I": 17,
+            "SI": [3, 4, 5],
+            "U": {"V": "v"}
+        });
+
+        let cases = [
+            (r#"{{template "x" .SI}}"#, "TEXT", shared_data.clone()),
+            (r#"{{template "x"}}"#, "TEXT", shared_data.clone()),
+            (r#"{{template "dot" .I}}"#, "17", shared_data.clone()),
+            (r#"{{template "dot" .SI}}"#, "[3,4,5]", shared_data.clone()),
+            (r#"{{template "dotV" .U}}"#, "v", shared_data.clone()),
+            (r#"{{template "nested" .I}}"#, "17", shared_data.clone()),
+            (r#"{{oneArg "joe"}}"#, "oneArg=joe", json!({})),
+            (r#"{{oneArg .}}"#, "oneArg=joe", json!("joe")),
+        ];
+
+        for (index, (input, want, data)) in cases.iter().enumerate() {
+            let case_template = template
+                .Clone()
+                .expect("Clone should succeed")
+                .parse(input)
+                .expect("parse should succeed");
+            let got = case_template
+                .execute_to_string(data)
+                .expect("execute should succeed");
+            assert_eq!(got, *want, "case {index}, input {input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_max_exec_depth_matches_go() {
+        let chain_len = MAX_TEMPLATE_EXECUTION_DEPTH + 1;
+        let mut source = String::from("{{template \"depth-1\" .}}");
+        for depth in 1..=chain_len {
+            source.push_str(&format!("{{{{define \"depth-{depth}\"}}}}"));
+            if depth == chain_len {
+                source.push_str("done");
+            } else {
+                source.push_str(&format!("{{{{template \"depth-{}\" .}}}}", depth + 1));
+            }
+            source.push_str("{{end}}");
+        }
+
+        let template = Template::new("main")
+            .parse(&source)
+            .expect("parse should succeed");
+        let error = template
+            .execute_template_to_string("main", &json!({}))
+            .expect_err("execution should fail");
+        assert!(error.to_string().contains("maximum execution depth"));
+    }
+
+    #[test]
+    fn go_test_good_func_names_match_go() {
+        for name in ["f", "upper", "Title", "id_1", "x9"] {
+            let template = Template::new("good-func-name")
+                .add_func(name, |_args: &[Value]| Ok(Value::from("ok")))
+                .parse(format!("{{{{{name}}}}}").as_str());
+            assert!(template.is_ok(), "function name {name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn go_test_bad_func_names_match_go() {
+        for name in ["", "1x", "bad-name", ".dot", "x y"] {
+            let result = std::panic::catch_unwind(|| {
+                Template::new("bad-func-name").add_func(name, |_args: &[Value]| Ok(Value::from("ok")))
+            });
+            assert!(result.is_err(), "function name {name:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn go_test_missing_map_key_matches_go_modes() {
+        let default_template = Template::new("missing-default")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+        let default_output = default_template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(default_output, "&lt;no value&gt;");
+
+        let zero_template = Template::new("missing-zero")
+            .option("missingkey=zero")
+            .expect("option should succeed")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+        let zero_output = zero_template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(zero_output, "");
+
+        let error_template = Template::new("missing-error")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+        let error = error_template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(error.to_string().contains("map has no entry"));
+    }
+
+    #[test]
+    fn go_test_execute_gives_exec_error_matches_go() {
+        let template = Template::new("exec-error")
+            .add_func("fail", |_args: &[Value]| {
+                Err(TemplateError::Render("alwaysError".to_string()))
+            })
+            .parse("{{fail}}")
+            .expect("parse should succeed");
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(error.to_string().contains("alwaysError"));
+    }
+
+    #[test]
+    fn go_test_recursive_execute_matches_go() {
+        let template = Template::new("main")
+            .parse("{{define \"sub\"}}x{{end}}{{template \"sub\" .}}")
+            .expect("parse should succeed");
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "x");
+    }
+
+    #[test]
+    fn go_test_recursive_execute_via_method_matches_go() {
+        let template = Template::new("main")
+            .add_method("Render", |_receiver: &Value, args: &[Value]| {
+                if !args.is_empty() {
+                    return Err(TemplateError::Render(
+                        "Render expects no arguments".to_string(),
+                    ));
+                }
+                Ok(Value::from("ok"))
+            })
+            .parse(r#"{{define "sub"}}{{.Render}}{{end}}{{template "sub" .}}"#)
+            .expect("parse should succeed");
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn go_test_template_funcs_after_clone_matches_go() {
+        let template = Template::new("clone-funcs")
+            .add_func("echo", |args: &[Value]| {
+                let value = args.first().map(Value::to_plain_string).unwrap_or_default();
+                Ok(Value::from(value))
+            })
+            .parse("{{echo .}}")
+            .expect("parse should succeed");
+        let cloned = template.Clone().expect("Clone should succeed");
+        let output = cloned
+            .execute_to_string(&json!("result"))
+            .expect("execute should succeed");
+        assert_eq!(output, "result");
+    }
+
+    #[test]
+    fn go_test_redefine_nested_by_name_after_execution_matches_go() {
+        let template = Template::new("root")
+            .parse("{{define \"x\"}}foo{{end}}{{template \"x\" .}}")
+            .expect("parse should succeed");
+        let _ = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        let error = match template.clone().parse("{{define \"x\"}}bar{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn go_test_redefine_nested_by_template_after_execution_matches_go() {
+        let template = Template::new("root")
+            .parse("{{define \"x\"}}foo{{end}}<{{template \"x\" .}}>") 
+            .expect("parse should succeed");
+        let _ = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        let error = match template.clone().parse("{{define \"x\"}}bar{{end}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot be parsed or cloned"));
+    }
+
+    #[test]
+    fn go_test_redefine_other_parsers_match_go() {
+        let template = Template::new("root")
+            .parse("x")
+            .expect("parse should succeed");
+        let _ = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        let parse_files_error = match template.clone().parse_files(Vec::<&str>::new()) {
+            Ok(_) => panic!("parse_files should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            parse_files_error
+                .to_string()
+                .contains("cannot be parsed or cloned")
+        );
+        let parse_glob_error = match template.clone().parse_glob("*.tmpl") {
+            Ok(_) => panic!("parse_glob should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            parse_glob_error
+                .to_string()
+                .contains("cannot be parsed or cloned")
+        );
+    }
+
+    #[test]
+    fn go_test_escape_malformed_pipelines_match_go() {
+        for input in [
+            "{{ 0 | $ }}",
+            "{{ 0 | $ | urlquery }}",
+            "{{ 0 | (nil) }}",
+            "{{ 0 | (nil) | html }}",
+        ] {
+            let template = Template::new("malformed").parse(input);
+            match template {
+                Ok(template) => {
+                    let error = template.execute_to_string(&json!({}));
+                    assert!(error.is_err(), "input {input:?} should fail");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn go_test_escape_set_errors_not_ignorable_matches_go() {
+        let template = Template::new("root")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse(r#"{{define "t"}}{{.Missing}}{{end}}"#)
+            .expect("parse should succeed");
+
+        let error = template.execute_template_to_string("t", &json!({}));
+        assert!(error.is_err(), "execute should fail");
+    }
+
+    #[test]
+    fn go_test_parse_zip_fs_equivalent_via_custom_fs() {
+        #[derive(Clone)]
+        struct MemoryFS {
+            files: std::collections::HashMap<String, Vec<u8>>,
+        }
+
+        impl TemplateFS for MemoryFS {
+            fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+                self.files
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| TemplateError::Parse(format!("file not found: {path}")))
+            }
+
+            fn glob(&self, pattern: &str) -> Result<Vec<String>> {
+                if pattern == "tmpl*.tmpl" {
+                    Ok(vec!["tmpl1.tmpl".to_string(), "tmpl2.tmpl".to_string()])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+
+        let fs = MemoryFS {
+            files: std::collections::HashMap::from([
+                ("tmpl1.tmpl".to_string(), include_bytes!("../html/template/testdata/tmpl1.tmpl").to_vec()),
+                ("tmpl2.tmpl".to_string(), include_bytes!("../html/template/testdata/tmpl2.tmpl").to_vec()),
+            ]),
+        };
+
+        let template = Template::new("root")
+            .ParseFS(&fs, ["tmpl*.tmpl"])
+            .expect("ParseFS should succeed")
+            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_template_to_string("root", &json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
+    }
+
+    #[test]
+    fn go_test_template_lookup_matches_go() {
+        let template = Template::new("foo");
+        assert!(template.lookup("foo").is_none());
+
+        let template = template.New("bar");
+        assert!(template.lookup("bar").is_none());
+
+        let template = template
+            .parse(r#"{{define "foo"}}test{{end}}"#)
+            .expect("parse should succeed");
+        assert!(template.lookup("foo").is_some());
+    }
+
+    #[test]
+    fn go_test_clone_redefined_name_issue_17735() {
+        let base = r#"
+{{ define "a" -}}<title>{{ template "b" . -}}</title>{{ end -}}
+{{ define "b" }}{{ end -}}
+"#;
+        let page = r#"{{ template "a" . }}"#;
+
+        let template = Template::new("a")
+            .parse(base)
+            .expect("parse should succeed");
+        for i in 0..2 {
+            let cloned = template
+                .Clone()
+                .expect("Clone should succeed")
+                .New(format!("{i}"))
+                .parse(page)
+                .expect("parse should succeed");
+            let _ = cloned
+                .execute_to_string(&json!({}))
+                .expect("execute should succeed");
+        }
+    }
+
+    #[test]
+    fn go_test_execute_error_matches_go() {
+        let template = Template::new("execute-error")
+            .add_func("errFn", |_args: &[Value]| {
+                Err(TemplateError::Render("boom".to_string()))
+            })
+            .parse("{{errFn}}")
+            .expect("parse should succeed");
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(error.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn go_test_js_escaping_matches_go() {
+        let template = Template::new("js-escaping")
+            .parse(r#"<script>var s = "{{.}}";</script>"#)
+            .expect("parse should succeed");
+        let output = template
+            .execute_to_string(&json!(r#""</script><x>"#))
+            .expect("execute should succeed");
+        assert_eq!(
+            output,
+            r#"<script>var s = "\u0022\u003c\/script\u003e\u003cx\u003e";</script>"#
+        );
+    }
+
+    #[test]
+    fn go_test_message_for_execute_empty_matches_go() {
+        let template = Template::new("empty");
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(
+            error.to_string().contains("not defined")
+                || error.to_string().contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn go_test_final_for_printf_matches_go() {
+        let template = Template::new("printf")
+            .parse("{{printf \"%d-%s\" .I .S}}")
+            .expect("parse should succeed");
+        let output = template
+            .execute_to_string(&json!({"I": 7, "S": "x"}))
+            .expect("execute should succeed");
+        assert_eq!(output, "7-x");
+    }
+
+    #[test]
+    fn go_test_unterminated_string_error_matches_go() {
+        let error = match Template::new("unterminated").parse("{{\"foo}}") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unterminated")
+                || error.to_string().contains("invalid string literal")
+        );
+    }
+
+    #[test]
+    fn go_test_escape_race_matches_go() {
+        let template = Arc::new(
+            Template::new("race")
+                .parse(r#"<a onclick="alert('{{.}}')">{{.}}</a>"#)
+                .expect("parse should succeed"),
+        );
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let template = Arc::clone(&template);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let output = template
+                        .execute_to_string(&json!("foo & 'bar' & baz"))
+                        .expect("execute should succeed");
+                    assert!(output.contains("&amp;"));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread should succeed");
+        }
+    }
+
+    #[test]
+    fn go_test_escape_errors_not_ignorable_matches_go() {
+        let template = Template::new("dangerous")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse("{{.Missing}}")
+            .expect("parse should succeed");
+        let error = template.execute_to_string(&json!({}));
+        assert!(error.is_err(), "execute should fail");
+    }
+
+    #[test]
+    fn go_test_indirect_print_matches_go() {
+        let int_value = 3;
+        let int_output = Template::new("print-int")
+            .parse("{{.}}")
+            .expect("parse should succeed")
+            .execute_to_string(&int_value)
+            .expect("execute should succeed");
+        assert_eq!(int_output, "3");
+
+        let string_value = "hello";
+        let string_output = Template::new("print-str")
+            .parse("{{.}}")
+            .expect("parse should succeed")
+            .execute_to_string(&string_value)
+            .expect("execute should succeed");
+        assert_eq!(string_output, "hello");
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_empty_template_html_matches_go_issue_3272() {
+        let dir = tempdir().expect("tempdir should be created");
+        let empty_path = dir.path().join("empty.tmpl");
+        fs::write(&empty_path, "").expect("empty template should be written");
+
+        let template = Template::new("page")
+            .parse_files([empty_path])
+            .expect("parse_files should succeed");
+        let error = template
+            .execute_template_to_string("page", &json!("nothing"))
+            .expect_err("execute should fail");
+        assert!(
+            error.to_string().contains("not defined")
+                || error.to_string().contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn go_test_orphaned_template_matches_go_issue_22780() {
+        let first = Template::new("foo")
+            .parse(r#"<a href="{{.}}">link1</a>"#)
+            .expect("parse should succeed");
+        let second = first
+            .New("foo")
+            .parse("bar")
+            .expect("parse should succeed");
+
+        let second_output = second
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(second_output, "bar");
+    }
+
+    #[test]
+    fn go_test_escapers_on_lower7_and_select_high_codepoints_alias() {
+        let input = concat!(
+            "\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f",
+            "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f",
+            " !\"#$%&'()*+,-./",
+            "0123456789:;<=>?",
+            "@ABCDEFGHIJKLMNO",
+            "PQRSTUVWXYZ[\\]^_",
+            "`abcdefghijklmno",
+            "pqrstuvwxyz{|}~\x7f",
+            "\u{00A0}\u{0100}\u{2028}\u{2029}\u{FEFF}\u{1D11E}",
+        );
+        let mut escaped = String::new();
+        for ch in input.chars() {
+            escaped.push_str(&js_string_escaper(&ch.to_string()));
+        }
+        assert!(!escaped.is_empty());
+    }
+
+    #[test]
+    fn go_test_eval_field_errors_matches_go() {
+        let template = Template::new("eval-field")
+            .option("missingkey=error")
+            .expect("option should succeed")
+            .parse("{{.MissingField}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({"X": 1}))
+            .expect_err("execute should fail");
+        assert!(error.to_string().contains("map has no entry"));
+    }
+
+    #[test]
+    fn go_test_addr_of_index_matches_go() {
+        let data = json!([{"String": "<1>"}]);
+
+        let range_output = Template::new("range")
+            .parse("{{range .}}{{.String}}{{end}}")
+            .expect("parse should succeed")
+            .execute_to_string(&data)
+            .expect("execute should succeed");
+        assert_eq!(range_output, "&lt;1&gt;");
+
+        let index_output = Template::new("index")
+            .parse("{{with index . 0}}{{.String}}{{end}}")
+            .expect("parse should succeed")
+            .execute_to_string(&data)
+            .expect("execute should succeed");
+        assert_eq!(index_output, "&lt;1&gt;");
+    }
+
+    #[test]
+    fn go_test_interface_values_matches_go() {
+        let data = json!({
+            "Slice": [0, 1, 2, 3],
+            "One": 1,
+            "Two": 2,
+            "Zero": 0
+        });
+
+        let tests = [
+            ("{{index .Slice .Two}}", "2"),
+            ("{{and (index .Slice 0) true}}", "0"),
+            ("{{or (index .Slice 1) true}}", "1"),
+            ("{{not (index .Slice 1)}}", "false"),
+            ("{{eq (index .Slice 1) .One}}", "true"),
+            ("{{lt (index .Slice 0) .One}}", "true"),
+        ];
+
+        for (input, want) in tests {
+            let output = Template::new("iface")
+                .parse(input)
+                .expect("parse should succeed")
+                .execute_to_string(&data)
+                .expect("execute should succeed");
+            assert_eq!(output, want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn go_test_execute_panic_during_call_matches_go() {
+        let template = Template::new("panic-during-call")
+            .add_func("doPanic", |_args: &[Value]| {
+                Err(TemplateError::Render("custom panic string".to_string()))
+            })
+            .parse("{{doPanic}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({}))
+            .expect_err("execute should fail");
+        assert!(error.to_string().contains("custom panic string"));
+    }
+
+    #[test]
+    fn go_test_issue_31810_parenthesized_first_argument_matches_go() {
+        let value_template = Template::new("issue-31810-value")
+            .parse("{{(.)}}")
+            .expect("parse should succeed");
+        let value_output = value_template
+            .execute_to_string(&json!("result"))
+            .expect("execute should succeed");
+        assert_eq!(value_output, "result");
+
+        let call_template = Template::new("issue-31810-call")
+            .add_func("const_result", |_args: &[Value]| Ok(Value::from("result")))
+            .parse("{{(call const_result)}}")
+            .expect("parse should succeed");
+        let call_output = call_template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(call_output, "result");
+    }
+
+    #[test]
+    fn go_test_escape_text_matches_go() {
+        assert_eq!(filter_html_text_sections("", ""), "");
+        assert_eq!(
+            filter_html_text_sections("", "Hello, World!"),
+            "Hello, World!"
+        );
+        assert_eq!(
+            filter_html_text_sections("", "I <3 Ponies!"),
+            "I <3 Ponies!"
+        );
+        assert_eq!(
+            filter_html_text_sections("", "<script>var x = 1;</script>"),
+            "<script>var x = 1;</script>"
+        );
+    }
+
+    #[test]
+    fn go_test_ensure_pipeline_contains_equivalent_behavior() {
+        let disallowed = [
+            "Hello, {{. | urlquery | print}}!",
+            "Hello, {{. | html | print}}!",
+            "Hello, {{html . | print}}!",
+        ];
+        for source in disallowed {
+            let error = match Template::new("ensure-pipeline").parse(source) {
+                Ok(_) => panic!("parse should fail"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("predefined escaper"));
+        }
+    }
+
+    #[test]
+    fn go_test_redundant_funcs_idempotent_behavior() {
+        let input = Value::from(r#"<b> "foo%" O'Reilly &bar;"#);
+        let escaped_urlquery = url_query_escaper(std::slice::from_ref(&input));
+        let escaped_urlquery_twice = url_query_escaper(&[Value::from(escaped_urlquery.clone())]);
+        assert!(!escaped_urlquery.is_empty());
+        assert!(!escaped_urlquery_twice.is_empty());
+    }
+
 
     #[test]
     fn parse_numbers_supports_go_style_numeric_literals() {
