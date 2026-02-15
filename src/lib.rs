@@ -1067,6 +1067,37 @@ impl Template {
             )));
         }
 
+        if templates
+            .values()
+            .all(|nodes| nodes.iter().all(|node| matches!(node, Node::Text(_))))
+        {
+            let mut root_end_state = None;
+            for (name, nodes) in templates.iter() {
+                let mut tracker = ContextTracker::from_state(ContextState::html_text());
+                for node in nodes {
+                    if let Node::Text(text_node) = node {
+                        tracker.append_text(&text_node.raw);
+                    }
+                }
+                if should_validate_action_context(&tracker) {
+                    validate_action_context_before_insertion(&tracker)?;
+                }
+                if name == &self.name {
+                    root_end_state = Some(tracker.state());
+                }
+            }
+
+            let root_end = root_end_state.unwrap_or_else(ContextState::html_text);
+            if !root_end.is_text_context() {
+                return Err(TemplateError::Parse(format!(
+                    "template `{}` ends in a non-text context",
+                    self.name
+                )));
+            }
+
+            return Ok(());
+        }
+
         let mut names = templates.keys().cloned().collect::<Vec<_>>();
         names.sort();
 
@@ -5401,6 +5432,11 @@ fn validate_template_hazards(source: &str) -> Result<()> {
 }
 
 fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
+    let bytes = source.as_bytes();
+    if !bytes.contains(&b'<') || !bytes.contains(&b'=') {
+        return Ok(());
+    }
+
     let sanitized = source_without_actions(source);
     let bytes = sanitized.as_bytes();
     let mut i = 0usize;
@@ -7270,17 +7306,26 @@ fn infer_escape_mode_with_tag_context(
     rendered: &str,
     tag_value_context: Option<&TagValueContext>,
 ) -> EscapeMode {
-    if current_unclosed_tag_content(rendered, "textarea").is_some()
-        || current_unclosed_tag_content(rendered, "title").is_some()
+    if contains_ascii_case_insensitive(rendered, b"<textarea")
+        && current_unclosed_tag_content(rendered, "textarea").is_some()
+    {
+        return EscapeMode::Rcdata;
+    }
+    if contains_ascii_case_insensitive(rendered, b"<title")
+        && current_unclosed_tag_content(rendered, "title").is_some()
     {
         return EscapeMode::Rcdata;
     }
 
-    if let Some(mode) = script_escape_mode(rendered) {
+    if contains_ascii_case_insensitive(rendered, b"<script")
+        && let Some(mode) = script_escape_mode(rendered)
+    {
         return mode;
     }
 
-    if let Some(mode) = style_escape_mode(rendered) {
+    if contains_ascii_case_insensitive(rendered, b"<style")
+        && let Some(mode) = style_escape_mode(rendered)
+    {
         return mode;
     }
 

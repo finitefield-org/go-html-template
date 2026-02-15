@@ -409,3 +409,18 @@ cargo run --release --quiet --bin perf_parse_breakdown
 | static_200k | 20 | 2062 | 1101 | -46.6% | 503 | 586 | +16.5% | true |
 | attr_20k | 10 | 25968 | 16315 | -37.2% | 12131 | 12823 | +5.7% | true |
 | url_20k | 10 | 28894 | 21920 | -24.1% | 24388 | 25164 | +3.2% | true |
+
+## Parse Full-Scan Reduction (extra pass for static/html-heavy)
+
+Additional optimization applied:
+- `validate_unquoted_attr_hazards` now returns early when source cannot contain unquoted-attr hazards (`<` or `=` not present).
+- `infer_escape_mode_with_tag_context` now guards script/style/title/textarea scans with cheap marker checks (`<script`, `<style`, `<title`, `<textarea`), reducing expensive full scans on unrelated HTML.
+- `reanalyze_contexts` now has a text-only template fast path that bypasses `ParseContextAnalyzer` and directly computes context/state while preserving JS/CSS/script/style validation behavior.
+
+### Selected before/after (against previous section’s baseline)
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_exec_us | after rust_exec_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 20 | 1101 | 525 | -52.3% | 586 | 481 | -17.9% | true |
+| attr_20k | 10 | 16315 | 16519 | +1.2% | 12823 | 12648 | -1.4% | true |
+| url_20k | 10 | 21920 | 15184 | -30.7% | 25164 | 25428 | +1.0% | true |
