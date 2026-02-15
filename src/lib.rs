@@ -3716,14 +3716,21 @@ struct ParseContextAnalyzer<'a> {
 struct TextTransitionCacheKey {
     state: ContextState,
     url_part: Option<UrlPartContext>,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+    script_json: bool,
     attr_name_dynamic_pending: bool,
     attr_value_from_dynamic_attr: bool,
 }
 
 #[derive(Clone, Debug)]
 struct TextTransitionCacheValue {
+    rendered: String,
     state: ContextState,
     url_part: Option<UrlPartContext>,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+    script_json: bool,
     attr_name_dynamic_pending: bool,
     attr_value_from_dynamic_attr: bool,
 }
@@ -3774,16 +3781,16 @@ fn text_transition_cache_key(
     if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
         return None;
     }
-    if !should_normalize_tracker_state(&tracker.state) {
-        return None;
-    }
-    if tracker.js_scan_state.is_some() || tracker.css_scan_state.is_some() || tracker.script_json {
+    if !text_transition_cache_is_eligible(tracker, text) {
         return None;
     }
 
     Some(TextTransitionCacheKey {
         state: tracker.state(),
         url_part: tracker.url_part,
+        js_scan_state: tracker.js_scan_state,
+        css_scan_state: tracker.css_scan_state,
+        script_json: tracker.script_json,
         attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
         attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
     })
@@ -3796,16 +3803,17 @@ fn text_transition_cache_value(
     if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
         return None;
     }
-    if !should_normalize_tracker_state(&tracker.state) {
-        return None;
-    }
-    if tracker.js_scan_state.is_some() || tracker.css_scan_state.is_some() || tracker.script_json {
+    if !text_transition_cache_is_eligible(tracker, text) {
         return None;
     }
 
     Some(TextTransitionCacheValue {
+        rendered: tracker.rendered.clone(),
         state: tracker.state(),
         url_part: tracker.url_part,
+        js_scan_state: tracker.js_scan_state,
+        css_scan_state: tracker.css_scan_state,
+        script_json: tracker.script_json,
         attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
         attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
     })
@@ -3815,14 +3823,45 @@ fn apply_text_transition_cache_value(
     tracker: &mut ContextTracker,
     value: &TextTransitionCacheValue,
 ) {
+    tracker.rendered = value.rendered.clone();
     tracker.state = value.state.clone();
     tracker.url_part = value.url_part;
-    tracker.rendered = seed_rendered_for_state_with_url_part(&tracker.state, tracker.url_part);
-    tracker.js_scan_state = None;
-    tracker.css_scan_state = None;
-    tracker.script_json = false;
+    tracker.js_scan_state = value.js_scan_state;
+    tracker.css_scan_state = value.css_scan_state;
+    tracker.script_json = value.script_json;
     tracker.attr_name_dynamic_pending = value.attr_name_dynamic_pending;
     tracker.attr_value_from_dynamic_attr = value.attr_value_from_dynamic_attr;
+}
+
+fn text_transition_cache_is_eligible(tracker: &ContextTracker, text: &str) -> bool {
+    if should_normalize_tracker_state(&tracker.state) {
+        return true;
+    }
+
+    if tracker.state.is_script_tag_context() {
+        let Some(scan_state) = tracker.js_scan_state else {
+            return false;
+        };
+        if contains_ascii_case_insensitive(text, b"</script") {
+            if !matches!(scan_state, JsScanState::Expr { .. }) {
+                return false;
+            }
+            return find_close_tag(text, 0, b"script").is_some();
+        }
+        return true;
+    }
+
+    if tracker.state.is_style_tag_context() {
+        let Some(scan_state) = tracker.css_scan_state else {
+            return false;
+        };
+        if contains_ascii_case_insensitive(text, b"</style") {
+            return find_style_close_tag_with_state(text, 0, scan_state).is_some();
+        }
+        return true;
+    }
+
+    false
 }
 
 impl<'a> ParseContextAnalyzer<'a> {
@@ -14705,6 +14744,20 @@ mod tests {
                 "unexpected css url part after chunk: {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn text_transition_cache_key_supports_script_context() {
+        let tracker = ContextTracker::from_state(ContextState::from_rendered("<script>"));
+        let key = text_transition_cache_key(&tracker, "const x=");
+        assert!(key.is_some());
+    }
+
+    #[test]
+    fn text_transition_cache_key_skips_script_close_when_not_in_expr_state() {
+        let tracker = ContextTracker::from_state(ContextState::from_rendered("<script>\""));
+        let key = text_transition_cache_key(&tracker, "</script>");
+        assert!(key.is_none());
     }
 
     #[test]
