@@ -1140,7 +1140,8 @@ impl Template {
                         }
                     }
                     let value = self.eval_expr(expr, root, dot, runtime, scopes)?;
-                    let escaped = escape_value_for_mode(&value, mode, &tracker.rendered)?;
+                    let escaped =
+                        escape_value_for_mode(&value, mode, &tracker.rendered, tracker.url_part)?;
                     output.push_str(&escaped);
                     tracker.append_text(&escaped);
                 }
@@ -5991,7 +5992,12 @@ struct TagValueContext {
     value_prefix: String,
 }
 
-fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str) -> Result<String> {
+fn escape_value_for_mode(
+    value: &Value,
+    mode: EscapeMode,
+    rendered_prefix: &str,
+    url_part: Option<UrlPartContext>,
+) -> Result<String> {
     match (value, mode) {
         (Value::SafeHtml(raw), EscapeMode::Html) => return Ok(raw.clone()),
         (Value::SafeHtml(raw), EscapeMode::AttrName) => return Ok(html_name_filter(&raw)),
@@ -6008,16 +6014,28 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
     }
 
     match mode {
-        EscapeMode::Html => Ok(escape_html(&value.to_plain_string())),
+        EscapeMode::Html => {
+            let plain = plain_string_cow(value);
+            Ok(escape_html(plain.as_ref()))
+        }
         EscapeMode::Rcdata => match value {
             Value::SafeHtml(raw) => Ok(escape_html_norm(raw)),
-            _ => Ok(escape_html(&value.to_plain_string())),
+            _ => {
+                let plain = plain_string_cow(value);
+                Ok(escape_html(plain.as_ref()))
+            }
         },
-        EscapeMode::AttrName => Ok(html_name_filter(&value.to_plain_string())),
+        EscapeMode::AttrName => {
+            let plain = plain_string_cow(value);
+            Ok(html_name_filter(plain.as_ref()))
+        }
         EscapeMode::AttrQuoted { kind, quote: _ } => match kind {
             AttrKind::Normal => match value {
                 Value::SafeHtml(raw) => Ok(escape_html_norm(&strip_tags(raw))),
-                _ => Ok(escape_html(&value.to_plain_string())),
+                _ => {
+                    let plain = plain_string_cow(value);
+                    Ok(escape_html(plain.as_ref()))
+                }
             },
             AttrKind::Js => {
                 let text = js_val_escaper(value)?;
@@ -6032,13 +6050,16 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
                     | Value::SafeJsStr(_)
                     | Value::SafeUrl(_)
                     | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
-                    _ => css_value_filter(&value.to_plain_string()),
+                    _ => {
+                        let plain = plain_string_cow(value);
+                        css_value_filter(plain.as_ref())
+                    }
                 };
                 Ok(escape_html(&text))
             }
             AttrKind::Url => Ok(escape_url_attribute_value_single_pass(
                 value,
-                rendered_prefix,
+                url_part,
                 HtmlAttributeEscapeMode::Quoted,
             )),
             AttrKind::Srcset => Ok(escape_srcset_attribute_value_single_pass(
@@ -6049,7 +6070,10 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
         EscapeMode::AttrUnquoted { kind } => match kind {
             AttrKind::Normal => match value {
                 Value::SafeHtml(raw) => Ok(html_nospace_escaper_norm(&strip_tags(raw))),
-                _ => Ok(html_nospace_escaper(&value.to_plain_string())),
+                _ => {
+                    let plain = plain_string_cow(value);
+                    Ok(html_nospace_escaper(plain.as_ref()))
+                }
             },
             AttrKind::Css => {
                 let text = match value {
@@ -6060,13 +6084,16 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
                     | Value::SafeJsStr(_)
                     | Value::SafeUrl(_)
                     | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
-                    _ => css_value_filter(&value.to_plain_string()),
+                    _ => {
+                        let plain = plain_string_cow(value);
+                        css_value_filter(plain.as_ref())
+                    }
                 };
                 Ok(escape_attr_unquoted(&text))
             }
             AttrKind::Url => Ok(escape_url_attribute_value_single_pass(
                 value,
-                rendered_prefix,
+                url_part,
                 HtmlAttributeEscapeMode::Unquoted,
             )),
             AttrKind::Srcset => Ok(escape_srcset_attribute_value_single_pass(
@@ -6079,16 +6106,28 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
             }
         },
         EscapeMode::ScriptExpr => escape_script_value(value),
-        EscapeMode::ScriptTemplate => Ok(escape_js_string_fragment(&value.to_plain_string(), '`')),
-        EscapeMode::ScriptRegexp => Ok(escape_js_string_fragment(&value.to_plain_string(), '/')),
+        EscapeMode::ScriptTemplate => {
+            let plain = plain_string_cow(value);
+            Ok(escape_js_string_fragment(plain.as_ref(), '`'))
+        }
+        EscapeMode::ScriptRegexp => {
+            let plain = plain_string_cow(value);
+            Ok(escape_js_string_fragment(plain.as_ref(), '/'))
+        }
         EscapeMode::ScriptLineComment | EscapeMode::ScriptBlockComment => Ok(String::new()),
         EscapeMode::ScriptString { quote: _ } => match value {
             Value::SafeJsStr(raw) => Ok(js_string_escaper_norm(raw)),
-            _ => Ok(js_string_escaper(&value.to_plain_string())),
+            _ => {
+                let plain = plain_string_cow(value);
+                Ok(js_string_escaper(plain.as_ref()))
+            }
         },
         EscapeMode::ScriptJsonString { quote: _ } => match value {
             Value::SafeJsStr(raw) => Ok(js_string_escaper_norm(raw)),
-            _ => Ok(js_string_escaper(&value.to_plain_string())),
+            _ => {
+                let plain = plain_string_cow(value);
+                Ok(js_string_escaper(plain.as_ref()))
+            }
         },
         EscapeMode::StyleExpr => {
             if matches!(
@@ -6102,7 +6141,8 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
             ) {
                 return Ok("ZgotmplZ".to_string());
             }
-            let filtered = css_value_filter(&value.to_plain_string());
+            let plain = plain_string_cow(value);
+            let filtered = css_value_filter(plain.as_ref());
             if filtered == "ZgotmplZ" {
                 return Ok(filtered);
             }
@@ -6113,7 +6153,8 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
             if let Some(url_part) = css_url_part_context(rendered_prefix) {
                 Ok(escape_css_url_value(value, url_part))
             } else {
-                Ok(escape_css_string_fragment(&value.to_plain_string(), quote))
+                let plain = plain_string_cow(value);
+                Ok(escape_css_string_fragment(plain.as_ref(), quote))
             }
         }
     }
@@ -6520,9 +6561,15 @@ enum HtmlAttributeEscapeMode {
     Unquoted,
 }
 
-fn plain_string_cow_for_url(value: &Value) -> Cow<'_, str> {
+fn plain_string_cow(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::SafeUrl(raw) => Cow::Borrowed(raw),
+        Value::SafeHtml(raw)
+        | Value::SafeHtmlAttr(raw)
+        | Value::SafeJs(raw)
+        | Value::SafeJsStr(raw)
+        | Value::SafeCss(raw)
+        | Value::SafeUrl(raw)
+        | Value::SafeSrcset(raw) => Cow::Borrowed(raw),
         Value::Json(JsonValue::String(raw)) => Cow::Borrowed(raw),
         _ => Cow::Owned(value.to_plain_string()),
     }
@@ -6560,13 +6607,46 @@ fn append_html_attr_escaped_char(output: &mut String, ch: char, mode: HtmlAttrib
 }
 
 fn append_html_attr_escaped_text(output: &mut String, input: &str, mode: HtmlAttributeEscapeMode) {
-    for ch in input.chars() {
-        append_html_attr_escaped_char(output, ch, mode);
+    if input.is_ascii() {
+        for &byte in input.as_bytes() {
+            append_html_attr_escaped_byte(output, byte, mode);
+        }
+    } else {
+        for ch in input.chars() {
+            append_html_attr_escaped_char(output, ch, mode);
+        }
     }
 }
 
 fn append_html_attr_escaped_byte(output: &mut String, byte: u8, mode: HtmlAttributeEscapeMode) {
-    append_html_attr_escaped_char(output, byte as char, mode);
+    match mode {
+        HtmlAttributeEscapeMode::Quoted => match byte {
+            b'&' => output.push_str("&amp;"),
+            b'<' => output.push_str("&lt;"),
+            b'>' => output.push_str("&gt;"),
+            b'"' => output.push_str("&#34;"),
+            b'\'' => output.push_str("&#39;"),
+            b'+' => output.push_str("&#43;"),
+            b'\0' => output.push('\u{FFFD}'),
+            _ => output.push(byte as char),
+        },
+        HtmlAttributeEscapeMode::Unquoted => match byte {
+            b'&' => output.push_str("&amp;"),
+            b'<' => output.push_str("&lt;"),
+            b'>' => output.push_str("&gt;"),
+            b'"' => output.push_str("&#34;"),
+            b'\'' => output.push_str("&#39;"),
+            b'`' => output.push_str("&#96;"),
+            b'=' => output.push_str("&#61;"),
+            b'+' => output.push_str("&#43;"),
+            b' ' => output.push_str("&#32;"),
+            b'\n' => output.push_str("&#10;"),
+            b'\r' => output.push_str("&#13;"),
+            b'\t' => output.push_str("&#9;"),
+            b'\0' => output.push_str("&#xfffd;"),
+            _ => output.push(byte as char),
+        },
+    }
 }
 
 fn append_url_attribute_encoded_and_escaped(
@@ -6625,11 +6705,11 @@ fn append_percent_encoded_and_escaped(
 
 fn escape_url_attribute_value_single_pass(
     value: &Value,
-    rendered_prefix: &str,
+    url_part: Option<UrlPartContext>,
     escape_mode: HtmlAttributeEscapeMode,
 ) -> String {
-    let raw = plain_string_cow_for_url(value);
-    let url_part = url_part_context(rendered_prefix).unwrap_or(UrlPartContext::Path);
+    let raw = plain_string_cow(value);
+    let url_part = url_part.unwrap_or(UrlPartContext::Path);
     let is_safe_value = matches!(value, Value::SafeUrl(_));
     if matches!(url_part, UrlPartContext::Path) && !is_safe_value && !is_safe_url(raw.as_ref()) {
         return "#ZgotmplZ".to_string();

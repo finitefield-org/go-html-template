@@ -118,6 +118,20 @@ Optimizations applied:
 |---|---:|---:|---:|---:|---|
 | range_no_vars | 60 | 3871 | 3443 | -11.1% | true |
 
+## URL/Attribute Escape Runtime Optimization
+
+Optimizations applied:
+- `escape_value_for_mode` now receives cached `url_part` from `ContextTracker` and avoids per-expression `url_part_context(rendered_prefix)` reparsing.
+- URL attribute escaping now uses the cached `url_part` hint directly.
+- HTML attribute escaping internals use byte-paths for ASCII (`append_html_attr_escaped_byte` fast path).
+
+### Before/After (same command, loops=10)
+
+| benchmark | before rust_execute_us | after rust_execute_us | change | output_match |
+|---|---:|---:|---:|---|
+| attr_20k | 16122 | 15567 | -3.4% | true |
+| url_20k | 23790 | 20420 | -14.2% | true |
+
 ## Template/Data Files Saved
 
 - Directory: `benchmarks/go_compare_cases`
