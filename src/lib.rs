@@ -7648,14 +7648,12 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                     }
                 } else if bytes[i] == b'/' && !in_char_class {
                     if is_script_tag_close_in_regexp(bytes, i) {
-                        output.push('/');
                         i += 1;
                         JsScanState::RegExp {
                             in_char_class,
                             js_ctx,
                         }
                     } else {
-                        output.push('/');
                         i += 1;
                         JsScanState::Expr { js_ctx }
                     }
@@ -7905,7 +7903,6 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                     }
                 } else if bytes[i] == b'/' && !in_char_class {
                     if is_script_tag_close_in_regexp(bytes, i) {
-                        output.push('/');
                         i += 1;
                         JsScanState::TemplateExprRegExp {
                             in_char_class,
@@ -7913,7 +7910,6 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
                             js_ctx,
                         }
                     } else {
-                        output.push('/');
                         i += 1;
                         JsScanState::TemplateExpr {
                             brace_depth,
@@ -11476,6 +11472,29 @@ mod tests {
         assert!(fake_close.is_none());
         assert_eq!(actual_close, expected_close);
         assert!(current_unclosed_tag_content(rendered, "script").is_none());
+    }
+
+    #[test]
+    fn script_adjacent_tags_do_not_duplicate_close_tag_slash() {
+        let template = Template::new("script")
+            .parse("<script>const x={{.X}};</script><script>const y={{.Y}};</script>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"X": "abc", "Y": "def"}))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            output,
+            "<script>const x=\"abc\";</script><script>const y=\"def\";</script>"
+        );
+        assert!(!output.contains("<//script>"));
+    }
+
+    #[test]
+    fn script_filter_preserves_regexp_literal_slashes() {
+        let filtered = filter_script_text("<script>", "const r=/ab/; const x = 1;");
+        assert_eq!(filtered, "const r=/ab/; const x = 1;");
     }
 
     #[test]
