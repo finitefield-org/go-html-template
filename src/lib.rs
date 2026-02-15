@@ -3784,7 +3784,7 @@ impl ContextTracker {
                 let Some(scan_state) = self.js_scan_state else {
                     return false;
                 };
-                if contains_ascii_case_insensitive(delta, b"</script") {
+                if contains_close_tag_hint(delta, b"script") {
                     if !matches!(scan_state, JsScanState::Expr { .. }) {
                         return false;
                     }
@@ -3823,7 +3823,7 @@ impl ContextTracker {
                 let Some(scan_state) = self.css_scan_state else {
                     return false;
                 };
-                if contains_ascii_case_insensitive(delta, b"</style") {
+                if contains_close_tag_hint(delta, b"style") {
                     let Some(close_start) = find_style_close_tag_with_state(delta, 0, scan_state)
                     else {
                         return false;
@@ -3866,7 +3866,7 @@ impl ContextTracker {
             let Some(scan_state) = self.js_scan_state else {
                 return false;
             };
-            if contains_ascii_case_insensitive(delta, b"</script") {
+            if contains_close_tag_hint(delta, b"script") {
                 if !matches!(scan_state, JsScanState::Expr { .. }) {
                     return false;
                 }
@@ -3895,7 +3895,7 @@ impl ContextTracker {
             let Some(scan_state) = self.css_scan_state else {
                 return false;
             };
-            if contains_ascii_case_insensitive(delta, b"</style") {
+            if contains_close_tag_hint(delta, b"style") {
                 let Some(close_start) = find_style_close_tag_with_state(delta, 0, scan_state)
                 else {
                     return false;
@@ -4131,13 +4131,13 @@ impl ContextTracker {
         }
         if self.state.is_script_tag_context()
             && matches!(self.js_scan_state, Some(JsScanState::Expr { .. }))
-            && !contains_ascii_case_insensitive(delta, b"</script")
+            && !contains_close_tag_hint(delta, b"script")
         {
             return true;
         }
         if self.state.is_style_tag_context()
             && matches!(self.css_scan_state, Some(CssScanState::Expr))
-            && !contains_ascii_case_insensitive(delta, b"</style")
+            && !contains_close_tag_hint(delta, b"style")
         {
             return true;
         }
@@ -4173,6 +4173,35 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
         .as_bytes()
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn contains_close_tag_hint(haystack: &str, tag: &[u8]) -> bool {
+    if tag.is_empty() {
+        return true;
+    }
+
+    let bytes = haystack.as_bytes();
+    let required_len = 2 + tag.len();
+    if bytes.len() < required_len {
+        return false;
+    }
+
+    let mut i = 0usize;
+    while i + required_len <= bytes.len() {
+        let Some(offset) = bytes[i..].iter().position(|byte| *byte == b'<') else {
+            return false;
+        };
+        i += offset;
+        if i + required_len > bytes.len() {
+            return false;
+        }
+        if bytes[i + 1] == b'/' && bytes[i + 2..i + 2 + tag.len()].eq_ignore_ascii_case(tag) {
+            return true;
+        }
+        i += 1;
+    }
+
+    false
 }
 
 fn incremental_scan_state_from_rendered(
@@ -4506,14 +4535,23 @@ fn prepared_text_plan_cache_key(
     })
 }
 
+#[cfg(test)]
 fn text_transition_cache_key(
     tracker: &ContextTracker,
     text: &str,
 ) -> Option<TextTransitionCacheKey> {
-    if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
+    let key = text_transition_cache_lookup_key(tracker, text)?;
+    if !text_transition_cache_is_eligible(tracker, text) {
         return None;
     }
-    if !text_transition_cache_is_eligible(tracker, text) {
+    Some(key)
+}
+
+fn text_transition_cache_lookup_key(
+    tracker: &ContextTracker,
+    text: &str,
+) -> Option<TextTransitionCacheKey> {
+    if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
         return None;
     }
 
@@ -4578,7 +4616,7 @@ fn text_transition_cache_is_eligible(tracker: &ContextTracker, text: &str) -> bo
         let Some(scan_state) = tracker.js_scan_state else {
             return false;
         };
-        if contains_ascii_case_insensitive(text, b"</script") {
+        if contains_close_tag_hint(text, b"script") {
             if !matches!(scan_state, JsScanState::Expr { .. }) {
                 return false;
             }
@@ -4591,7 +4629,7 @@ fn text_transition_cache_is_eligible(tracker: &ContextTracker, text: &str) -> bo
         let Some(scan_state) = tracker.css_scan_state else {
             return false;
         };
-        if contains_ascii_case_insensitive(text, b"</style") {
+        if contains_close_tag_hint(text, b"style") {
             return find_style_close_tag_with_state(text, 0, scan_state).is_some();
         }
         return true;
@@ -4965,8 +5003,8 @@ impl<'a> ParseContextAnalyzer<'a> {
             }
         }
 
-        let cache_key = text_transition_cache_key(tracker, &text_node.raw);
-        if let Some(key) = cache_key.as_ref()
+        let cache_lookup_key = text_transition_cache_lookup_key(tracker, &text_node.raw);
+        if let Some(key) = cache_lookup_key.as_ref()
             && let Some(cached) = self
                 .text_transition_cache
                 .get(key)
@@ -4977,7 +5015,7 @@ impl<'a> ParseContextAnalyzer<'a> {
         }
 
         let update_rendered_tail = tracker.append_text_for_parse(&text_node.raw);
-        if let Some(key) = cache_key
+        if let Some(key) = cache_lookup_key
             && let Some(cached) =
                 text_transition_cache_value(tracker, &text_node.raw, update_rendered_tail)
         {
