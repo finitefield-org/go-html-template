@@ -3690,6 +3690,45 @@ fn lookup_path_with_methods(
         return Ok(base.clone());
     }
 
+    // Fast path: when traversing pure JSON objects/arrays, walk by reference
+    // and clone only once at the end.
+    if let Value::Json(base_json) = base {
+        let mut current_json = base_json;
+
+        for (index, segment) in path.iter().enumerate() {
+            let direct = match current_json {
+                JsonValue::Object(map) => map.get(segment),
+                JsonValue::Array(items) => segment
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|item_index| items.get(item_index)),
+                _ => None,
+            };
+
+            if let Some(next_json) = direct {
+                current_json = next_json;
+                continue;
+            }
+
+            if let Some(method) = methods.get(segment) {
+                let receiver = Value::Json(current_json.clone());
+                let mut current = method(&receiver, &[])?;
+                for remaining in &path[index + 1..] {
+                    current =
+                        lookup_single_segment(&current, remaining, methods, missing_key_mode)?;
+                }
+                return Ok(current);
+            }
+
+            return match current_json {
+                JsonValue::Object(_) => missing_value_for_key(segment, missing_key_mode),
+                _ => Ok(Value::Json(JsonValue::Null)),
+            };
+        }
+
+        return Ok(Value::Json(current_json.clone()));
+    }
+
     let mut current = base.clone();
     for segment in path {
         current = lookup_single_segment(&current, segment, methods, missing_key_mode)?;
