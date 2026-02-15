@@ -3998,7 +3998,11 @@ impl<'a> ParseContextAnalyzer<'a> {
 
         let analysis = (|| -> Result<ContextState> {
             let start_tracker = ContextTracker::from_state(start_state.clone());
-            let flows = self.analyze_nodes(&mut nodes, start_tracker, false)?;
+            let flows = if is_linear_text_expr_nodes(&nodes) {
+                self.analyze_linear_text_expr_nodes(&mut nodes, start_tracker)?
+            } else {
+                self.analyze_nodes(&mut nodes, start_tracker, false)?
+            };
 
             let mut normal_states = HashSet::new();
             for flow in &flows {
@@ -4042,6 +4046,24 @@ impl<'a> ParseContextAnalyzer<'a> {
         let end_state = analysis?;
         self.end_states.insert(name.to_string(), end_state.clone());
         Ok(end_state)
+    }
+
+    fn analyze_linear_text_expr_nodes(
+        &mut self,
+        nodes: &mut [Node],
+        mut tracker: ContextTracker,
+    ) -> Result<Vec<AnalysisFlow>> {
+        for node in nodes {
+            match node {
+                Node::Text(text_node) => self.apply_text_node_transition(text_node, &mut tracker),
+                Node::Expr {
+                    mode, runtime_mode, ..
+                } => self.apply_expr_node_transition(mode, runtime_mode, &mut tracker)?,
+                _ => unreachable!("linear fast path must only receive text/expr nodes"),
+            }
+        }
+
+        Ok(vec![AnalysisFlow::normal(tracker)])
     }
 
     fn analyze_nodes(
@@ -4105,56 +4127,7 @@ impl<'a> ParseContextAnalyzer<'a> {
     ) -> Result<Vec<AnalysisFlow>> {
         match node {
             Node::Text(text_node) => {
-                if text_node.prepared.is_none() {
-                    let prepared_cache_key = prepared_text_plan_cache_key(&tracker, &text_node.raw);
-                    if let Some(key) = prepared_cache_key.as_ref()
-                        && let Some(cached) = self
-                            .prepared_text_plan_cache
-                            .get(key)
-                            .and_then(|entries| entries.get(text_node.raw.as_str()))
-                    {
-                        text_node.prepared = cached.clone();
-                    }
-
-                    if text_node.prepared.is_none()
-                        && should_prepare_text_plan_for_script_style(&tracker.state, &text_node.raw)
-                    {
-                        let prepared = prepare_text_plan_for_script_style(
-                            &tracker.state,
-                            &tracker,
-                            &text_node.raw,
-                        )
-                        .map(Arc::new);
-                        if let Some(key) = prepared_cache_key {
-                            self.prepared_text_plan_cache
-                                .entry(key)
-                                .or_default()
-                                .insert(text_node.raw.to_string(), prepared.clone());
-                        }
-                        text_node.prepared = prepared;
-                    }
-                }
-
-                let cache_key = text_transition_cache_key(&tracker, &text_node.raw);
-                if let Some(key) = cache_key.as_ref()
-                    && let Some(cached) = self
-                        .text_transition_cache
-                        .get(key)
-                        .and_then(|entries| entries.get(text_node.raw.as_str()))
-                {
-                    apply_text_transition_cache_value(&mut tracker, cached);
-                    return Ok(vec![AnalysisFlow::normal(tracker)]);
-                }
-
-                tracker.append_text_for_parse(&text_node.raw);
-                if let Some(key) = cache_key
-                    && let Some(cached) = text_transition_cache_value(&tracker, &text_node.raw)
-                {
-                    self.text_transition_cache
-                        .entry(key)
-                        .or_default()
-                        .insert(text_node.raw.to_string(), cached);
-                }
+                self.apply_text_node_transition(text_node, &mut tracker);
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::Expr {
@@ -4162,15 +4135,7 @@ impl<'a> ParseContextAnalyzer<'a> {
                 mode,
                 runtime_mode,
             } => {
-                if should_validate_action_context(&tracker) {
-                    validate_action_context_before_insertion(&tracker)?;
-                }
-                let escape_mode = tracker.mode();
-                *mode = escape_mode;
-                *runtime_mode = should_resolve_expr_mode_at_runtime(escape_mode, &tracker);
-                if placeholder_advances_parse_context(&tracker, escape_mode) {
-                    tracker.append_expr_placeholder_for_parse(escape_mode);
-                }
+                self.apply_expr_node_transition(mode, runtime_mode, &mut tracker)?;
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::SetVar { .. } | Node::Define { .. } => Ok(vec![AnalysisFlow::normal(tracker)]),
@@ -4294,6 +4259,80 @@ impl<'a> ParseContextAnalyzer<'a> {
             }
         }
     }
+
+    fn apply_text_node_transition(&mut self, text_node: &mut TextNode, tracker: &mut ContextTracker) {
+        if text_node.prepared.is_none() {
+            let prepared_cache_key = prepared_text_plan_cache_key(tracker, &text_node.raw);
+            if let Some(key) = prepared_cache_key.as_ref()
+                && let Some(cached) = self
+                    .prepared_text_plan_cache
+                    .get(key)
+                    .and_then(|entries| entries.get(text_node.raw.as_str()))
+            {
+                text_node.prepared = cached.clone();
+            }
+
+            if text_node.prepared.is_none()
+                && should_prepare_text_plan_for_script_style(&tracker.state, &text_node.raw)
+            {
+                let prepared =
+                    prepare_text_plan_for_script_style(&tracker.state, tracker, &text_node.raw)
+                        .map(Arc::new);
+                if let Some(key) = prepared_cache_key {
+                    self.prepared_text_plan_cache
+                        .entry(key)
+                        .or_default()
+                        .insert(text_node.raw.to_string(), prepared.clone());
+                }
+                text_node.prepared = prepared;
+            }
+        }
+
+        let cache_key = text_transition_cache_key(tracker, &text_node.raw);
+        if let Some(key) = cache_key.as_ref()
+            && let Some(cached) = self
+                .text_transition_cache
+                .get(key)
+                .and_then(|entries| entries.get(text_node.raw.as_str()))
+        {
+            apply_text_transition_cache_value(tracker, cached);
+            return;
+        }
+
+        tracker.append_text_for_parse(&text_node.raw);
+        if let Some(key) = cache_key
+            && let Some(cached) = text_transition_cache_value(tracker, &text_node.raw)
+        {
+            self.text_transition_cache
+                .entry(key)
+                .or_default()
+                .insert(text_node.raw.to_string(), cached);
+        }
+    }
+
+    fn apply_expr_node_transition(
+        &self,
+        mode: &mut EscapeMode,
+        runtime_mode: &mut bool,
+        tracker: &mut ContextTracker,
+    ) -> Result<()> {
+        if should_validate_action_context(tracker) {
+            validate_action_context_before_insertion(tracker)?;
+        }
+        let escape_mode = tracker.mode();
+        *mode = escape_mode;
+        *runtime_mode = should_resolve_expr_mode_at_runtime(escape_mode, tracker);
+        if placeholder_advances_parse_context(tracker, escape_mode) {
+            tracker.append_expr_placeholder_for_parse(escape_mode);
+        }
+        Ok(())
+    }
+}
+
+fn is_linear_text_expr_nodes(nodes: &[Node]) -> bool {
+    nodes
+        .iter()
+        .all(|node| matches!(node, Node::Text(_) | Node::Expr { .. }))
 }
 
 fn dedup_analysis_flows(flows: Vec<AnalysisFlow>) -> Vec<AnalysisFlow> {
