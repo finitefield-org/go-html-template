@@ -1348,9 +1348,17 @@ impl Template {
             return Ok((ParseTree { nodes: Vec::new() }, None));
         }
 
-        let has_left_delim = text.contains(left_delim);
+        let (has_left_delim, no_default_delim_scan) =
+            if left_delim == "{{" && right_delim == "}}" {
+                match scan_text_summary_if_no_default_delim(text) {
+                    Some(scan) => (false, Some(scan)),
+                    None => (true, None),
+                }
+            } else {
+                (text.contains(left_delim), None)
+            };
         if !has_left_delim {
-            let scan = scan_text_summary(text);
+            let scan = no_default_delim_scan.unwrap_or_else(|| scan_text_summary(text));
             if scan.has_lt && scan.has_eq {
                 validate_unquoted_attr_hazards(text, scan.has_lt, scan.has_eq)?;
             }
@@ -1449,9 +1457,17 @@ impl Template {
             return Ok((ParseTree { nodes: Vec::new() }, None));
         }
 
-        let has_left_delim = text.contains(left_delim);
+        let (has_left_delim, no_default_delim_scan) =
+            if left_delim == "{{" && right_delim == "}}" {
+                match scan_text_summary_if_no_default_delim(&text) {
+                    Some(scan) => (false, Some(scan)),
+                    None => (true, None),
+                }
+            } else {
+                (text.contains(left_delim), None)
+            };
         if !has_left_delim {
-            let scan = scan_text_summary(&text);
+            let scan = no_default_delim_scan.unwrap_or_else(|| scan_text_summary(&text));
             if scan.has_lt && scan.has_eq {
                 validate_unquoted_attr_hazards(&text, scan.has_lt, scan.has_eq)?;
             }
@@ -6646,6 +6662,48 @@ fn scan_text_summary(text: &str) -> TextScanSummary {
     summary
 }
 
+fn scan_text_summary_if_no_default_delim(text: &str) -> Option<TextScanSummary> {
+    let bytes = text.as_bytes();
+    let mut summary = TextScanSummary::default();
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'{' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            return None;
+        }
+
+        match byte {
+            b'<' => {
+                summary.has_lt = true;
+                if i + 3 < bytes.len()
+                    && bytes[i + 1] == b'!'
+                    && bytes[i + 2] == b'-'
+                    && bytes[i + 3] == b'-'
+                {
+                    summary.has_comment_open = true;
+                }
+            }
+            b'=' => summary.has_eq = true,
+            b'\'' => summary.has_single_quote = true,
+            b'"' => summary.has_double_quote = true,
+            b'`' => summary.has_backtick = true,
+            b's' | b'S' => summary.has_s = true,
+            b't' | b'T' => summary.has_t = true,
+            b'-' => {
+                if i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] == b'>' {
+                    summary.has_comment_close = true;
+                }
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    Some(summary)
+}
+
 fn deferred_text_only_context_analysis(text: &str, scan: &TextScanSummary) -> bool {
     if scan.has_eq
         || scan.has_single_quote
@@ -6670,6 +6728,9 @@ fn deferred_text_only_context_analysis(text: &str, scan: &TextScanSummary) -> bo
 
 fn cacheable_text_only_output(text: &str, scan: &TextScanSummary) -> bool {
     if !scan.has_lt {
+        return true;
+    }
+    if !scan.has_s && !scan.has_t {
         return true;
     }
     !contains_script_or_style_tag(text)
