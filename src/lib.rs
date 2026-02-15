@@ -559,11 +559,9 @@ impl TemplateDependencyGraph {
         let mut roots = affected
             .iter()
             .filter(|name| {
-                self.reverse
-                    .get(*name)
-                    .map_or(true, |callers| {
-                        !callers.iter().any(|caller| affected.contains(caller))
-                    })
+                self.reverse.get(*name).map_or(true, |callers| {
+                    !callers.iter().any(|caller| affected.contains(caller))
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -584,9 +582,41 @@ impl TemplateDependencyGraph {
 }
 
 #[derive(Clone)]
+struct TemplateParseMeta {
+    text_only: bool,
+    defer_text_only_context_analysis: bool,
+    cacheable_text_only_output: bool,
+}
+
+impl TemplateParseMeta {
+    fn from_nodes(nodes: &[Node]) -> Self {
+        let text_only = nodes.iter().all(|node| matches!(node, Node::Text(_)));
+        if !text_only {
+            return Self {
+                text_only: false,
+                defer_text_only_context_analysis: false,
+                cacheable_text_only_output: false,
+            };
+        }
+
+        let defer_text_only_context_analysis = text_only_nodes_allow_deferred_analysis(nodes);
+        let cacheable_text_only_output = single_text_node_raw(nodes)
+            .map(is_text_only_output_cacheable)
+            .unwrap_or(false);
+
+        Self {
+            text_only: true,
+            defer_text_only_context_analysis,
+            cacheable_text_only_output,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct TemplateNameSpace {
     templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
     template_dependency_graph: Arc<RwLock<TemplateDependencyGraph>>,
+    template_parse_meta: Arc<RwLock<HashMap<String, TemplateParseMeta>>>,
     text_only_candidates: Arc<RwLock<HashSet<String>>>,
     text_only_outputs: Arc<RwLock<HashMap<String, String>>>,
     context_analysis_ready: Arc<AtomicBool>,
@@ -604,6 +634,7 @@ impl TemplateNameSpace {
         Self {
             templates: Arc::new(RwLock::new(HashMap::new())),
             template_dependency_graph: Arc::new(RwLock::new(TemplateDependencyGraph::default())),
+            template_parse_meta: Arc::new(RwLock::new(HashMap::new())),
             text_only_candidates: Arc::new(RwLock::new(HashSet::new())),
             text_only_outputs: Arc::new(RwLock::new(HashMap::new())),
             context_analysis_ready: Arc::new(AtomicBool::new(true)),
@@ -721,6 +752,7 @@ impl Template {
             .read()
             .unwrap()
             .clone();
+        let template_parse_meta = self.name_space.template_parse_meta.read().unwrap().clone();
         let text_only_candidates = self.name_space.text_only_candidates.read().unwrap().clone();
         let text_only_outputs = self.name_space.text_only_outputs.read().unwrap().clone();
         let context_analysis_ready = self
@@ -736,6 +768,7 @@ impl Template {
             name_space: TemplateNameSpace {
                 templates: Arc::new(RwLock::new(templates)),
                 template_dependency_graph: Arc::new(RwLock::new(template_dependency_graph)),
+                template_parse_meta: Arc::new(RwLock::new(template_parse_meta)),
                 text_only_candidates: Arc::new(RwLock::new(text_only_candidates)),
                 text_only_outputs: Arc::new(RwLock::new(text_only_outputs)),
                 context_analysis_ready: Arc::new(AtomicBool::new(context_analysis_ready)),
@@ -992,24 +1025,38 @@ impl Template {
         }
     }
 
-    fn all_templates_are_text_only(&self) -> bool {
-        self.name_space
-            .templates
-            .read()
-            .unwrap()
-            .values()
-            .all(|nodes| nodes.iter().all(|node| matches!(node, Node::Text(_))))
-    }
-
-    fn can_defer_text_only_context_analysis(&self) -> bool {
+    fn deferred_text_only_candidates(&self) -> Option<HashSet<String>> {
         let templates = self.name_space.templates.read().unwrap();
-        templates
-            .values()
-            .all(|nodes| text_only_nodes_allow_deferred_analysis(nodes))
+        if templates.is_empty() {
+            return Some(HashSet::new());
+        }
+
+        let parse_meta = self.name_space.template_parse_meta.read().unwrap();
+        if parse_meta.len() < templates.len() {
+            return None;
+        }
+
+        let mut candidates = HashSet::new();
+        for name in templates.keys() {
+            let meta = parse_meta.get(name)?;
+            if !meta.text_only || !meta.defer_text_only_context_analysis {
+                return None;
+            }
+            if meta.cacheable_text_only_output {
+                candidates.insert(name.clone());
+            }
+        }
+
+        Some(candidates)
     }
 
     fn finalize_contexts_after_parse(&self) -> Result<()> {
-        if self.all_templates_are_text_only() && self.can_defer_text_only_context_analysis() {
+        if let Some(text_only_candidates) = self.deferred_text_only_candidates() {
+            *self.name_space.text_only_candidates.write().unwrap() = text_only_candidates;
+            self.name_space.text_only_outputs.write().unwrap().clear();
+            self.name_space
+                .context_analysis_ready
+                .store(true, AtomicOrdering::SeqCst);
             return Ok(());
         }
         self.reanalyze_contexts()?;
@@ -1045,7 +1092,11 @@ impl Template {
     }
 
     fn clear_text_only_output_cache(&self) {
-        self.name_space.text_only_candidates.write().unwrap().clear();
+        self.name_space
+            .text_only_candidates
+            .write()
+            .unwrap()
+            .clear();
         self.name_space.text_only_outputs.write().unwrap().clear();
         self.name_space
             .context_analysis_ready
@@ -1288,8 +1339,9 @@ impl Template {
                     if !is_empty_template_body(&body) || !templates.contains_key(&defined_name) {
                         let template_name = defined_name.clone();
                         let dependencies = collect_template_call_dependencies(&body);
+                        let parse_meta = TemplateParseMeta::from_nodes(&body);
                         templates.insert(template_name.clone(), body);
-                        changed_templates.push((template_name, dependencies));
+                        changed_templates.push((template_name, dependencies, parse_meta));
                     }
                 }
                 Node::Block {
@@ -1299,8 +1351,9 @@ impl Template {
                 } => {
                     if !templates.contains_key(&block_name) {
                         let dependencies = collect_template_call_dependencies(&body);
+                        let parse_meta = TemplateParseMeta::from_nodes(&body);
                         templates.insert(block_name.clone(), body.clone());
-                        changed_templates.push((block_name.clone(), dependencies));
+                        changed_templates.push((block_name.clone(), dependencies, parse_meta));
                     }
                     root_nodes.push(Node::TemplateCall {
                         name: block_name,
@@ -1313,14 +1366,17 @@ impl Template {
 
         if !root_nodes.is_empty() || !templates.contains_key(name) {
             let root_dependencies = collect_template_call_dependencies(&root_nodes);
+            let root_parse_meta = TemplateParseMeta::from_nodes(&root_nodes);
             templates.insert(name.to_string(), root_nodes);
-            changed_templates.push((name.to_string(), root_dependencies));
+            changed_templates.push((name.to_string(), root_dependencies, root_parse_meta));
         }
 
         if !changed_templates.is_empty() {
             let mut dependency_graph = self.name_space.template_dependency_graph.write().unwrap();
-            for (template_name, dependencies) in changed_templates {
+            let mut parse_meta_map = self.name_space.template_parse_meta.write().unwrap();
+            for (template_name, dependencies, parse_meta) in changed_templates {
                 dependency_graph.update_template_calls(&template_name, dependencies);
+                parse_meta_map.insert(template_name, parse_meta);
             }
         }
     }
@@ -1386,7 +1442,8 @@ impl Template {
                 text_only_candidates
             } else {
                 let (affected_templates, analysis_roots) = {
-                    let dependency_graph = self.name_space.template_dependency_graph.read().unwrap();
+                    let dependency_graph =
+                        self.name_space.template_dependency_graph.read().unwrap();
                     let affected =
                         dependency_graph.affected_templates_for_reanalysis(&self.name, &templates);
                     let roots = dependency_graph.reanalysis_roots(&affected);
@@ -1417,7 +1474,8 @@ impl Template {
                         if !known_templates.contains(&name) || analyzer.has_analysis(&name) {
                             continue;
                         }
-                        let end_state = analyzer.analyze_template(&name, ContextState::html_text())?;
+                        let end_state =
+                            analyzer.analyze_template(&name, ContextState::html_text())?;
                         if name == self.name && !end_state.is_text_context() {
                             return Err(TemplateError::Parse(format!(
                                 "template `{}` ends in a non-text context",
@@ -2384,7 +2442,11 @@ fn collect_template_call_dependencies(nodes: &[Node]) -> HashSet<String> {
 fn collect_template_call_dependencies_into(nodes: &[Node], dependencies: &mut HashSet<String>) {
     for node in nodes {
         match node {
-            Node::Text(_) | Node::Expr { .. } | Node::SetVar { .. } | Node::Break | Node::Continue => {}
+            Node::Text(_)
+            | Node::Expr { .. }
+            | Node::SetVar { .. }
+            | Node::Break
+            | Node::Continue => {}
             Node::If {
                 then_branch,
                 else_branch,
@@ -5699,24 +5761,33 @@ fn text_only_nodes_allow_deferred_analysis(nodes: &[Node]) -> bool {
     };
 
     let bytes = text.as_bytes();
-    if bytes.contains(&b'=')
-        || bytes.contains(&b'"')
-        || bytes.contains(&b'\'')
-        || bytes.contains(&b'`')
-    {
-        return false;
+    let mut has_s = false;
+    let mut has_t = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match byte {
+            b'=' | b'"' | b'\'' | b'`' => return false,
+            b's' | b'S' => has_s = true,
+            b't' | b'T' => has_t = true,
+            _ => {}
+        }
+
+        if byte == b'<' && i + 3 < bytes.len() {
+            if bytes[i + 1] == b'!' && bytes[i + 2] == b'-' && bytes[i + 3] == b'-' {
+                return false;
+            }
+        } else if byte == b'-'
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b'-'
+            && bytes[i + 2] == b'>'
+        {
+            return false;
+        }
+
+        i += 1;
     }
 
-    if text.contains("<!--") || text.contains("-->") {
-        return false;
-    }
-
-    let has_s = bytes
-        .iter()
-        .any(|byte| *byte == b's' || *byte == b'S');
-    let has_t = bytes
-        .iter()
-        .any(|byte| *byte == b't' || *byte == b'T');
     if !has_s && !has_t {
         return true;
     }
@@ -6424,7 +6495,10 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
     while let Some(start_offset) = source[cursor..].find(left_delim) {
         let start = cursor + start_offset;
         if start > cursor {
-            tokens.push(Token::Text { start: cursor, end: start });
+            tokens.push(Token::Text {
+                start: cursor,
+                end: start,
+            });
         }
 
         let mut action_start = start + left_delim.len();
@@ -6452,12 +6526,14 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
         let trim_right = action_start_trimmed < action_end_trimmed
             && source[action_start_trimmed..action_end_trimmed].ends_with('-');
         if trim_right {
-            action_end_trimmed = previous_char_boundary(source, action_start_trimmed, action_end_trimmed);
+            action_end_trimmed =
+                previous_char_boundary(source, action_start_trimmed, action_end_trimmed);
             action_end_trimmed =
                 trim_end_whitespace(source, action_start_trimmed, action_end_trimmed);
         }
 
-        action_start_trimmed = trim_start_whitespace(source, action_start_trimmed, action_end_trimmed);
+        action_start_trimmed =
+            trim_start_whitespace(source, action_start_trimmed, action_end_trimmed);
         tokens.push(Token::Action {
             start: action_start_trimmed,
             end: action_end_trimmed,
@@ -6740,8 +6816,7 @@ fn parse_if_from_condition(
                         ));
                     }
                     let else_if_condition = parse_expression(tail)?;
-                    let nested =
-                        parse_if_from_condition(source, tokens, index, else_if_condition)?;
+                    let nested = parse_if_from_condition(source, tokens, index, else_if_condition)?;
                     else_branch.push(nested);
                 } else {
                     return Err(TemplateError::Parse(format!(
@@ -19902,6 +19977,56 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
         };
 
         assert!(error.to_string().contains("non-text context"));
+    }
+
+    #[test]
+    fn parse_text_only_fast_path_marks_context_ready_and_cache_candidate() {
+        let source = "<ul>".to_string() + &"<li>x</li>".repeat(100) + "</ul>";
+        let template = Template::new("static")
+            .parse(&source)
+            .expect("parse should succeed");
+
+        assert!(
+            template
+                .name_space
+                .context_analysis_ready
+                .load(AtomicOrdering::SeqCst)
+        );
+        assert!(
+            template
+                .name_space
+                .text_only_candidates
+                .read()
+                .unwrap()
+                .contains("static")
+        );
+    }
+
+    #[test]
+    fn parse_meta_is_updated_when_template_switches_from_text_only_to_dynamic() {
+        let template = Template::new("switch")
+            .parse("hello")
+            .expect("first parse should succeed");
+        assert!(
+            template
+                .name_space
+                .text_only_candidates
+                .read()
+                .unwrap()
+                .contains("switch")
+        );
+
+        let template = template
+            .parse("{{.Name}}")
+            .expect("second parse should succeed");
+        assert!(
+            !template
+                .name_space
+                .text_only_candidates
+                .read()
+                .unwrap()
+                .contains("switch")
+        );
     }
 
     #[test]
