@@ -2693,6 +2693,20 @@ impl ContextTracker {
         }
     }
 
+    fn append_text_for_parse(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let previous_mode = self.state.mode;
+        self.refresh_cached_state_with_delta_for_parse(text);
+        self.refresh_dynamic_attr_runtime_flag(previous_mode);
+        self.update_rendered_tail_for_parse(text);
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
+        }
+    }
+
     fn append_known_script_close_tag(&mut self, close_tag: &str) {
         self.append_known_script_close_tag_with_suffix(close_tag, "");
     }
@@ -2755,6 +2769,20 @@ impl ContextTracker {
         }
     }
 
+    fn append_expr_placeholder_for_parse(&mut self, mode: EscapeMode) {
+        let previous_mode = self.state.mode;
+        let placeholder = placeholder_for_mode(mode);
+        self.refresh_cached_state_with_delta_for_parse(placeholder);
+        if matches!(mode, EscapeMode::AttrName) {
+            self.attr_name_dynamic_pending = true;
+        }
+        self.refresh_dynamic_attr_runtime_flag(previous_mode);
+        self.update_rendered_tail_for_parse(placeholder);
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
+        }
+    }
+
     fn refresh_dynamic_attr_runtime_flag(&mut self, previous_mode: EscapeMode) {
         let current_mode = self.state.mode;
         let was_attr_value = is_attr_value_mode(previous_mode);
@@ -2781,6 +2809,25 @@ impl ContextTracker {
             return;
         }
         self.refresh_cached_state_full();
+    }
+
+    fn refresh_cached_state_with_delta_for_parse(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.try_refresh_cached_state_incremental(delta) {
+            return;
+        }
+        if self.state.in_open_tag
+            || matches!(self.state.mode, EscapeMode::AttrName)
+            || self.js_scan_state.is_some()
+            || self.css_scan_state.is_some()
+            || self.script_json
+        {
+            self.refresh_cached_state_with_rendered_tail_delta_for_parse(delta);
+        } else {
+            self.refresh_cached_state_seeded_delta(delta);
+        }
     }
 
     fn refresh_cached_state_full(&mut self) {
@@ -3054,12 +3101,24 @@ impl ContextTracker {
     }
 
     fn try_refresh_cached_state_seeded_delta(&mut self, delta: &str) -> bool {
+        self.refresh_cached_state_seeded_delta(delta);
+        true
+    }
+
+    fn refresh_cached_state_seeded_delta(&mut self, delta: &str) {
         let mut rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
         rendered.push_str(delta);
         self.state = ContextState::from_rendered(&rendered);
         self.url_part = url_part_from_mode_and_rendered(self.state.mode, &rendered);
         self.sync_incremental_scan_state_from_rendered(&rendered);
-        true
+    }
+
+    fn refresh_cached_state_with_rendered_tail_delta_for_parse(&mut self, delta: &str) {
+        let mut rendered = self.rendered.clone();
+        rendered.push_str(delta);
+        self.state = ContextState::from_rendered(&rendered);
+        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &rendered);
+        self.sync_incremental_scan_state_from_rendered(&rendered);
     }
 
     fn refresh_cached_state_from_fragment(&mut self, fragment: &str) {
@@ -3088,6 +3147,33 @@ impl ContextTracker {
         self.rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
         self.sync_incremental_scan_state();
     }
+
+    fn update_rendered_tail_for_parse(&mut self, delta: &str) {
+        if delta.is_empty() || should_normalize_tracker_state(&self.state) {
+            return;
+        }
+
+        self.rendered.push_str(delta);
+        truncate_to_char_boundary_tail(&mut self.rendered, PARSE_TRACKER_RENDERED_TAIL_MAX);
+    }
+}
+
+const PARSE_TRACKER_RENDERED_TAIL_MAX: usize = 2048;
+
+fn truncate_to_char_boundary_tail(value: &mut String, max_len: usize) {
+    if value.len() <= max_len {
+        return;
+    }
+
+    let mut start = value.len().saturating_sub(max_len);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    if start >= value.len() {
+        value.clear();
+        return;
+    }
+    value.drain(..start);
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
@@ -3567,7 +3653,7 @@ impl<'a> ParseContextAnalyzer<'a> {
                     return Ok(vec![AnalysisFlow::normal(tracker)]);
                 }
 
-                tracker.append_text(&text_node.raw);
+                tracker.append_text_for_parse(&text_node.raw);
                 if let Some(key) = cache_key
                     && let Some(cached) = text_transition_cache_value(&tracker, &text_node.raw)
                 {
@@ -3590,7 +3676,7 @@ impl<'a> ParseContextAnalyzer<'a> {
                 *mode = escape_mode;
                 *runtime_mode = should_resolve_expr_mode_at_runtime(escape_mode, &tracker);
                 if placeholder_advances_parse_context(&tracker, escape_mode) {
-                    tracker.append_expr_placeholder(escape_mode);
+                    tracker.append_expr_placeholder_for_parse(escape_mode);
                 }
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
@@ -3669,7 +3755,7 @@ impl<'a> ParseContextAnalyzer<'a> {
                 let start_state = tracker.state();
                 let end_state = self.analyze_template(name, start_state.clone())?;
                 if start_state == end_state {
-                    tracker.append_expr_placeholder(end_state.mode);
+                    tracker.append_expr_placeholder_for_parse(end_state.mode);
                     Ok(vec![AnalysisFlow::normal(tracker)])
                 } else {
                     Ok(vec![AnalysisFlow::normal(ContextTracker::from_state(
@@ -3722,35 +3808,19 @@ fn dedup_analysis_flows(flows: Vec<AnalysisFlow>) -> Vec<AnalysisFlow> {
     let mut seen = HashSet::new();
 
     for flow in flows {
-        let state = flow.tracker.state();
-        let rendered_key = match state.mode {
-            EscapeMode::AttrName
-            | EscapeMode::AttrQuoted { .. }
-            | EscapeMode::AttrUnquoted { .. } => flow.tracker.rendered.clone(),
-            EscapeMode::ScriptExpr
-            | EscapeMode::ScriptString { .. }
-            | EscapeMode::ScriptJsonString { .. }
-            | EscapeMode::ScriptTemplate
-            | EscapeMode::ScriptRegexp
-            | EscapeMode::ScriptLineComment
-            | EscapeMode::ScriptBlockComment
-            | EscapeMode::StyleExpr
-            | EscapeMode::StyleString { .. }
-            | EscapeMode::StyleLineComment
-            | EscapeMode::StyleBlockComment => flow.tracker.rendered.clone(),
-            _ => String::new(),
-        };
-        let key = (flow.kind, state.clone(), rendered_key.clone());
+        let key = (
+            flow.kind,
+            flow.tracker.state(),
+            flow.tracker.url_part,
+            flow.tracker.js_scan_state,
+            flow.tracker.css_scan_state,
+            flow.tracker.script_json,
+            flow.tracker.attr_name_dynamic_pending,
+            flow.tracker.attr_value_from_dynamic_attr,
+        );
 
         if seen.insert(key) {
-            if rendered_key.is_empty() {
-                deduped.push(AnalysisFlow::with_kind(
-                    flow.kind,
-                    ContextTracker::from_state(state),
-                ));
-            } else {
-                deduped.push(flow);
-            }
+            deduped.push(flow);
         }
     }
 
@@ -3851,9 +3921,7 @@ where
         ) {
             continue;
         }
-        if let Some(part) = url_part_context(&flow.tracker.rendered) {
-            url_parts.insert(part);
-        }
+        url_parts.insert(flow.tracker.url_part.unwrap_or(UrlPartContext::Path));
     }
     url_parts.len() > 1
 }
@@ -5360,7 +5428,7 @@ fn analyze_text_only_segment(text: &str) -> (ContextTracker, bool) {
     }
 
     let mut tracker = ContextTracker::from_state(ContextState::html_text());
-    tracker.append_text(text);
+    tracker.append_text_for_parse(text);
     (tracker, cacheable_output)
 }
 
@@ -8821,7 +8889,7 @@ enum JsContext {
     DivOp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JsScanState {
     Expr {
         js_ctx: JsContext,
@@ -11257,7 +11325,7 @@ fn js_whitespace(ch: char) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CssScanState {
     Expr,
     SingleQuote {
