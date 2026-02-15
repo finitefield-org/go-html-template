@@ -1693,6 +1693,25 @@ pub fn html_escape_string(value: &str) -> String {
     escape_html(value)
 }
 
+pub fn escape_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '\'' => escaped.push_str("&#39;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&#34;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+pub fn unescape_string(value: &str) -> String {
+    unescape_html_entities(value)
+}
+
 pub fn html_escaper(args: &[Value]) -> String {
     let mut combined = String::new();
     for arg in args {
@@ -1722,7 +1741,7 @@ pub fn url_query_escaper(args: &[Value]) -> String {
     for arg in args {
         combined.push_str(&arg.to_plain_string());
     }
-    percent_encode_url(&combined)
+    query_escape_url(&combined)
 }
 
 #[allow(non_snake_case)]
@@ -1733,6 +1752,16 @@ pub fn HTMLEscape<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
 #[allow(non_snake_case)]
 pub fn HTMLEscapeString(value: &str) -> String {
     html_escape_string(value)
+}
+
+#[allow(non_snake_case)]
+pub fn EscapeString(value: &str) -> String {
+    escape_string(value)
+}
+
+#[allow(non_snake_case)]
+pub fn UnescapeString(value: &str) -> String {
+    unescape_string(value)
 }
 
 #[allow(non_snake_case)]
@@ -2798,7 +2827,7 @@ fn builtin_funcs() -> FuncMap {
             for arg in args {
                 combined.push_str(&arg.to_plain_string());
             }
-            Ok(Value::from(percent_encode_url(&combined)))
+            Ok(Value::from(query_escape_url(&combined)))
         }) as Function,
     );
 
@@ -9191,8 +9220,32 @@ fn percent_encode_url(input: &str) -> String {
     encoded
 }
 
+fn query_escape_url(input: &str) -> String {
+    let mut encoded = String::new();
+    for &byte in input.as_bytes() {
+        if is_unreserved_url_byte(byte) {
+            encoded.push(byte as char);
+        } else if byte == b' ' {
+            encoded.push('+');
+        } else {
+            encoded.push('%');
+            encoded.push(hex_upper((byte >> 4) & 0x0F));
+            encoded.push(hex_upper(byte & 0x0F));
+        }
+    }
+    encoded
+}
+
 fn is_unreserved_url_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+fn hex_upper(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'A' + (value - 10)) as char,
+        _ => '0',
+    }
 }
 
 fn hex_lower(value: u8) -> char {
@@ -9201,6 +9254,205 @@ fn hex_lower(value: u8) -> char {
         10..=15 => (b'a' + (value - 10)) as char,
         _ => '0',
     }
+}
+
+const LONGEST_ENTITY_WITHOUT_SEMICOLON: usize = 6;
+
+const NUMERIC_ENTITY_REPLACEMENTS: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+];
+
+const HTML_ENTITY_TABLE: &[(&str, char)] = &[
+    ("amp;", '&'),
+    ("amp", '&'),
+    ("lt;", '<'),
+    ("lt", '<'),
+    ("gt;", '>'),
+    ("gt", '>'),
+    ("quot;", '"'),
+    ("quot", '"'),
+    ("apos;", '\''),
+    ("copy;", '\u{00A9}'),
+    ("copy", '\u{00A9}'),
+    ("aacute;", '\u{00E1}'),
+    ("aacute", '\u{00E1}'),
+];
+
+const HTML_ENTITY_TABLE2: &[(&str, [char; 2])] = &[("gesl;", ['\u{22DB}', '\u{FE00}'])];
+
+fn entity_maps() -> (
+    &'static [(&'static str, char)],
+    &'static [(&'static str, [char; 2])],
+) {
+    (HTML_ENTITY_TABLE, HTML_ENTITY_TABLE2)
+}
+
+fn lookup_entity(name: &str) -> Option<char> {
+    HTML_ENTITY_TABLE
+        .iter()
+        .find_map(|(entity_name, value)| (*entity_name == name).then_some(*value))
+}
+
+fn lookup_entity2(name: &str) -> Option<[char; 2]> {
+    HTML_ENTITY_TABLE2
+        .iter()
+        .find_map(|(entity_name, value)| (*entity_name == name).then_some(*value))
+}
+
+fn decode_digit(byte: u8, hex: bool) -> Option<u8> {
+    if hex {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    } else {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            _ => None,
+        }
+    }
+}
+
+fn decode_numeric_entity(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+
+    let mut index = 2;
+    let mut hex = false;
+    if matches!(bytes.get(index), Some(b'x' | b'X')) {
+        hex = true;
+        index += 1;
+    }
+
+    let mut value: u64 = 0;
+    let mut matched_digits = 0usize;
+    while index < bytes.len() {
+        if let Some(digit) = decode_digit(bytes[index], hex) {
+            value = value
+                .saturating_mul(if hex { 16 } else { 10 })
+                .saturating_add(digit as u64);
+            matched_digits += 1;
+            index += 1;
+            continue;
+        }
+
+        if bytes[index] == b';' {
+            index += 1;
+        }
+        break;
+    }
+
+    if matched_digits == 0 {
+        return None;
+    }
+
+    let codepoint = if (0x80..=0x9F).contains(&value) {
+        NUMERIC_ENTITY_REPLACEMENTS[(value - 0x80) as usize] as u32
+    } else if value == 0 || (0xD800..=0xDFFF).contains(&(value as u32)) || value > 0x10_FFFF {
+        '\u{FFFD}' as u32
+    } else {
+        value as u32
+    };
+
+    let mut decoded = String::new();
+    decoded.push(char::from_u32(codepoint).unwrap_or('\u{FFFD}'));
+    Some((decoded, index))
+}
+
+fn decode_named_entity(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    let mut index = 1usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+        if byte == b';' {
+            index += 1;
+        }
+        break;
+    }
+
+    let entity_name = &input[1..index];
+    if entity_name.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = lookup_entity(entity_name) {
+        return Some((value.to_string(), index));
+    }
+    if let Some(values) = lookup_entity2(entity_name) {
+        let mut decoded = String::new();
+        decoded.push(values[0]);
+        decoded.push(values[1]);
+        return Some((decoded, index));
+    }
+
+    let max_len = entity_name
+        .len()
+        .saturating_sub(1)
+        .min(LONGEST_ENTITY_WITHOUT_SEMICOLON);
+    for candidate_len in (2..=max_len).rev() {
+        if let Some(value) = lookup_entity(&entity_name[..candidate_len]) {
+            return Some((value.to_string(), candidate_len + 1));
+        }
+    }
+
+    None
+}
+
+fn decode_html_entity(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.len() <= 1 || bytes[0] != b'&' {
+        return None;
+    }
+    if bytes[1] == b'#' {
+        decode_numeric_entity(input)
+    } else {
+        decode_named_entity(input)
+    }
+}
+
+fn unescape_html_entities(input: &str) -> String {
+    let first_amp = match input.find('&') {
+        Some(index) => index,
+        None => return input.to_string(),
+    };
+
+    let mut output = String::with_capacity(input.len());
+    output.push_str(&input[..first_amp]);
+
+    let mut cursor = first_amp;
+    while cursor < input.len() {
+        let remainder = &input[cursor..];
+        if !remainder.starts_with('&') {
+            if let Some(next_amp) = remainder.find('&') {
+                output.push_str(&remainder[..next_amp]);
+                cursor += next_amp;
+                continue;
+            }
+            output.push_str(remainder);
+            break;
+        }
+
+        if let Some((decoded, consumed)) = decode_html_entity(remainder) {
+            output.push_str(&decoded);
+            cursor += consumed;
+        } else {
+            output.push('&');
+            cursor += 1;
+        }
+    }
+
+    output
 }
 
 fn escape_html(input: &str) -> String {
@@ -9400,6 +9652,16 @@ mod tests {
 
     fn test_method(_: &Value, _: &[Value]) -> Result<Value> {
         Ok(Value::from("ok"))
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    fn create_template_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempdir().expect("temp dir should be created");
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            fs::write(path, contents).expect("template file should be written");
+        }
+        dir
     }
 
     #[test]
@@ -11413,7 +11675,7 @@ mod tests {
             .execute_to_string(&json!({"Query": "a=b c&x=<y>"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "a%3db%20c%26x%3d%3cy%3e");
+        assert_eq!(output, "a%3Db&#43;c%26x%3D%3Cy%3E");
     }
 
     #[test]
@@ -12023,7 +12285,7 @@ mod tests {
             .execute_to_string(&json!({"X": "<tag>", "Y": "a b"}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "&lt;tag&gt;|a%20b");
+        assert_eq!(output, "&lt;tag&gt;|a&#43;b");
     }
 
     #[test]
@@ -13248,6 +13510,11 @@ mod tests {
     }
 
     #[test]
+    fn go_test_escapers_on_lower_7_and_select_high_codepoints_matches_go_alias() {
+        go_test_js_escapers_on_lower7_and_selected_high_codepoints();
+    }
+
+    #[test]
     fn go_test_srcset_filter_matches_go_table() {
         let tests = [
             (
@@ -14453,6 +14720,14 @@ mod tests {
         assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
     }
 
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_parse_fs_matches_go() {
+        parse_fs_accepts_multiple_patterns();
+        parse_fs_supports_glob_patterns();
+        parse_fs_with_custom_filesystem();
+    }
+
     #[test]
     fn go_test_multi_add_parse_tree_to_unparsed_template_no_panic() {
         let master = r#"{{define "master"}}{{end}}"#;
@@ -14755,6 +15030,11 @@ mod tests {
     }
 
     #[test]
+    fn go_test_execute_on_new_template_matches_go_issue_3872() {
+        let _ = Template::new("Name").templates();
+    }
+
+    #[test]
     fn go_test_good_func_names_match_go() {
         for name in ["f", "upper", "Title", "id_1", "x9"] {
             let template = Template::new("good-func-name")
@@ -14772,6 +15052,11 @@ mod tests {
             });
             assert!(result.is_err(), "function name {name:?} should be rejected");
         }
+    }
+
+    #[test]
+    fn go_test_comparison_matches_go() {
+        index_and_comparison_functions_work();
     }
 
     #[test]
@@ -14925,6 +15210,36 @@ mod tests {
     }
 
     #[test]
+    fn go_test_redefine_non_empty_after_execution_matches_go() {
+        redefine_non_empty_after_execution_is_rejected();
+    }
+
+    #[test]
+    fn go_test_redefine_empty_after_execution_matches_go() {
+        redefine_empty_after_execution_is_rejected_and_preserves_output();
+    }
+
+    #[test]
+    fn go_test_redefine_after_non_execution_matches_go() {
+        redefine_after_non_execution_is_rejected_and_keeps_previous_definition();
+    }
+
+    #[test]
+    fn go_test_redefine_after_named_execution_matches_go() {
+        redefine_after_named_execution_is_rejected_and_keeps_previous_definition();
+    }
+
+    #[test]
+    fn go_test_redefine_safety_matches_go() {
+        redefine_safety_prevents_post_execute_injection();
+    }
+
+    #[test]
+    fn go_test_redefine_top_use_matches_go() {
+        redefine_top_use_prevents_post_execute_script_injection();
+    }
+
+    #[test]
     fn go_test_escape_malformed_pipelines_match_go() {
         for input in [
             "{{ 0 | $ }}",
@@ -15010,6 +15325,16 @@ mod tests {
             .parse(r#"{{define "foo"}}test{{end}}"#)
             .expect("parse should succeed");
         assert!(template.lookup("foo").is_some());
+    }
+
+    #[test]
+    fn go_test_templates_matches_go() {
+        templates_includes_all_associated_templates();
+    }
+
+    #[test]
+    fn go_test_template_look_up_matches_go_alias() {
+        go_test_template_lookup_matches_go();
     }
 
     #[test]
@@ -15348,6 +15673,376 @@ mod tests {
         assert!(!escaped_urlquery_twice.is_empty());
     }
 
+    #[test]
+    fn go_test_html_entity_length_matches_go() {
+        let (entity, entity2) = entity_maps();
+
+        assert!(!entity.is_empty(), "entity map should not be empty");
+        assert!(!entity2.is_empty(), "entity2 map should not be empty");
+
+        for (name, value) in entity {
+            assert!(
+                1 + name.len() >= value.len_utf8(),
+                "escaped entity &{name} is shorter than its UTF-8 encoding {value}"
+            );
+            if name.len() > LONGEST_ENTITY_WITHOUT_SEMICOLON {
+                assert!(
+                    name.ends_with(';'),
+                    "entity name {name} is too long without semicolon"
+                );
+            }
+        }
+
+        for (name, values) in entity2 {
+            assert!(
+                1 + name.len() >= values[0].len_utf8() + values[1].len_utf8(),
+                "escaped entity &{name} is shorter than its UTF-8 encoding {}{}",
+                values[0],
+                values[1]
+            );
+        }
+    }
+
+    #[test]
+    fn go_test_html_unescape_matches_go_table() {
+        let tests = [
+            ("copy", "A\ttext\nstring", "A\ttext\nstring"),
+            ("simple", "&amp; &gt; &lt;", "& > <"),
+            ("stringEnd", "&amp &amp", "& &"),
+            ("multiCodepoint", "text &gesl; blah", "text \u{22DB}\u{FE00} blah"),
+            ("decimalEntity", "Delta = &#916; ", "Delta = \u{0394} "),
+            ("hexadecimalEntity", "Lambda = &#x3bb; = &#X3Bb ", "Lambda = \u{03BB} = \u{03BB} "),
+            ("numericEnds", "&# &#x &#128;43 &copy = &#169f = &#xa9", "&# &#x \u{20AC}43 \u{00A9} = \u{00A9}f = \u{00A9}"),
+            ("numericReplacements", "Footnote&#x87;", "Footnote\u{2021}"),
+            ("copySingleAmpersand", "&", "&"),
+            ("copyAmpersandNonEntity", "text &test", "text &test"),
+            ("copyAmpersandHash", "text &#", "text &#"),
+        ];
+
+        for (desc, html, want) in tests {
+            let got = UnescapeString(html);
+            assert_eq!(got, want, "case: {desc}");
+        }
+    }
+
+    #[test]
+    fn go_test_html_unescape_escape_roundtrip_matches_go() {
+        let tests = [
+            "",
+            "abc def",
+            "a & b",
+            "a&amp;b",
+            "a &amp b",
+            "&quot;",
+            "\"",
+            "\"<&>\"",
+            "&quot;&lt;&amp;&gt;&quot;",
+            "3&5==1 && 0<1, \"0&lt;1\", a+acute=&aacute;",
+            "The special characters are: <, >, &, ' and \"",
+        ];
+
+        for input in tests {
+            let got = UnescapeString(&EscapeString(input));
+            assert_eq!(got, input, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn go_test_html_example_escape_string_matches_go() {
+        let input = "\"Fran & Freddie's Diner\" <tasty@example.com>";
+        let got = EscapeString(input);
+        assert_eq!(
+            got,
+            "&#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;"
+        );
+    }
+
+    #[test]
+    fn go_test_html_example_unescape_string_matches_go() {
+        let input = "&quot;Fran &amp; Freddie&#39;s Diner&quot; &lt;tasty@example.com&gt;";
+        let got = UnescapeString(input);
+        assert_eq!(got, "\"Fran & Freddie's Diner\" <tasty@example.com>");
+    }
+
+    #[test]
+    fn go_test_html_fuzz_escape_unescape_matches_go_invariant() {
+        let corpus = [
+            "",
+            "abc",
+            "a & b",
+            "<script>alert(1)</script>",
+            "\"Fran & Freddie's Diner\" <tasty@example.com>",
+            "Delta = &#916; and Lambda = &#x3bb;",
+            "text &gesl; blah",
+            "mixed &#128;43 &copy = &#169f = &#xa9",
+            "nul:\0byte",
+            "emoji: 😀",
+            "already escaped: &lt;tag&gt; &amp; &#34;quoted&#34;",
+        ];
+
+        for input in corpus {
+            let escaped = EscapeString(input);
+            let unescaped = UnescapeString(&escaped);
+            assert_eq!(unescaped, input, "roundtrip should preserve input: {input:?}");
+
+            // As in Go's fuzz test, ensure reverse composition does not panic.
+            let _ = EscapeString(&UnescapeString(input));
+        }
+    }
+
+    #[test]
+    fn go_test_template_example_matches_go() {
+        let source =
+            r#"<ul>{{range .Items}}<li>{{.}}</li>{{else}}<li><strong>no rows</strong></li>{{end}}</ul>"#;
+
+        let template = Template::new("webpage")
+            .parse(source)
+            .expect("parse should succeed");
+
+        let with_items = template
+            .execute_to_string(&json!({"Items": ["My photos", "My blog"]}))
+            .expect("execute should succeed");
+        let no_items = template
+            .execute_to_string(&json!({"Items": []}))
+            .expect("execute should succeed");
+
+        assert_eq!(with_items, "<ul><li>My photos</li><li>My blog</li></ul>");
+        assert_eq!(no_items, "<ul><li><strong>no rows</strong></li></ul>");
+    }
+
+    #[test]
+    fn go_test_template_example_autoescaping_matches_go() {
+        let template = Template::new("foo")
+            .parse(r#"{{define "T"}}Hello, {{.}}!{{end}}"#)
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_template_to_string("T", &json!("<script>alert('you have been pwned')</script>"))
+            .expect("execute should succeed");
+        assert_eq!(
+            output,
+            "Hello, &lt;script&gt;alert(&#39;you have been pwned&#39;)&lt;/script&gt;!"
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn go_test_template_example__autoescaping_matches_go_alias() {
+        go_test_template_example_autoescaping_matches_go();
+    }
+
+    #[test]
+    fn go_test_template_example_escape_matches_go() {
+        let input = "\"Fran & Freddie's Diner\" <tasty@example.com>";
+        let values = [
+            Value::from("\"Fran & Freddie's Diner\""),
+            Value::from(32_i64),
+            Value::from("<tasty@example.com>"),
+        ];
+
+        let mut html_written = Vec::new();
+        HTMLEscape(&mut html_written, input.as_bytes()).expect("HTMLEscape should succeed");
+        let html_written = String::from_utf8(html_written).expect("html output should be utf-8");
+
+        let mut js_written = Vec::new();
+        JSEscape(&mut js_written, input.as_bytes()).expect("JSEscape should succeed");
+        let js_written = String::from_utf8(js_written).expect("js output should be utf-8");
+
+        assert_eq!(
+            HTMLEscapeString(input),
+            "&#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;"
+        );
+        assert_eq!(
+            html_written,
+            "&#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;"
+        );
+        assert_eq!(
+            HTMLEscaper(&values),
+            "&#34;Fran &amp; Freddie&#39;s Diner&#34;32&lt;tasty@example.com&gt;"
+        );
+
+        assert_eq!(
+            JSEscapeString(input),
+            "\\u0022Fran \\u0026 Freddie\\u0027s Diner\\u0022 \\u003ctasty@example.com\\u003e"
+        );
+        assert_eq!(
+            js_written,
+            "\\u0022Fran \\u0026 Freddie\\u0027s Diner\\u0022 \\u003ctasty@example.com\\u003e"
+        );
+        assert_eq!(
+            JSEscaper(&values),
+            "\\u0022Fran \\u0026 Freddie\\u0027s Diner\\u002232\\u003ctasty@example.com\\u003e"
+        );
+
+        assert_eq!(
+            URLQueryEscaper(&values),
+            "%22Fran+%26+Freddie%27s+Diner%2232%3Ctasty%40example.com%3E"
+        );
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn go_test_template_example__escape_matches_go_alias() {
+        go_test_template_example_escape_matches_go();
+    }
+
+    #[test]
+    fn go_test_template_example_template_delims_matches_go() {
+        let template = Template::new("tpl")
+            .delims("<<", ">>")
+            .parse("<<.Greeting>> {{.Name}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Greeting": "Hello", "Name": "Joe"}))
+            .expect("execute should succeed");
+        assert_eq!(output, "Hello {{.Name}}");
+    }
+
+    #[test]
+    fn go_test_template_example_template_block_matches_go() {
+        let master = r#"Names:{{block "list" .}}{{"\n"}}{{range .}}{{println "-" .}}{{end}}{{end}}"#;
+        let overlay = r#"{{define "list"}} {{join . ", "}}{{end}}"#;
+        let guardians = json!(["Gamora", "Groot", "Nebula", "Rocket", "Star-Lord"]);
+
+        let master_tmpl = Template::new("master")
+            .add_func("join", |args: &[Value]| {
+                if args.len() != 2 {
+                    return Err(TemplateError::Render("join expects two arguments".to_string()));
+                }
+                let sep = args[1].to_plain_string();
+                let parts = match &args[0] {
+                    Value::Json(JsonValue::Array(values)) => values
+                        .iter()
+                        .map(|value| Value::Json(value.clone()).to_plain_string())
+                        .collect::<Vec<_>>(),
+                    value => vec![value.to_plain_string()],
+                };
+                Ok(Value::from(parts.join(&sep)))
+            })
+            .parse(master)
+            .expect("parse should succeed");
+        let overlay_tmpl = master_tmpl
+            .Clone()
+            .expect("Clone should succeed")
+            .parse(overlay)
+            .expect("parse should succeed");
+
+        let base_output = master_tmpl
+            .execute_to_string(&guardians)
+            .expect("execute should succeed");
+        let overlay_output = overlay_tmpl
+            .execute_to_string(&guardians)
+            .expect("execute should succeed");
+
+        assert!(base_output.contains("Names:\n- Gamora\n- Groot\n- Nebula\n- Rocket\n- Star-Lord\n"));
+        assert_eq!(
+            overlay_output,
+            "Names: Gamora, Groot, Nebula, Rocket, Star-Lord"
+        );
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_template_example_template_glob_matches_go() {
+        let dir = create_template_dir(&[
+            ("T0.tmpl", r#"T0 invokes T1: ({{template "T1"}})"#),
+            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            ("T2.tmpl", r#"{{define "T2"}}This is T2{{end}}"#),
+        ]);
+        let pattern = format!("{}/*.tmpl", dir.path().display());
+
+        let template = Template::new("root")
+            .parse_glob(&pattern)
+            .expect("parse_glob should succeed");
+        let output = template
+            .execute_template_to_string("T0.tmpl", &json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "T0 invokes T1: (T1 invokes T2: (This is T2))");
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_template_example_template_parsefiles_matches_go() {
+        let dir1 = create_template_dir(&[("T1.tmpl", r#"T1 invokes T2: ({{template "T2"}})"#)]);
+        let dir2 = create_template_dir(&[("T2.tmpl", r#"{{define "T2"}}This is T2{{end}}"#)]);
+
+        let first = dir1.path().join("T1.tmpl");
+        let second = dir2.path().join("T2.tmpl");
+        let template = parse_files([first, second]).expect("parse_files should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        assert_eq!(output, "T1 invokes T2: (This is T2)");
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_template_example_template_helpers_matches_go() {
+        let dir = create_template_dir(&[
+            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            ("T2.tmpl", r#"{{define "T2"}}This is T2{{end}}"#),
+        ]);
+        let pattern = format!("{}/*.tmpl", dir.path().display());
+
+        let templates = parse_glob(&pattern).expect("parse_glob should succeed");
+        let templates = templates
+            .parse(r#"{{define "driver1"}}Driver 1 calls T1: ({{template "T1"}})
+{{end}}"#)
+            .expect("parse driver1 should succeed");
+        let templates = templates
+            .parse(r#"{{define "driver2"}}Driver 2 calls T2: ({{template "T2"}})
+{{end}}"#)
+            .expect("parse driver2 should succeed");
+
+        let out_driver1 = templates
+            .execute_template_to_string("driver1", &json!({}))
+            .expect("execute driver1 should succeed");
+        let out_driver2 = templates
+            .execute_template_to_string("driver2", &json!({}))
+            .expect("execute driver2 should succeed");
+        assert_eq!(
+            format!("{out_driver1}{out_driver2}"),
+            "Driver 1 calls T1: (T1 invokes T2: (This is T2))\nDriver 2 calls T2: (This is T2)\n"
+        );
+    }
+
+    #[cfg(not(feature = "web-rust"))]
+    #[test]
+    fn go_test_template_example_template_share_matches_go() {
+        let dir = create_template_dir(&[
+            ("T0.tmpl", "T0 ({{.}} version) invokes T1: ({{template \"T1\"}})\n"),
+            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            ("T2.tmpl", r#"{{define "T2"}}{{end}}"#),
+        ]);
+        let pattern = format!("{}/*.tmpl", dir.path().display());
+
+        let drivers = parse_glob(&pattern).expect("parse_glob should succeed");
+        let first = drivers
+            .Clone()
+            .expect("Clone should succeed")
+            .parse(r#"{{define "T2"}}T2, version A{{end}}"#)
+            .expect("parse T2 version A should succeed");
+        let second = drivers
+            .Clone()
+            .expect("Clone should succeed")
+            .parse(r#"{{define "T2"}}T2, version B{{end}}"#)
+            .expect("parse T2 version B should succeed");
+
+        let out_second = second
+            .execute_template_to_string("T0.tmpl", &json!("second"))
+            .expect("execute should succeed");
+        let out_first = first
+            .execute_template_to_string("T0.tmpl", &json!("first"))
+            .expect("execute should succeed");
+
+        assert_eq!(
+            format!("{out_second}{out_first}"),
+            "T0 (second version) invokes T1: (T1 invokes T2: (T2, version B))\nT0 (first version) invokes T1: (T1 invokes T2: (T2, version A))\n"
+        );
+    }
+
 
     #[test]
     fn parse_numbers_supports_go_style_numeric_literals() {
@@ -15360,6 +16055,11 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "12|12.34|7.5");
+    }
+
+    #[test]
+    fn go_test_numbers_matches_go() {
+        parse_numbers_supports_go_style_numeric_literals();
     }
 
     #[test]
