@@ -279,7 +279,7 @@ impl Value {
         Self::SafeSrcset(value.into())
     }
 
-    fn from_serializable<T: Serialize>(data: &T) -> Result<Self> {
+    pub fn from_serializable<T: Serialize>(data: &T) -> Result<Self> {
         Ok(Self::Json(serde_json::to_value(data)?))
     }
 
@@ -864,55 +864,53 @@ impl Template {
         self.execute_template_to_string(&self.name, data)
     }
 
+    pub fn execute_value<W: Write>(&self, writer: &mut W, data: &Value) -> Result<()> {
+        self.execute_template_value(writer, &self.name, data)
+    }
+
+    pub fn execute_value_to_string(&self, data: &Value) -> Result<String> {
+        self.execute_template_value_to_string(&self.name, data)
+    }
+
+    pub fn execute_template_value<W: Write>(
+        &self,
+        writer: &mut W,
+        name: &str,
+        data: &Value,
+    ) -> Result<()> {
+        let rendered = self.execute_template_with_root_to_string(name, data)?;
+        writer.write_all(rendered.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn execute_template_value_to_string(&self, name: &str, data: &Value) -> Result<String> {
+        self.execute_template_with_root_to_string(name, data)
+    }
+
     pub fn execute_template<T: Serialize, W: Write>(
         &self,
         writer: &mut W,
         name: &str,
         data: &T,
     ) -> Result<()> {
-        self.name_space.executed.store(true, AtomicOrdering::SeqCst);
-        if let Some(rendered) = self.text_only_template_output(name)? {
-            writer.write_all(rendered.as_bytes())?;
-            return Ok(());
-        }
-        let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
-        let root_json = match &root {
-            Value::Json(value) => Some(value),
-            _ => None,
-        };
-        let mut rendered = String::new();
-        let mut tracker = ContextTracker::from_state(ContextState::html_text());
-        let mut scopes = vec![HashMap::new()];
-        let flow = self.render_named(
-            name,
-            &root,
-            &root,
-            root_json,
-            &mut scopes,
-            &mut rendered,
-            &mut tracker,
-            &runtime,
-            false,
-            0,
-        )?;
-        if !matches!(flow, RenderFlow::Normal) {
-            return Err(TemplateError::Render(
-                "break/continue action is not inside range".to_string(),
-            ));
-        }
+        let rendered = self.execute_template_with_root_to_string(name, &root)?;
         writer.write_all(rendered.as_bytes())?;
         Ok(())
     }
 
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
+        let root = Value::from_serializable(data)?;
+        self.execute_template_with_root_to_string(name, &root)
+    }
+
+    fn execute_template_with_root_to_string(&self, name: &str, root: &Value) -> Result<String> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         if let Some(rendered) = self.text_only_template_output(name)? {
             return Ok(rendered);
         }
         let runtime = self.runtime_context();
-        let root = Value::from_serializable(data)?;
-        let root_json = match &root {
+        let root_json = match root {
             Value::Json(value) => Some(value),
             _ => None,
         };
@@ -921,8 +919,8 @@ impl Template {
         let mut scopes = vec![HashMap::new()];
         let flow = self.render_named(
             name,
-            &root,
-            &root,
+            root,
+            root,
             root_json,
             &mut scopes,
             &mut rendered,
@@ -12050,6 +12048,45 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "ALICE <span>x</span>");
+    }
+
+    #[test]
+    fn execute_value_to_string_matches_generic_execute() {
+        let template = Template::new("value-exec")
+            .parse("<p>{{.Name}}</p>")
+            .expect("parse should succeed");
+
+        let data = json!({"Name": "Alice"});
+        let value = Value::from_serializable(&data).expect("value conversion should succeed");
+
+        let generic = template
+            .execute_to_string(&data)
+            .expect("generic execute should succeed");
+        let by_value = template
+            .execute_value_to_string(&value)
+            .expect("value execute should succeed");
+
+        assert_eq!(generic, by_value);
+    }
+
+    #[test]
+    fn execute_template_value_writer_works_for_named_template() {
+        let template = Template::new("root")
+            .parse("{{define \"greet\"}}Hello {{.Name}}{{end}}")
+            .expect("parse should succeed");
+
+        let data = json!({"Name": "Alice"});
+        let value = Value::from_serializable(&data).expect("value conversion should succeed");
+        let mut output = Vec::new();
+
+        template
+            .execute_template_value(&mut output, "greet", &value)
+            .expect("value execute should succeed");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 conversion should succeed"),
+            "Hello Alice"
+        );
     }
 
     #[cfg(not(feature = "web-rust"))]

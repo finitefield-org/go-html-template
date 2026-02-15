@@ -1,4 +1,4 @@
-use go_html_template::Template;
+use go_html_template::{Template, Value};
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -213,11 +213,12 @@ fn bench_rust_exec(
     let parsed = Template::new("bench")
         .option(missingkey_option)?
         .parse(template)?;
+    let root = Value::from_serializable(data)?;
 
     let start = Instant::now();
     let mut output = String::new();
     for _ in 0..loops {
-        output = parsed.execute_to_string(data)?;
+        output = parsed.execute_value_to_string(&root)?;
     }
     let avg = start.elapsed().as_micros() / loops as u128;
     Ok((avg, output))

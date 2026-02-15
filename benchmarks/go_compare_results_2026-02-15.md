@@ -312,3 +312,48 @@ cargo run --release --quiet --bin perf_parse_breakdown
 | case | loops | before rust_parse_us | after rust_parse_us | change | output_match |
 |---|---:|---:|---:|---:|---|
 | static_200k | 20 | 1979 | 1626 | -17.8% | true |
+
+## Value Root Reuse In Compare Execute Path (Latest Re-run)
+
+Optimization applied:
+- Added Value-based execute APIs and switched compare tool execute loop to reuse one prebuilt root `Value` (`execute_value_to_string`) instead of re-serializing JSON each iteration.
+- This removes comparator-side overhead and exposes engine execution cost more directly.
+
+Updated files:
+- `/Users/kazuyoshitoshiya/Documents/GitHub/go-html-template/src/lib.rs`
+- `/Users/kazuyoshitoshiya/Documents/GitHub/go-html-template/src/bin/compare_go_html_template.rs`
+
+Reference command pattern:
+
+```bash
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/<case>.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops <case-specific>
+```
+
+### Full Comparison Snapshot
+
+| case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 20 | 2573 | 123 | 20.92 | 593 | 397 | 1.49 | true |
+| expr_20k | 20 | 9567 | 9922 | 0.96 | 2707 | 12631 | 0.21 | true |
+| deep_path_20k | 20 | 18028 | 23482 | 0.77 | 2710 | 19359 | 0.14 | true |
+| func_print_20k | 20 | 14497 | 14266 | 1.02 | 4567 | 21023 | 0.22 | true |
+| range_no_vars | 30 | 13 | 12 | 1.08 | 123 | 1009 | 0.12 | true |
+| range_var_decl | 30 | 13 | 14 | 0.93 | 9508 | 23265 | 0.41 | true |
+| range_var_assign | 30 | 15 | 19 | 0.79 | 9783 | 23764 | 0.41 | true |
+| if_else_20k | 20 | 37303 | 32393 | 1.15 | 6120 | 14929 | 0.41 | true |
+| template_call_range | 30 | 14 | 15 | 0.93 | 6140 | 13222 | 0.46 | true |
+| attr_20k | 10 | 26997 | 12407 | 2.18 | 12760 | 13771 | 0.93 | true |
+| url_20k | 10 | 29162 | 13762 | 2.12 | 24156 | 24443 | 0.99 | true |
+| script_2 | 30 | 14 | 11 | 1.27 | 1 | 11 | 0.09 | true |
+| script_100 | 10 | 150 | 60 | 2.50 | 57 | 87 | 0.66 | true |
+| script_2k | 3 | 5237 | 2524 | 2.07 | 1815 | 3602 | 0.50 | true |
+| style_100 | 10 | 144 | 61 | 2.36 | 150 | 105 | 1.43 | true |
+| style_2k | 3 | 3835 | 1177 | 3.26 | 1576 | 3877 | 0.41 | true |
+
+### Remaining Rust>Go Cases
+
+- Parse slower: `static_200k`, `func_print_20k` (near tie), `if_else_20k`, `attr_20k`, `url_20k`, `script_100`, `script_2k`, `style_100`, `style_2k`.
+- Execute slower: `static_200k`, `style_100` (small).
