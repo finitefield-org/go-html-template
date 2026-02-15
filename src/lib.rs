@@ -2107,42 +2107,52 @@ impl ContextState {
 #[derive(Clone, Debug)]
 struct ContextTracker {
     rendered: String,
+    state: ContextState,
+    url_part: Option<UrlPartContext>,
 }
 
 impl ContextTracker {
     fn from_state(state: ContextState) -> Self {
+        let rendered = seed_rendered_for_state(&state);
+        let url_part = url_part_from_mode_and_rendered(state.mode, &rendered);
         Self {
-            rendered: seed_rendered_for_state(&state),
+            rendered,
+            state,
+            url_part,
         }
     }
 
     fn state(&self) -> ContextState {
-        ContextState::from_rendered(&self.rendered)
+        self.state.clone()
     }
 
     fn mode(&self) -> EscapeMode {
-        self.state().mode
+        self.state.mode
     }
 
     fn append_text(&mut self, text: &str) {
         self.rendered.push_str(text);
-        let state = self.state();
-        if should_normalize_tracker_state(&state) {
-            self.normalize_from_state(&state);
+        self.refresh_cached_state();
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
         }
     }
 
     fn append_expr_placeholder(&mut self, mode: EscapeMode) {
         self.rendered.push_str(placeholder_for_mode(mode));
-        let state = self.state();
-        if should_normalize_tracker_state(&state) {
-            self.normalize_from_state(&state);
+        self.refresh_cached_state();
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
         }
     }
 
-    fn normalize_from_state(&mut self, state: &ContextState) {
-        let url_part = url_part_from_mode_and_rendered(state.mode, &self.rendered);
-        self.rendered = seed_rendered_for_state_with_url_part(state, url_part);
+    fn refresh_cached_state(&mut self) {
+        self.state = ContextState::from_rendered(&self.rendered);
+        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &self.rendered);
+    }
+
+    fn normalize_from_cached_state(&mut self) {
+        self.rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
     }
 }
 
@@ -5761,35 +5771,35 @@ fn current_attr_name_context(rendered: &str) -> bool {
         return false;
     }
 
-    let chars: Vec<char> = fragment.chars().collect();
+    let bytes = fragment.as_bytes();
     let mut i = 0usize;
 
-    while i < chars.len() && chars[i].is_whitespace() {
+    while i < bytes.len() && is_html_space(bytes[i]) {
         i += 1;
     }
-    if i >= chars.len() {
+    if i >= bytes.len() {
         return true;
     }
 
-    if chars[i] == '/' || chars[i] == '!' || chars[i] == '?' {
+    if matches!(bytes[i], b'/' | b'!' | b'?') {
         return false;
     }
 
-    while i < chars.len() {
-        while i < chars.len() && chars[i].is_whitespace() {
+    while i < bytes.len() {
+        while i < bytes.len() && is_html_space(bytes[i]) {
             i += 1;
         }
-        if i >= chars.len() {
+        if i >= bytes.len() {
             return true;
         }
-        if chars[i] == '/' || chars[i] == '>' {
+        if matches!(bytes[i], b'/' | b'>') {
             return false;
         }
 
         let start = i;
-        while i < chars.len() {
-            let ch = chars[i];
-            if ch.is_whitespace() || ch == '=' || ch == '/' || ch == '>' {
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if is_html_space(byte) || matches!(byte, b'=' | b'/' | b'>') {
                 break;
             }
             i += 1;
@@ -5798,41 +5808,41 @@ fn current_attr_name_context(rendered: &str) -> bool {
             return false;
         }
 
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < bytes.len() && is_html_space(bytes[i]) {
             i += 1;
         }
-        if i >= chars.len() || chars[i] == '/' || chars[i] == '>' {
+        if i >= bytes.len() || matches!(bytes[i], b'/' | b'>') {
             return true;
         }
 
-        if chars[i] == '=' {
+        if bytes[i] == b'=' {
             i += 1;
-            while i < chars.len() && chars[i].is_whitespace() {
+            while i < bytes.len() && is_html_space(bytes[i]) {
                 i += 1;
             }
 
-            if i >= chars.len() {
+            if i >= bytes.len() {
                 return false;
             }
 
-            if chars[i] == '"' || chars[i] == '\'' {
-                let quote = chars[i];
+            if matches!(bytes[i], b'"' | b'\'') {
+                let quote = bytes[i];
                 i += 1;
-                while i < chars.len() && chars[i] != quote {
+                while i < bytes.len() && bytes[i] != quote {
                     i += 1;
                 }
-                if i >= chars.len() {
+                if i >= bytes.len() {
                     return false;
                 }
                 i += 1;
                 continue;
             }
 
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
+            while i < bytes.len() && !is_html_space(bytes[i]) && bytes[i] != b'>' {
                 i += 1;
             }
 
-            if i >= chars.len() {
+            if i >= bytes.len() {
                 return false;
             }
 
@@ -5846,45 +5856,45 @@ fn current_attr_name_context(rendered: &str) -> bool {
 }
 
 fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
-    let chars: Vec<char> = fragment.chars().collect();
-    if chars.is_empty() {
+    let bytes = fragment.as_bytes();
+    if bytes.is_empty() {
         return None;
     }
 
     let mut i = 0usize;
-    while i < chars.len() && chars[i].is_whitespace() {
+    while i < bytes.len() && is_html_space(bytes[i]) {
         i += 1;
     }
-    if i >= chars.len() {
+    if i >= bytes.len() {
         return None;
     }
-    if chars[i] == '/' || chars[i] == '!' || chars[i] == '?' {
+    if matches!(bytes[i], b'/' | b'!' | b'?') {
         return None;
     }
 
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch.is_whitespace() || ch == '/' || ch == '>' {
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if is_html_space(byte) || matches!(byte, b'/' | b'>') {
             break;
         }
         i += 1;
     }
 
-    while i < chars.len() {
-        while i < chars.len() && chars[i].is_whitespace() {
+    while i < bytes.len() {
+        while i < bytes.len() && is_html_space(bytes[i]) {
             i += 1;
         }
-        if i >= chars.len() {
+        if i >= bytes.len() {
             break;
         }
-        if chars[i] == '/' || chars[i] == '>' {
+        if matches!(bytes[i], b'/' | b'>') {
             break;
         }
 
         let attr_start = i;
-        while i < chars.len() {
-            let ch = chars[i];
-            if ch.is_whitespace() || ch == '=' || ch == '/' || ch == '>' {
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if is_html_space(byte) || matches!(byte, b'=' | b'/' | b'>') {
                 break;
             }
             i += 1;
@@ -5892,20 +5902,20 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
         if i <= attr_start {
             break;
         }
-        let attr_name: String = chars[attr_start..i].iter().collect();
+        let attr_name = fragment[attr_start..i].to_string();
 
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < bytes.len() && is_html_space(bytes[i]) {
             i += 1;
         }
-        if i >= chars.len() || chars[i] != '=' {
+        if i >= bytes.len() || bytes[i] != b'=' {
             continue;
         }
         i += 1;
 
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < bytes.len() && is_html_space(bytes[i]) {
             i += 1;
         }
-        if i >= chars.len() {
+        if i >= bytes.len() {
             return Some(TagValueContext {
                 attr_name,
                 quoted: false,
@@ -5914,21 +5924,21 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
             });
         }
 
-        let quote = chars[i];
-        if quote == '"' || quote == '\'' {
+        let quote = bytes[i];
+        if matches!(quote, b'"' | b'\'') {
             i += 1;
             let value_start = i;
-            while i < chars.len() && chars[i] != quote {
+            while i < bytes.len() && bytes[i] != quote {
                 i += 1;
             }
-            if i >= chars.len() {
-                let partial: String = chars[value_start..].iter().collect();
+            if i >= bytes.len() {
+                let partial = &fragment[value_start..];
                 if partial.is_empty() || !partial.ends_with("}}") {
                     return Some(TagValueContext {
                         attr_name,
                         quoted: true,
-                        quote: Some(quote),
-                        value_prefix: partial,
+                        quote: Some(quote as char),
+                        value_prefix: partial.to_string(),
                     });
                 }
                 return None;
@@ -5936,17 +5946,17 @@ fn parse_open_tag_value_context(fragment: &str) -> Option<TagValueContext> {
             i += 1;
         } else {
             let value_start = i;
-            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
+            while i < bytes.len() && !is_html_space(bytes[i]) && bytes[i] != b'>' {
                 i += 1;
             }
-            if i >= chars.len() {
-                let partial: String = chars[value_start..].iter().collect();
+            if i >= bytes.len() {
+                let partial = &fragment[value_start..];
                 if partial.is_empty() || !partial.ends_with("}}") {
                     return Some(TagValueContext {
                         attr_name,
                         quoted: false,
                         quote: None,
-                        value_prefix: partial,
+                        value_prefix: partial.to_string(),
                     });
                 }
                 return None;
