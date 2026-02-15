@@ -8437,6 +8437,7 @@ fn current_css_mode(content: &str) -> EscapeMode {
     }
 }
 
+#[cfg(test)]
 fn ends_with_css_keyword(css: &str, keyword: &str) -> bool {
     let trimmed = css.trim_end_matches(is_html_space_char);
     if trimmed.len() < keyword.len() {
@@ -8459,6 +8460,7 @@ fn ends_with_css_keyword(css: &str, keyword: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 fn is_css_nmchar(codepoint: u32) -> bool {
     if (0x30..=0x39).contains(&codepoint)
         || (0x41..=0x5A).contains(&codepoint)
@@ -8504,6 +8506,7 @@ fn hex_decode(bytes: &[u8]) -> u32 {
     })
 }
 
+#[cfg(test)]
 fn skip_css_space(css: &str) -> &str {
     let bytes = css.as_bytes();
     if bytes.is_empty() {
@@ -9061,6 +9064,7 @@ fn js_string_escaper_norm(input: &str) -> String {
     escaped
 }
 
+#[cfg(test)]
 fn js_regexp_escaper(input: &str) -> String {
     if input.is_empty() {
         return "(?:)".to_string();
@@ -9283,6 +9287,7 @@ const HTML_ENTITY_TABLE: &[(&str, char)] = &[
 
 const HTML_ENTITY_TABLE2: &[(&str, [char; 2])] = &[("gesl;", ['\u{22DB}', '\u{FE00}'])];
 
+#[cfg(test)]
 fn entity_maps() -> (
     &'static [(&'static str, char)],
     &'static [(&'static str, [char; 2])],
