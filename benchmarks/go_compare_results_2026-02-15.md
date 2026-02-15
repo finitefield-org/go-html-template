@@ -376,3 +376,36 @@ Optimization applied:
 |---|---:|---:|---:|---:|---:|---:|---:|---|
 | attr_20k | 10 | 26997 | 25968 | -3.8% | 12760 | 12131 | -4.9% | true |
 | url_20k | 10 | 29162 | 28894 | -0.9% | 24156 | 24388 | +1.0% | true |
+
+## Parse Context Full-Scan Reduction (Item 2 follow-up)
+
+Optimization applied:
+- Added parse-time text transition cache in `ParseContextAnalyzer` keyed by normalized tracker state + short text fragment.
+- Reused cached context transitions for repeated text chunks to avoid repeated `append_text` scanning in large repeated templates (`attr_20k` / `url_20k` style patterns).
+- Added no-op fast paths:
+  - `strip_html_comments` now returns borrowed text when no `<!--` exists.
+  - `parse_tree` now skips tokenize/parse-node pipeline for delimiter-free input and creates a single text node directly.
+- `source_without_actions` now returns borrowed text when no actions exist (avoids extra copy in hazard validation).
+
+### Parse Breakdown Before/After
+
+Command:
+
+```bash
+cargo run --release --quiet --bin perf_parse_breakdown
+```
+
+| benchmark | before (avg_us) | after (avg_us) | change |
+|---|---:|---:|---:|
+| parse_tree_expr_20k | 8451 | 8124 | -3.9% |
+| parse_expr_20k | 9089 | 8814 | -3.0% |
+| parse_tree_html_mix | 8165 | 7474 | -8.5% |
+| parse_html_mix | 13642 | 10475 | -23.2% |
+
+### Selected Go Compare Before/After
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_execute_us | after rust_execute_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 20 | 2062 | 1101 | -46.6% | 503 | 586 | +16.5% | true |
+| attr_20k | 10 | 25968 | 16315 | -37.2% | 12131 | 12823 | +5.7% | true |
+| url_20k | 10 | 28894 | 21920 | -24.1% | 24388 | 25164 | +3.2% | true |

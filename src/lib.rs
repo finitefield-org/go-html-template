@@ -654,7 +654,17 @@ impl Template {
         let preprocessed = strip_html_comments(text);
         let left_delim = self.name_space.left_delim.read().unwrap().clone();
         let right_delim = self.name_space.right_delim.read().unwrap().clone();
-        let tokens = tokenize(&preprocessed, &left_delim, &right_delim)?;
+        let preprocessed = preprocessed.as_ref();
+        if preprocessed.is_empty() {
+            return Ok(ParseTree { nodes: Vec::new() });
+        }
+        if !preprocessed.contains(&left_delim) {
+            return Ok(ParseTree {
+                nodes: vec![Node::Text(TextNode::new(preprocessed.to_string()))],
+            });
+        }
+
+        let tokens = tokenize(preprocessed, &left_delim, &right_delim)?;
         let mut index = 0;
         let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
         if let Some(stop) = stop {
@@ -3115,6 +3125,84 @@ struct ParseContextAnalyzer<'a> {
     end_states: HashMap<String, ContextState>,
     in_progress: HashSet<String>,
     recursive_templates: HashSet<String>,
+    text_transition_cache:
+        HashMap<TextTransitionCacheKey, HashMap<String, TextTransitionCacheValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TextTransitionCacheKey {
+    state: ContextState,
+    url_part: Option<UrlPartContext>,
+    attr_name_dynamic_pending: bool,
+    attr_value_from_dynamic_attr: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TextTransitionCacheValue {
+    state: ContextState,
+    url_part: Option<UrlPartContext>,
+    attr_name_dynamic_pending: bool,
+    attr_value_from_dynamic_attr: bool,
+}
+
+const TEXT_TRANSITION_CACHE_MAX_TEXT_LEN: usize = 256;
+
+fn text_transition_cache_key(
+    tracker: &ContextTracker,
+    text: &str,
+) -> Option<TextTransitionCacheKey> {
+    if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
+        return None;
+    }
+    if !should_normalize_tracker_state(&tracker.state) {
+        return None;
+    }
+    if tracker.js_scan_state.is_some() || tracker.css_scan_state.is_some() || tracker.script_json {
+        return None;
+    }
+
+    Some(TextTransitionCacheKey {
+        state: tracker.state(),
+        url_part: tracker.url_part,
+        attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
+        attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
+    })
+}
+
+fn text_transition_cache_value(
+    tracker: &ContextTracker,
+    text: &str,
+) -> Option<TextTransitionCacheValue> {
+    if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
+        return None;
+    }
+    if !should_normalize_tracker_state(&tracker.state) {
+        return None;
+    }
+    if tracker.js_scan_state.is_some() || tracker.css_scan_state.is_some() || tracker.script_json {
+        return None;
+    }
+
+    Some(TextTransitionCacheValue {
+        state: tracker.state(),
+        url_part: tracker.url_part,
+        attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
+        attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
+    })
+}
+
+fn apply_text_transition_cache_value(
+    tracker: &mut ContextTracker,
+    value: &TextTransitionCacheValue,
+) {
+    tracker.state = value.state.clone();
+    tracker.url_part = value.url_part;
+    tracker.rendered = seed_rendered_for_state_with_url_part(&tracker.state, tracker.url_part);
+    tracker.js_scan_state = None;
+    tracker.css_scan_state = None;
+    tracker.script_json = false;
+    tracker.attr_name_dynamic_pending = value.attr_name_dynamic_pending;
+    tracker.attr_value_from_dynamic_attr = value.attr_value_from_dynamic_attr;
 }
 
 impl<'a> ParseContextAnalyzer<'a> {
@@ -3125,6 +3213,7 @@ impl<'a> ParseContextAnalyzer<'a> {
             end_states: HashMap::new(),
             in_progress: HashSet::new(),
             recursive_templates: HashSet::new(),
+            text_transition_cache: HashMap::new(),
         }
     }
 
@@ -3271,7 +3360,27 @@ impl<'a> ParseContextAnalyzer<'a> {
                         &text_node.raw,
                     );
                 }
+
+                let cache_key = text_transition_cache_key(&tracker, &text_node.raw);
+                if let Some(key) = cache_key.as_ref()
+                    && let Some(cached) = self
+                        .text_transition_cache
+                        .get(key)
+                        .and_then(|entries| entries.get(text_node.raw.as_str()))
+                {
+                    apply_text_transition_cache_value(&mut tracker, cached);
+                    return Ok(vec![AnalysisFlow::normal(tracker)]);
+                }
+
                 tracker.append_text(&text_node.raw);
+                if let Some(key) = cache_key
+                    && let Some(cached) = text_transition_cache_value(&tracker, &text_node.raw)
+                {
+                    self.text_transition_cache
+                        .entry(key)
+                        .or_default()
+                        .insert(text_node.raw.clone(), cached);
+                }
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::Expr {
@@ -5398,7 +5507,11 @@ fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
     Ok(())
 }
 
-fn source_without_actions(source: &str) -> String {
+fn source_without_actions(source: &str) -> Cow<'_, str> {
+    if !source.contains("{{") {
+        return Cow::Borrowed(source);
+    }
+
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
     let mut i = 0usize;
@@ -5418,10 +5531,14 @@ fn source_without_actions(source: &str) -> String {
         out.push(bytes[i] as char);
         i += 1;
     }
-    out
+    Cow::Owned(out)
 }
 
-fn strip_html_comments(source: &str) -> String {
+fn strip_html_comments(source: &str) -> Cow<'_, str> {
+    if !source.contains("<!--") {
+        return Cow::Borrowed(source);
+    }
+
     let bytes = source.as_bytes();
     let mut output = String::with_capacity(source.len());
     let mut cursor = 0usize;
@@ -5475,7 +5592,7 @@ fn strip_html_comments(source: &str) -> String {
         cursor += next_char_len;
     }
 
-    output
+    Cow::Owned(output)
 }
 
 fn matches_html_tag(bytes: &[u8], name: &[u8]) -> bool {
