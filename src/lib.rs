@@ -3612,9 +3612,9 @@ impl ContextTracker {
         }
     }
 
-    fn append_text_for_parse(&mut self, text: &str) {
+    fn append_text_for_parse(&mut self, text: &str) -> bool {
         if text.is_empty() {
-            return;
+            return false;
         }
 
         let skip_rendered_tail_if_incremental =
@@ -3622,12 +3622,14 @@ impl ContextTracker {
         let previous_mode = self.state.mode;
         let used_incremental = self.refresh_cached_state_with_delta_for_parse(text);
         self.refresh_dynamic_attr_runtime_flag(previous_mode);
+        let mut updated_rendered_tail = false;
         if !(skip_rendered_tail_if_incremental && used_incremental) {
-            self.update_rendered_tail_for_parse(text);
+            updated_rendered_tail = self.update_rendered_tail_for_parse(text);
         }
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
+        updated_rendered_tail
     }
 
     fn append_known_script_close_tag(&mut self, close_tag: &str) {
@@ -3696,7 +3698,7 @@ impl ContextTracker {
             self.attr_name_dynamic_pending = true;
         }
         self.refresh_dynamic_attr_runtime_flag(previous_mode);
-        self.update_rendered_tail_for_parse(placeholder);
+        let _ = self.update_rendered_tail_for_parse(placeholder);
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
@@ -4110,13 +4112,14 @@ impl ContextTracker {
         self.sync_incremental_scan_state();
     }
 
-    fn update_rendered_tail_for_parse(&mut self, delta: &str) {
+    fn update_rendered_tail_for_parse(&mut self, delta: &str) -> bool {
         if delta.is_empty() || should_normalize_tracker_state(&self.state) {
-            return;
+            return false;
         }
 
         self.rendered.push_str(delta);
         truncate_to_char_boundary_tail(&mut self.rendered, PARSE_TRACKER_RENDERED_TAIL_MAX);
+        true
     }
 
     fn should_skip_rendered_tail_update_for_parse_text(&self, delta: &str) -> bool {
@@ -4411,7 +4414,6 @@ struct TextTransitionCacheKey {
 
 #[derive(Clone, Debug)]
 struct TextTransitionCacheValue {
-    rendered: String,
     state: ContextState,
     url_part: Option<UrlPartContext>,
     js_scan_state: Option<JsScanState>,
@@ -4419,6 +4421,7 @@ struct TextTransitionCacheValue {
     script_json: bool,
     attr_name_dynamic_pending: bool,
     attr_value_from_dynamic_attr: bool,
+    update_rendered_tail: bool,
 }
 
 const TEXT_TRANSITION_CACHE_MAX_TEXT_LEN: usize = 256;
@@ -4528,6 +4531,7 @@ fn text_transition_cache_key(
 fn text_transition_cache_value(
     tracker: &ContextTracker,
     text: &str,
+    update_rendered_tail: bool,
 ) -> Option<TextTransitionCacheValue> {
     if text.is_empty() || text.len() > TEXT_TRANSITION_CACHE_MAX_TEXT_LEN {
         return None;
@@ -4537,7 +4541,6 @@ fn text_transition_cache_value(
     }
 
     Some(TextTransitionCacheValue {
-        rendered: tracker.rendered.clone(),
         state: tracker.state(),
         url_part: tracker.url_part,
         js_scan_state: tracker.js_scan_state,
@@ -4545,14 +4548,15 @@ fn text_transition_cache_value(
         script_json: tracker.script_json,
         attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
         attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
+        update_rendered_tail,
     })
 }
 
 fn apply_text_transition_cache_value(
     tracker: &mut ContextTracker,
+    text: &str,
     value: &TextTransitionCacheValue,
 ) {
-    tracker.rendered = value.rendered.clone();
     tracker.state = value.state.clone();
     tracker.url_part = value.url_part;
     tracker.js_scan_state = value.js_scan_state;
@@ -4560,6 +4564,9 @@ fn apply_text_transition_cache_value(
     tracker.script_json = value.script_json;
     tracker.attr_name_dynamic_pending = value.attr_name_dynamic_pending;
     tracker.attr_value_from_dynamic_attr = value.attr_value_from_dynamic_attr;
+    if value.update_rendered_tail {
+        let _ = tracker.update_rendered_tail_for_parse(text);
+    }
 }
 
 fn text_transition_cache_is_eligible(tracker: &ContextTracker, text: &str) -> bool {
@@ -4965,13 +4972,14 @@ impl<'a> ParseContextAnalyzer<'a> {
                 .get(key)
                 .and_then(|entries| entries.get(text_node.raw.as_str()))
         {
-            apply_text_transition_cache_value(tracker, cached);
+            apply_text_transition_cache_value(tracker, &text_node.raw, cached);
             return;
         }
 
-        tracker.append_text_for_parse(&text_node.raw);
+        let update_rendered_tail = tracker.append_text_for_parse(&text_node.raw);
         if let Some(key) = cache_key
-            && let Some(cached) = text_transition_cache_value(tracker, &text_node.raw)
+            && let Some(cached) =
+                text_transition_cache_value(tracker, &text_node.raw, update_rendered_tail)
         {
             self.text_transition_cache
                 .entry(key)
@@ -6733,7 +6741,7 @@ fn analyze_text_only_segment(text: &str) -> (ContextTracker, bool) {
     }
 
     let mut tracker = ContextTracker::from_state(ContextState::html_text());
-    tracker.append_text_for_parse(text);
+    let _ = tracker.append_text_for_parse(text);
     (tracker, cacheable_output)
 }
 
