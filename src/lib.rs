@@ -889,8 +889,18 @@ impl Template {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
+        let mut tracker = ContextTracker::from_state(ContextState::html_text());
         let mut scopes = vec![HashMap::new()];
-        let flow = self.render_named(name, &root, &root, &mut scopes, &mut rendered, false, 0)?;
+        let flow = self.render_named(
+            name,
+            &root,
+            &root,
+            &mut scopes,
+            &mut rendered,
+            &mut tracker,
+            false,
+            0,
+        )?;
         if !matches!(flow, RenderFlow::Normal) {
             return Err(TemplateError::Render(
                 "break/continue action is not inside range".to_string(),
@@ -904,8 +914,18 @@ impl Template {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
+        let mut tracker = ContextTracker::from_state(ContextState::html_text());
         let mut scopes = vec![HashMap::new()];
-        let flow = self.render_named(name, &root, &root, &mut scopes, &mut rendered, false, 0)?;
+        let flow = self.render_named(
+            name,
+            &root,
+            &root,
+            &mut scopes,
+            &mut rendered,
+            &mut tracker,
+            false,
+            0,
+        )?;
         if !matches!(flow, RenderFlow::Normal) {
             return Err(TemplateError::Render(
                 "break/continue action is not inside range".to_string(),
@@ -1065,6 +1085,7 @@ impl Template {
         dot: &Value,
         scopes: &mut ScopeStack,
         output: &mut String,
+        tracker: &mut ContextTracker,
         in_range: bool,
         depth: usize,
     ) -> Result<RenderFlow> {
@@ -1078,7 +1099,7 @@ impl Template {
         let nodes = templates
             .get(name)
             .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
-        self.render_nodes(nodes, root, dot, scopes, output, in_range, depth)
+        self.render_nodes(nodes, root, dot, scopes, output, tracker, in_range, depth)
     }
 
     fn render_nodes(
@@ -1088,19 +1109,25 @@ impl Template {
         dot: &Value,
         scopes: &mut ScopeStack,
         output: &mut String,
+        tracker: &mut ContextTracker,
         in_range: bool,
         depth: usize,
     ) -> Result<RenderFlow> {
         for node in nodes {
             match node {
                 Node::Text(text) => {
-                    let mode = infer_escape_mode(output);
+                    let mode = tracker.mode();
                     if matches!(mode, EscapeMode::ScriptExpr) {
-                        output.push_str(&filter_script_text(output, text));
+                        let filtered = filter_script_text(&tracker.rendered, text);
+                        output.push_str(&filtered);
+                        tracker.append_text(&filtered);
                     } else if matches!(mode, EscapeMode::Html) {
-                        output.push_str(&filter_html_text_sections(output, text));
+                        let filtered = filter_html_text_sections(&tracker.rendered, text);
+                        output.push_str(&filtered);
+                        tracker.append_text(&filtered);
                     } else {
                         output.push_str(text);
+                        tracker.append_text(text);
                     }
                 }
                 Node::Expr { expr, mode } => {
@@ -1114,13 +1141,15 @@ impl Template {
                             kind: AttrKind::Normal
                         }
                     ) {
-                        let inferred_mode = infer_escape_mode(output);
+                        let inferred_mode = tracker.mode();
                         if !matches!(inferred_mode, EscapeMode::AttrName) {
                             mode = inferred_mode;
                         }
                     }
                     let value = self.eval_expr(expr, root, dot, scopes)?;
-                    output.push_str(&escape_value_for_mode(&value, mode, output)?);
+                    let escaped = escape_value_for_mode(&value, mode, &tracker.rendered)?;
+                    output.push_str(&escaped);
+                    tracker.append_text(&escaped);
                 }
                 Node::SetVar {
                     name,
@@ -1148,6 +1177,7 @@ impl Template {
                             dot,
                             scopes,
                             output,
+                            tracker,
                             in_range,
                             depth,
                         )?;
@@ -1163,6 +1193,7 @@ impl Template {
                             dot,
                             scopes,
                             output,
+                            tracker,
                             in_range,
                             depth,
                         )?;
@@ -1183,8 +1214,16 @@ impl Template {
                     let items = iterable_value.iter_pairs();
                     if items.is_empty() {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(else_branch, root, dot, scopes, output, true, depth)?;
+                        let flow = self.render_nodes(
+                            else_branch,
+                            root,
+                            dot,
+                            scopes,
+                            output,
+                            tracker,
+                            true,
+                            depth,
+                        )?;
                         pop_scope(scopes);
                         match flow {
                             RenderFlow::Normal | RenderFlow::Break | RenderFlow::Continue => {}
@@ -1207,8 +1246,9 @@ impl Template {
                                     assign_variable(scopes, &vars[1], item.clone())?;
                                 }
                             }
-                            let flow =
-                                self.render_nodes(body, root, &item, scopes, output, true, depth)?;
+                            let flow = self.render_nodes(
+                                body, root, &item, scopes, output, tracker, true, depth,
+                            )?;
                             pop_scope(scopes);
                             match flow {
                                 RenderFlow::Normal => {}
@@ -1226,8 +1266,9 @@ impl Template {
                     let value = self.eval_expr(value, root, dot, scopes)?;
                     if value.truthy() {
                         push_scope(scopes);
-                        let flow =
-                            self.render_nodes(body, root, &value, scopes, output, in_range, depth)?;
+                        let flow = self.render_nodes(
+                            body, root, &value, scopes, output, tracker, in_range, depth,
+                        )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
@@ -1240,6 +1281,7 @@ impl Template {
                             dot,
                             scopes,
                             output,
+                            tracker,
                             in_range,
                             depth,
                         )?;
@@ -1267,6 +1309,7 @@ impl Template {
                         &next_dot,
                         &mut template_scopes,
                         output,
+                        tracker,
                         in_range,
                         next_depth,
                     )?;
@@ -1294,6 +1337,7 @@ impl Template {
                             &next_dot,
                             &mut template_scopes,
                             output,
+                            tracker,
                             in_range,
                             next_depth,
                         )?;
@@ -1302,8 +1346,9 @@ impl Template {
                         }
                     } else {
                         push_scope(scopes);
-                        let flow = self
-                            .render_nodes(body, root, &next_dot, scopes, output, in_range, depth)?;
+                        let flow = self.render_nodes(
+                            body, root, &next_dot, scopes, output, tracker, in_range, depth,
+                        )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
                             return Ok(flow);
