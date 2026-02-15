@@ -1275,9 +1275,6 @@ impl Template {
     }
 
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
-        if text.as_bytes().contains(&b'=') {
-            validate_template_hazards(text)?;
-        }
         let left_delim = self.name_space.left_delim.read().unwrap().clone();
         let right_delim = self.name_space.right_delim.read().unwrap().clone();
         let tree = self.parse_tree_with_delims(text, &left_delim, &right_delim)?;
@@ -1301,6 +1298,10 @@ impl Template {
 
         let has_left_delim = text.contains(left_delim);
         if !has_left_delim {
+            if text.as_bytes().contains(&b'=') {
+                validate_unquoted_attr_hazards(text)?;
+            }
+
             if !maybe_has_html_comment_marker(text) {
                 return Ok(ParseTree {
                     nodes: vec![Node::Text(TextNode::from_span(
@@ -6628,21 +6629,13 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
-fn validate_template_hazards(source: &str) -> Result<()> {
-    if source.contains("{{") {
-        return Ok(());
-    }
-    validate_unquoted_attr_hazards(source)
-}
-
 fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
     let bytes = source.as_bytes();
     if !bytes.contains(&b'<') || !bytes.contains(&b'=') {
         return Ok(());
     }
 
-    let sanitized = source_without_actions(source);
-    let bytes = sanitized.as_bytes();
+    let bytes = source.as_bytes();
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -6745,33 +6738,6 @@ fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn source_without_actions(source: &str) -> Cow<'_, str> {
-    if !source.contains("{{") {
-        return Cow::Borrowed(source);
-    }
-
-    let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'}' && bytes[i + 1] == b'}' {
-                    i += 2;
-                    break;
-                }
-                i += 1;
-            }
-            out.push(' ');
-            continue;
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    Cow::Owned(out)
 }
 
 fn maybe_has_html_comment_marker(source: &str) -> bool {
