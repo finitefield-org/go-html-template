@@ -3231,7 +3231,9 @@ impl<'a> ParseContextAnalyzer<'a> {
     ) -> Result<Vec<AnalysisFlow>> {
         match node {
             Node::Text(text_node) => {
-                if text_node.prepared.is_none() {
+                if text_node.prepared.is_none()
+                    && should_prepare_text_plan_for_script_style(&tracker.state, &text_node.raw)
+                {
                     text_node.prepared = prepare_text_plan_for_script_style(
                         &tracker.state,
                         &tracker,
@@ -10138,24 +10140,47 @@ fn ensure_filtered_prefix<'a>(
         .expect("filtered prefix must exist")
 }
 
+fn contains_open_script_or_style_tag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 7 {
+        return false;
+    }
+
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] != b'/' {
+            let rest = &bytes[i + 1..];
+            if matches_html_tag(rest, b"script") || matches_html_tag(rest, b"style") {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn should_prepare_text_plan_for_script_style(start_state: &ContextState, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if start_state.is_script_tag_context() || start_state.is_style_tag_context() {
+        return true;
+    }
+    if !start_state.is_text_context() {
+        return false;
+    }
+    if !text.as_bytes().contains(&b'<') {
+        return false;
+    }
+    contains_open_script_or_style_tag(text)
+}
+
 fn prepare_text_plan_for_script_style(
     start_state: &ContextState,
     tracker: &ContextTracker,
     text: &str,
 ) -> Option<PreparedTextPlan> {
-    if text.is_empty() {
-        return None;
-    }
-
-    let has_script_style_marker = contains_ascii_case_insensitive(text, b"<script")
-        || contains_ascii_case_insensitive(text, b"</script")
-        || contains_ascii_case_insensitive(text, b"<style")
-        || contains_ascii_case_insensitive(text, b"</style");
-
-    if !start_state.is_script_tag_context()
-        && !start_state.is_style_tag_context()
-        && !has_script_style_marker
-    {
+    if !should_prepare_text_plan_for_script_style(start_state, text) {
         return None;
     }
 
@@ -13542,6 +13567,28 @@ mod tests {
         }
 
         assert!(has_style_close_chunk);
+    }
+
+    #[test]
+    fn parse_skips_preparing_script_style_chunks_in_attr_context() {
+        let template = Template::new("prepared-attr")
+            .parse("<a title=\"{{.X}}<script></script>\">ok</a>")
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get("prepared-attr")
+            .expect("template nodes should exist");
+
+        let has_prepared_chunks = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Text(text_node) => Some(text_node.prepared.is_some()),
+                _ => None,
+            })
+            .any(std::convert::identity);
+
+        assert!(!has_prepared_chunks);
     }
 
     #[test]

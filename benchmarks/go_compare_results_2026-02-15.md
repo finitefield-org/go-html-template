@@ -280,3 +280,35 @@ cargo run --release --quiet --bin compare_go_html_template -- \
   --data benchmarks/go_compare_cases/data_main.json \
   --loops 20
 ```
+
+## Parse Text-Plan Precompute Tightening (Item 5)
+
+Optimization applied:
+- Added `should_prepare_text_plan_for_script_style` and moved `prepare_text_plan_for_script_style` behind this guard in parse analysis.
+- Tightened precompute trigger to:
+  - always allow script/style tag contexts,
+  - skip non-text contexts,
+  - skip text chunks without `<`,
+  - only precompute in HTML text when an actual opening `<script`/`<style` tag is present.
+- Replaced broad marker scans (`<script`, `</script`, `<style`, `</style`) with a single pass opener check.
+
+### Parse Breakdown Before/After
+
+Command:
+
+```bash
+cargo run --release --quiet --bin perf_parse_breakdown
+```
+
+| benchmark | before (avg_us) | after (avg_us) | change |
+|---|---:|---:|---:|
+| parse_tree_expr_20k | 8313 | 8427 | +1.4% |
+| parse_expr_20k | 9468 | 9131 | -3.6% |
+| parse_tree_html_mix | 8349 | 8278 | -0.9% |
+| parse_html_mix | 14138 | 14087 | -0.4% |
+
+### Selected Go Compare Case (Parse)
+
+| case | loops | before rust_parse_us | after rust_parse_us | change | output_match |
+|---|---:|---:|---:|---:|---|
+| static_200k | 20 | 1979 | 1626 | -17.8% | true |
