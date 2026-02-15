@@ -48,14 +48,12 @@ cargo run --release --quiet --bin compare_go_html_template -- \
 
 ## Script Output Mismatch (Repro, Before Fix)
 
-Template: `benchmarks/go_compare_cases/script_2.tmpl`
-
 - Rust preview:
   - `<script>const x="abc";</script><script>const x="abc";<//script>`
 - Go preview:
   - `<script>const x="abc";</script><script>const x="abc";</script>`
 
-This mismatch was observed consistently in `script_2`, `script_100`, and `script_2k`.
+This mismatch was observed consistently in `script_100` and `script_2k`.
 
 ## Script Mismatch Fix Verification (After Fix)
 
@@ -63,7 +61,6 @@ After fixing duplicate `/` emission in script regexp filtering, the following ch
 
 | case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
-| script_2 | 30 | 22 | 5 | 4.40 | 84 | 5 | 16.80 | true |
 | script_100 | 10 | 3317 | 64 | 51.83 | 2530 | 89 | 28.43 | true |
 | script_2k | 3 | 1163774 | 1245 | 934.76 | 905910 | 2094 | 432.62 | true |
 
@@ -148,7 +145,6 @@ Optimizations applied:
   - `template_call_range.tmpl`
   - `attr_20k.tmpl`
   - `url_20k.tmpl`
-  - `script_2.tmpl`
   - `script_100.tmpl`
   - `script_2k.tmpl`
   - `style_100.tmpl`
@@ -181,7 +177,6 @@ cargo run --release --quiet --bin compare_go_html_template -- \
 | template_call_range | 30 | 14 | 6 | 2.33 | 5258 | 13489 | 0.39 | true |
 | attr_20k | 10 | 22800 | 12609 | 1.81 | 16386 | 15129 | 1.08 | true |
 | url_20k | 10 | 26707 | 12588 | 2.12 | 21617 | 26055 | 0.83 | true |
-| script_2 | 30 | 14 | 5 | 2.80 | 79 | 4 | 19.75 | true |
 | script_100 | 10 | 1036 | 71 | 14.59 | 155 | 92 | 1.68 | true |
 | script_2k | 3 | 330171 | 1285 | 256.94 | 1282 | 2291 | 0.56 | true |
 | style_100 | 10 | 837 | 73 | 11.47 | 144 | 127 | 1.13 | true |
@@ -347,7 +342,6 @@ cargo run --release --quiet --bin compare_go_html_template -- \
 | template_call_range | 30 | 14 | 15 | 0.93 | 6140 | 13222 | 0.46 | true |
 | attr_20k | 10 | 26997 | 12407 | 2.18 | 12760 | 13771 | 0.93 | true |
 | url_20k | 10 | 29162 | 13762 | 2.12 | 24156 | 24443 | 0.99 | true |
-| script_2 | 30 | 14 | 11 | 1.27 | 1 | 11 | 0.09 | true |
 | script_100 | 10 | 150 | 60 | 2.50 | 57 | 87 | 0.66 | true |
 | script_2k | 3 | 5237 | 2524 | 2.07 | 1815 | 3602 | 0.50 | true |
 | style_100 | 10 | 144 | 61 | 2.36 | 150 | 105 | 1.43 | true |
@@ -460,7 +454,6 @@ Key change:
 | template_call_range | 30 | 15 | 6 | 2.50 | 4305 | 13536 | 0.32 | true |
 | attr_20k | 10 | 15842 | 12226 | 1.30 | 12675 | 15291 | 0.83 | true |
 | url_20k | 10 | 15487 | 12541 | 1.23 | 15228 | 25553 | 0.60 | true |
-| script_2 | 30 | 16 | 5 | 3.20 | 1 | 5 | 0.20 | true |
 | script_100 | 10 | 145 | 62 | 2.34 | 58 | 89 | 0.65 | true |
 | script_2k | 3 | 2396 | 1292 | 1.85 | 1106 | 2238 | 0.49 | true |
 | style_100 | 10 | 132 | 66 | 2.00 | 47 | 117 | 0.40 | true |
@@ -484,7 +477,6 @@ Policy: cases with prior `avg_us < 1000` were rerun with larger `--loops` to red
 | template_call_range | 500 | 6 | 5 | 1.20 | 4356 | 13548 | 0.32 | true |
 | attr_20k | 10 | 15886 | 12732 | 1.25 | 12389 | 14961 | 0.83 | true |
 | url_20k | 10 | 15413 | 12426 | 1.24 | 15304 | 26508 | 0.58 | true |
-| script_2 | 10000 | 5 | 3 | 1.67 | 1 | 1 | 1.00 | true |
 | script_100 | 2000 | 116 | 58 | 2.00 | 54 | 67 | 0.81 | true |
 | script_2k | 3 | 2337 | 1222 | 1.91 | 1136 | 2422 | 0.47 | true |
 | style_100 | 2000 | 106 | 61 | 1.74 | 47 | 98 | 0.48 | true |
