@@ -1213,6 +1213,16 @@ impl Template {
                 } => {
                     let iterable_value = self.eval_expr(iterable, root, dot, runtime, scopes)?;
                     let vars_len = vars.len();
+                    let iteration_count = range_iteration_count(&iterable_value);
+                    if vars_len == 0
+                        && iteration_count > 0
+                        && let Some(body_text) = range_static_text_body(body)
+                        && let Some(rendered_text) =
+                            range_static_text_fast_path_text(tracker, &body_text)
+                    {
+                        append_repeated_text(output, tracker, &rendered_text, iteration_count);
+                        continue;
+                    }
                     match &iterable_value {
                         Value::Json(JsonValue::Array(items)) if !items.is_empty() => {
                             if vars_len == 0 {
@@ -4407,6 +4417,73 @@ fn assign_range_variables(
         }
     }
     Ok(())
+}
+
+fn range_iteration_count(value: &Value) -> usize {
+    match value {
+        Value::Json(JsonValue::Array(items)) => items.len(),
+        Value::Json(JsonValue::Object(items)) => items.len(),
+        Value::Json(JsonValue::String(value)) => value.chars().count(),
+        _ => 0,
+    }
+}
+
+fn range_static_text_body(body: &[Node]) -> Option<String> {
+    let mut combined = String::new();
+    for node in body {
+        match node {
+            Node::Text(text) => combined.push_str(text),
+            _ => return None,
+        }
+    }
+    Some(combined)
+}
+
+fn range_static_text_fast_path_text(tracker: &ContextTracker, body_text: &str) -> Option<String> {
+    if body_text.is_empty() {
+        return Some(String::new());
+    }
+    if !tracker.state.is_text_context() {
+        return None;
+    }
+    if contains_ascii_case_insensitive(body_text, b"<script")
+        || contains_ascii_case_insensitive(body_text, b"</script")
+        || contains_ascii_case_insensitive(body_text, b"<style")
+        || contains_ascii_case_insensitive(body_text, b"</style")
+        || body_text.contains("<!--")
+        || body_text.contains("-->")
+    {
+        return None;
+    }
+
+    if body_text.as_bytes().contains(&b'<') {
+        Some(filter_html_text_sections(&tracker.rendered, body_text))
+    } else {
+        Some(body_text.to_string())
+    }
+}
+
+fn append_repeated_text(
+    output: &mut String,
+    tracker: &mut ContextTracker,
+    text: &str,
+    iterations: usize,
+) {
+    if iterations == 0 || text.is_empty() {
+        return;
+    }
+    if iterations == 1 {
+        output.push_str(text);
+        tracker.append_text(text);
+        return;
+    }
+
+    let mut repeated = String::with_capacity(text.len().saturating_mul(iterations));
+    for _ in 0..iterations {
+        repeated.push_str(text);
+    }
+    output.push_str(&repeated);
+    tracker.append_text(&repeated);
 }
 
 fn push_scope(scopes: &mut ScopeStack) {
@@ -13437,6 +13514,19 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "abc");
+    }
+
+    #[test]
+    fn range_no_vars_static_text_body_repeats_without_data_dependency() {
+        let template = Template::new("range-no-vars-static-text")
+            .parse("<ul>{{range .Items}}<li>x</li>{{end}}</ul>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": [1, 2, 3]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<ul><li>x</li><li>x</li><li>x</li></ul>");
     }
 
     #[test]
