@@ -865,6 +865,10 @@ impl Template {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
+        let root_json = match &root {
+            Value::Json(value) => Some(value),
+            _ => None,
+        };
         let mut rendered = String::new();
         let mut tracker = ContextTracker::from_state(ContextState::html_text());
         let mut scopes = vec![HashMap::new()];
@@ -872,6 +876,7 @@ impl Template {
             name,
             &root,
             &root,
+            root_json,
             &mut scopes,
             &mut rendered,
             &mut tracker,
@@ -892,6 +897,10 @@ impl Template {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
         let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
+        let root_json = match &root {
+            Value::Json(value) => Some(value),
+            _ => None,
+        };
         let mut rendered = String::new();
         let mut tracker = ContextTracker::from_state(ContextState::html_text());
         let mut scopes = vec![HashMap::new()];
@@ -899,6 +908,7 @@ impl Template {
             name,
             &root,
             &root,
+            root_json,
             &mut scopes,
             &mut rendered,
             &mut tracker,
@@ -1063,6 +1073,7 @@ impl Template {
         name: &str,
         root: &Value,
         dot: &Value,
+        dot_json: Option<&JsonValue>,
         scopes: &mut ScopeStack,
         output: &mut String,
         tracker: &mut ContextTracker,
@@ -1081,7 +1092,7 @@ impl Template {
             .get(name)
             .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
         self.render_nodes(
-            nodes, root, dot, scopes, output, tracker, runtime, in_range, depth,
+            nodes, root, dot, dot_json, scopes, output, tracker, runtime, in_range, depth,
         )
     }
 
@@ -1090,6 +1101,7 @@ impl Template {
         nodes: &[Node],
         root: &Value,
         dot: &Value,
+        dot_json: Option<&JsonValue>,
         scopes: &mut ScopeStack,
         output: &mut String,
         tracker: &mut ContextTracker,
@@ -1124,7 +1136,7 @@ impl Template {
                             mode = inferred_mode;
                         }
                     }
-                    let value = self.eval_expr(expr, root, dot, runtime, scopes)?;
+                    let value = self.eval_expr(expr, root, dot, dot_json, runtime, scopes)?;
                     let escaped = escape_value_for_mode(
                         &value,
                         mode,
@@ -1140,7 +1152,7 @@ impl Template {
                     value,
                     declare,
                 } => {
-                    let evaluated = self.eval_expr(value, root, dot, runtime, scopes)?;
+                    let evaluated = self.eval_expr(value, root, dot, dot_json, runtime, scopes)?;
                     if *declare {
                         declare_variable(scopes, name, evaluated);
                     } else {
@@ -1152,13 +1164,15 @@ impl Template {
                     then_branch,
                     else_branch,
                 } => {
-                    let condition_value = self.eval_expr(condition, root, dot, runtime, scopes)?;
+                    let condition_value =
+                        self.eval_expr(condition, root, dot, dot_json, runtime, scopes)?;
                     if condition_value.truthy() {
                         push_scope(scopes);
                         let flow = self.render_nodes(
                             then_branch,
                             root,
                             dot,
+                            dot_json,
                             scopes,
                             output,
                             tracker,
@@ -1176,6 +1190,7 @@ impl Template {
                             else_branch,
                             root,
                             dot,
+                            dot_json,
                             scopes,
                             output,
                             tracker,
@@ -1196,8 +1211,10 @@ impl Template {
                     body,
                     else_branch,
                 } => {
-                    let iterable_value = self.eval_expr(iterable, root, dot, runtime, scopes)?;
+                    let iterable_value =
+                        self.eval_expr(iterable, root, dot, dot_json, runtime, scopes)?;
                     let vars_len = vars.len();
+                    let body_uses_dot = nodes_may_reference_dot(body);
                     let iteration_count = range_iteration_count(&iterable_value);
                     if vars_len == 0
                         && iteration_count > 0
@@ -1217,9 +1234,16 @@ impl Template {
                                         .last_mut()
                                         .expect("range scope pushed before iteration")
                                         .clear();
-                                    let item = Value::Json(value.clone());
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        body,
+                                        root,
+                                        dot,
+                                        if body_uses_dot { Some(value) } else { None },
+                                        scopes,
+                                        output,
+                                        tracker,
+                                        runtime,
+                                        true,
                                         depth,
                                     )?;
                                     match flow {
@@ -1263,7 +1287,15 @@ impl Template {
                                         )?;
                                     }
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        body,
+                                        root,
+                                        &item,
+                                        if body_uses_dot { Some(value) } else { None },
+                                        scopes,
+                                        output,
+                                        tracker,
+                                        runtime,
+                                        true,
                                         depth,
                                     )?;
                                     match flow {
@@ -1280,16 +1312,23 @@ impl Template {
                             keys.sort_unstable();
                             if vars_len == 0 {
                                 push_scope(scopes);
-                                for key in keys {
+                                for map_key in keys {
                                     scopes
                                         .last_mut()
                                         .expect("range scope pushed before iteration")
                                         .clear();
-                                    let item = Value::Json(
-                                        items.get(key).expect("key collected from map").clone(),
-                                    );
+                                    let value_ref =
+                                        items.get(map_key).expect("key collected from map");
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        body,
+                                        root,
+                                        dot,
+                                        if body_uses_dot { Some(value_ref) } else { None },
+                                        scopes,
+                                        output,
+                                        tracker,
+                                        runtime,
+                                        true,
                                         depth,
                                     )?;
                                     match flow {
@@ -1306,11 +1345,11 @@ impl Template {
                                     Some(resolve_range_assign_targets(scopes, vars)?)
                                 };
                                 push_scope(scopes);
-                                for key in keys {
-                                    let item = Value::Json(
-                                        items.get(key).expect("key collected from map").clone(),
-                                    );
-                                    let key = (vars_len >= 2).then(|| Value::from(key));
+                                for map_key in keys {
+                                    let value_ref =
+                                        items.get(map_key).expect("key collected from map");
+                                    let item = Value::Json(value_ref.clone());
+                                    let key_value = (vars_len >= 2).then(|| Value::from(map_key));
                                     if *declare_vars {
                                         let range_scope = scopes
                                             .last_mut()
@@ -1318,7 +1357,7 @@ impl Template {
                                         declare_range_variables(
                                             range_scope,
                                             vars,
-                                            key,
+                                            key_value,
                                             item.clone(),
                                         );
                                     } else {
@@ -1330,12 +1369,20 @@ impl Template {
                                             scopes,
                                             vars,
                                             assign_targets.expect("assign targets resolved"),
-                                            key,
+                                            key_value,
                                             item.clone(),
                                         )?;
                                     }
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        body,
+                                        root,
+                                        &item,
+                                        if body_uses_dot { Some(value_ref) } else { None },
+                                        scopes,
+                                        output,
+                                        tracker,
+                                        runtime,
+                                        true,
                                         depth,
                                     )?;
                                     match flow {
@@ -1355,9 +1402,21 @@ impl Template {
                                         .last_mut()
                                         .expect("range scope pushed before iteration")
                                         .clear();
-                                    let item = Value::Json(JsonValue::String(ch.to_string()));
+                                    let item = if body_uses_dot {
+                                        Some(Value::Json(JsonValue::String(ch.to_string())))
+                                    } else {
+                                        None
+                                    };
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        body,
+                                        root,
+                                        item.as_ref().unwrap_or(dot),
+                                        None,
+                                        scopes,
+                                        output,
+                                        tracker,
+                                        runtime,
+                                        true,
                                         depth,
                                     )?;
                                     match flow {
@@ -1401,8 +1460,8 @@ impl Template {
                                         )?;
                                     }
                                     let flow = self.render_nodes(
-                                        body, root, &item, scopes, output, tracker, runtime, true,
-                                        depth,
+                                        body, root, &item, None, scopes, output, tracker, runtime,
+                                        true, depth,
                                     )?;
                                     match flow {
                                         RenderFlow::Normal => {}
@@ -1419,6 +1478,7 @@ impl Template {
                                 else_branch,
                                 root,
                                 dot,
+                                dot_json,
                                 scopes,
                                 output,
                                 tracker,
@@ -1438,11 +1498,16 @@ impl Template {
                     body,
                     else_branch,
                 } => {
-                    let value = self.eval_expr(value, root, dot, runtime, scopes)?;
+                    let value = self.eval_expr(value, root, dot, dot_json, runtime, scopes)?;
                     if value.truthy() {
+                        let value_json = match &value {
+                            Value::Json(json) => Some(json),
+                            _ => None,
+                        };
                         push_scope(scopes);
                         let flow = self.render_nodes(
-                            body, root, &value, scopes, output, tracker, runtime, in_range, depth,
+                            body, root, &value, value_json, scopes, output, tracker, runtime,
+                            in_range, depth,
                         )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
@@ -1454,6 +1519,7 @@ impl Template {
                             else_branch,
                             root,
                             dot,
+                            dot_json,
                             scopes,
                             output,
                             tracker,
@@ -1469,8 +1535,12 @@ impl Template {
                 }
                 Node::TemplateCall { name, data } => {
                     let next_dot = match data {
-                        Some(expr) => self.eval_expr(expr, root, dot, runtime, scopes)?,
-                        None => dot.clone(),
+                        Some(expr) => self.eval_expr(expr, root, dot, dot_json, runtime, scopes)?,
+                        None => dot_to_owned(dot, dot_json),
+                    };
+                    let next_dot_json = match &next_dot {
+                        Value::Json(json) => Some(json),
+                        _ => None,
                     };
                     let next_depth = depth + 1;
                     if next_depth > MAX_TEMPLATE_EXECUTION_DEPTH {
@@ -1483,6 +1553,7 @@ impl Template {
                         name,
                         root,
                         &next_dot,
+                        next_dot_json,
                         &mut template_scopes,
                         output,
                         tracker,
@@ -1496,8 +1567,12 @@ impl Template {
                 }
                 Node::Block { name, data, body } => {
                     let next_dot = match data {
-                        Some(expr) => self.eval_expr(expr, root, dot, runtime, scopes)?,
-                        None => dot.clone(),
+                        Some(expr) => self.eval_expr(expr, root, dot, dot_json, runtime, scopes)?,
+                        None => dot_to_owned(dot, dot_json),
+                    };
+                    let next_dot_json = match &next_dot {
+                        Value::Json(json) => Some(json),
+                        _ => None,
                     };
 
                     if self.name_space.templates.read().unwrap().contains_key(name) {
@@ -1512,6 +1587,7 @@ impl Template {
                             name,
                             root,
                             &next_dot,
+                            next_dot_json,
                             &mut template_scopes,
                             output,
                             tracker,
@@ -1525,7 +1601,15 @@ impl Template {
                     } else {
                         push_scope(scopes);
                         let flow = self.render_nodes(
-                            body, root, &next_dot, scopes, output, tracker, runtime, in_range,
+                            body,
+                            root,
+                            &next_dot,
+                            next_dot_json,
+                            scopes,
+                            output,
+                            tracker,
+                            runtime,
+                            in_range,
                             depth,
                         )?;
                         pop_scope(scopes);
@@ -1629,6 +1713,7 @@ impl Template {
         expr: &Expr,
         root: &Value,
         dot: &Value,
+        dot_json: Option<&JsonValue>,
         runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
@@ -1642,12 +1727,12 @@ impl Template {
                             "pipeline command must be a function".to_string(),
                         ));
                     }
-                    piped = Some(self.eval_term(term, root, dot, runtime, scopes)?);
+                    piped = Some(self.eval_term(term, root, dot, dot_json, runtime, scopes)?);
                 }
                 Command::Call { name, args } => {
                     let mut evaluated_args = args
                         .iter()
-                        .map(|arg| self.eval_term(arg, root, dot, runtime, scopes))
+                        .map(|arg| self.eval_term(arg, root, dot, dot_json, runtime, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
                     if index > 0 {
@@ -1658,8 +1743,9 @@ impl Template {
                     }
 
                     if index == 0 && evaluated_args.is_empty() {
-                        if let Some(value) = lookup_identifier(
+                        if let Some(value) = lookup_identifier_with_dot_json(
                             dot,
+                            dot_json,
                             root,
                             name,
                             &runtime.methods,
@@ -1669,14 +1755,12 @@ impl Template {
                             continue;
                         }
 
-                        if !runtime.funcs.contains_key(name) {
-                            if matches!(dot, Value::Json(JsonValue::Object(_)))
-                                || matches!(root, Value::Json(JsonValue::Object(_)))
-                            {
-                                piped =
-                                    Some(missing_value_for_key(name, runtime.missing_key_mode)?);
-                                continue;
-                            }
+                        if !runtime.funcs.contains_key(name)
+                            && (dot_is_object(dot, dot_json)
+                                || matches!(root, Value::Json(JsonValue::Object(_))))
+                        {
+                            piped = Some(missing_value_for_key(name, runtime.missing_key_mode)?);
+                            continue;
                         }
                     }
 
@@ -1692,7 +1776,7 @@ impl Template {
                 Command::Invoke { callee, args } => {
                     let mut evaluated_args = args
                         .iter()
-                        .map(|arg| self.eval_term(arg, root, dot, runtime, scopes))
+                        .map(|arg| self.eval_term(arg, root, dot, dot_json, runtime, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
                     if index > 0 {
@@ -1706,6 +1790,7 @@ impl Template {
                         &evaluated_args,
                         root,
                         dot,
+                        dot_json,
                         runtime,
                         scopes,
                     )?);
@@ -1721,13 +1806,18 @@ impl Template {
         term: &Term,
         root: &Value,
         dot: &Value,
+        dot_json: Option<&JsonValue>,
         runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
         match term {
-            Term::DotPath(path) => {
-                lookup_path_with_methods(dot, path, &runtime.methods, runtime.missing_key_mode)
-            }
+            Term::DotPath(path) => lookup_dot_path_with_methods(
+                dot,
+                dot_json,
+                path,
+                &runtime.methods,
+                runtime.missing_key_mode,
+            ),
             Term::RootPath(path) => {
                 lookup_path_with_methods(root, path, &runtime.methods, runtime.missing_key_mode)
             }
@@ -1744,13 +1834,18 @@ impl Template {
                 )
             }
             Term::Identifier(name) => {
-                if let Some(value) =
-                    lookup_identifier(dot, root, name, &runtime.methods, runtime.missing_key_mode)?
-                {
+                if let Some(value) = lookup_identifier_with_dot_json(
+                    dot,
+                    dot_json,
+                    root,
+                    name,
+                    &runtime.methods,
+                    runtime.missing_key_mode,
+                )? {
                     Ok(value)
                 } else if runtime.funcs.contains_key(name) {
                     Ok(Value::FunctionRef(name.clone()))
-                } else if matches!(dot, Value::Json(JsonValue::Object(_)))
+                } else if dot_is_object(dot, dot_json)
                     || matches!(root, Value::Json(JsonValue::Object(_)))
                 {
                     missing_value_for_key(name, runtime.missing_key_mode)
@@ -1760,9 +1855,9 @@ impl Template {
                     )))
                 }
             }
-            Term::SubExpr(expr) => self.eval_expr(expr, root, dot, runtime, scopes),
+            Term::SubExpr(expr) => self.eval_expr(expr, root, dot, dot_json, runtime, scopes),
             Term::SubExprPath { expr, path } => {
-                let base = self.eval_expr(expr, root, dot, runtime, scopes)?;
+                let base = self.eval_expr(expr, root, dot, dot_json, runtime, scopes)?;
                 lookup_path_with_methods(&base, path, &runtime.methods, runtime.missing_key_mode)
             }
         }
@@ -1774,11 +1869,12 @@ impl Template {
         args: &[Value],
         root: &Value,
         dot: &Value,
+        dot_json: Option<&JsonValue>,
         runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
         match callee {
-            Term::DotPath(path) => self.call_path_method(dot, path, args, runtime),
+            Term::DotPath(path) => self.call_dot_path_method(dot, dot_json, path, args, runtime),
             Term::RootPath(path) => self.call_path_method(root, path, args, runtime),
             Term::Variable { name, path } => {
                 let variable = lookup_variable(scopes, name).ok_or_else(|| {
@@ -1788,6 +1884,10 @@ impl Template {
             }
             Term::Identifier(name) => {
                 if let Some(method) = runtime.methods.get(name) {
+                    if let Some(dot_json) = dot_json {
+                        let dot_value = Value::Json(dot_json.clone());
+                        return method(&dot_value, args);
+                    }
                     return method(dot, args);
                 }
                 Err(TemplateError::Render(format!(
@@ -1801,10 +1901,37 @@ impl Template {
                 "parenthesized expressions are not callable".to_string(),
             )),
             Term::SubExprPath { expr, path } => {
-                let receiver = self.eval_expr(expr, root, dot, runtime, scopes)?;
+                let receiver = self.eval_expr(expr, root, dot, dot_json, runtime, scopes)?;
                 self.call_path_method(&receiver, path, args, runtime)
             }
         }
+    }
+
+    fn call_dot_path_method(
+        &self,
+        dot: &Value,
+        dot_json: Option<&JsonValue>,
+        path: &[String],
+        args: &[Value],
+        runtime: &RuntimeContext<'_>,
+    ) -> Result<Value> {
+        if let Some(base_json) = dot_json {
+            if path.is_empty() {
+                return Err(TemplateError::Render("path is not callable".to_string()));
+            }
+            let (method_name, receiver_path) = split_last_path(path);
+            let receiver = lookup_json_path_with_methods(
+                base_json,
+                receiver_path,
+                &runtime.methods,
+                runtime.missing_key_mode,
+            )?;
+            let method = runtime.methods.get(method_name).ok_or_else(|| {
+                TemplateError::Render(format!("method `{method_name}` is not registered"))
+            })?;
+            return method(&receiver, args);
+        }
+        self.call_path_method(dot, path, args, runtime)
     }
 
     fn call_path_method(
@@ -4352,6 +4479,80 @@ fn lookup_path_with_methods(
     Ok(current)
 }
 
+fn lookup_json_path_with_methods(
+    base_json: &JsonValue,
+    path: &[String],
+    methods: &MethodMap,
+    missing_key_mode: MissingKeyMode,
+) -> Result<Value> {
+    if path.is_empty() {
+        return Ok(Value::Json(base_json.clone()));
+    }
+
+    let mut current_json = base_json;
+    for (index, segment) in path.iter().enumerate() {
+        let direct = match current_json {
+            JsonValue::Object(map) => map.get(segment),
+            JsonValue::Array(items) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|item_index| items.get(item_index)),
+            _ => None,
+        };
+
+        if let Some(next_json) = direct {
+            current_json = next_json;
+            continue;
+        }
+
+        if let Some(method) = methods.get(segment) {
+            let receiver = Value::Json(current_json.clone());
+            let mut current = method(&receiver, &[])?;
+            for remaining in &path[index + 1..] {
+                current = lookup_single_segment(&current, remaining, methods, missing_key_mode)?;
+            }
+            return Ok(current);
+        }
+
+        return match current_json {
+            JsonValue::Object(_) => missing_value_for_key(segment, missing_key_mode),
+            _ => Ok(Value::Json(JsonValue::Null)),
+        };
+    }
+
+    Ok(Value::Json(current_json.clone()))
+}
+
+fn lookup_dot_path_with_methods(
+    dot: &Value,
+    dot_json: Option<&JsonValue>,
+    path: &[String],
+    methods: &MethodMap,
+    missing_key_mode: MissingKeyMode,
+) -> Result<Value> {
+    if let Some(base_json) = dot_json {
+        lookup_json_path_with_methods(base_json, path, methods, missing_key_mode)
+    } else {
+        lookup_path_with_methods(dot, path, methods, missing_key_mode)
+    }
+}
+
+fn dot_to_owned(dot: &Value, dot_json: Option<&JsonValue>) -> Value {
+    if let Some(value) = dot_json {
+        Value::Json(value.clone())
+    } else {
+        dot.clone()
+    }
+}
+
+fn dot_is_object(dot: &Value, dot_json: Option<&JsonValue>) -> bool {
+    if let Some(value) = dot_json {
+        matches!(value, JsonValue::Object(_))
+    } else {
+        matches!(dot, Value::Json(JsonValue::Object(_)))
+    }
+}
+
 fn lookup_single_segment(
     current: &Value,
     segment: &str,
@@ -4383,18 +4584,33 @@ fn lookup_single_segment(
     }
 }
 
-fn lookup_identifier(
+fn lookup_identifier_with_dot_json(
     dot: &Value,
+    dot_json: Option<&JsonValue>,
     root: &Value,
     name: &str,
     methods: &MethodMap,
     _missing_key_mode: MissingKeyMode,
 ) -> Result<Option<Value>> {
-    if let Some(value) = lookup_object_key(dot, name).or_else(|| lookup_object_key(root, name)) {
+    if let Some(value) = dot_json {
+        if let JsonValue::Object(map) = value
+            && let Some(found) = map.get(name)
+        {
+            return Ok(Some(Value::Json(found.clone())));
+        }
+    } else if let Some(value) = lookup_object_key(dot, name) {
+        return Ok(Some(value));
+    }
+
+    if let Some(value) = lookup_object_key(root, name) {
         return Ok(Some(value));
     }
 
     if let Some(method) = methods.get(name) {
+        if let Some(dot_json) = dot_json {
+            let dot_value = Value::Json(dot_json.clone());
+            return Ok(Some(method(&dot_value, &[])?));
+        }
         return Ok(Some(method(dot, &[])?));
     }
 
@@ -4564,6 +4780,112 @@ fn range_iteration_count(value: &Value) -> usize {
         Value::Json(JsonValue::String(value)) => value.chars().count(),
         _ => 0,
     }
+}
+
+fn term_may_reference_dot(term: &Term) -> bool {
+    match term {
+        Term::DotPath(_) | Term::Identifier(_) => true,
+        Term::SubExpr(expr) => expr_may_reference_dot(expr),
+        Term::SubExprPath { expr, .. } => expr_may_reference_dot(expr),
+        Term::RootPath(_) | Term::Variable { .. } | Term::Literal(_) => false,
+    }
+}
+
+fn expr_may_reference_dot(expr: &Expr) -> bool {
+    for command in &expr.commands {
+        match command {
+            Command::Value(term) => {
+                if term_may_reference_dot(term) {
+                    return true;
+                }
+            }
+            Command::Call { args, .. } => {
+                if args.iter().any(term_may_reference_dot) {
+                    return true;
+                }
+            }
+            Command::Invoke { callee, args } => {
+                if term_may_reference_dot(callee) || args.iter().any(term_may_reference_dot) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn nodes_may_reference_dot(nodes: &[Node]) -> bool {
+    for node in nodes {
+        match node {
+            Node::Text(_) | Node::Break | Node::Continue => {}
+            Node::Expr { expr, .. } => {
+                if expr_may_reference_dot(expr) {
+                    return true;
+                }
+            }
+            Node::SetVar { value, .. } => {
+                if expr_may_reference_dot(value) {
+                    return true;
+                }
+            }
+            Node::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                if expr_may_reference_dot(condition)
+                    || nodes_may_reference_dot(then_branch)
+                    || nodes_may_reference_dot(else_branch)
+                {
+                    return true;
+                }
+            }
+            Node::Range {
+                iterable,
+                body,
+                else_branch,
+                ..
+            } => {
+                if expr_may_reference_dot(iterable)
+                    || nodes_may_reference_dot(body)
+                    || nodes_may_reference_dot(else_branch)
+                {
+                    return true;
+                }
+            }
+            Node::With {
+                value,
+                body,
+                else_branch,
+            } => {
+                if expr_may_reference_dot(value)
+                    || nodes_may_reference_dot(body)
+                    || nodes_may_reference_dot(else_branch)
+                {
+                    return true;
+                }
+            }
+            Node::TemplateCall { data, .. } => {
+                if data.is_none() || data.as_ref().is_some_and(expr_may_reference_dot) {
+                    return true;
+                }
+            }
+            Node::Block { data, body, .. } => {
+                if data.is_none()
+                    || data.as_ref().is_some_and(expr_may_reference_dot)
+                    || nodes_may_reference_dot(body)
+                {
+                    return true;
+                }
+            }
+            Node::Define { body, .. } => {
+                if nodes_may_reference_dot(body) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn range_static_text_body(body: &[Node]) -> Option<String> {
@@ -13900,6 +14222,21 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<ul><li>x</li><li>x</li><li>x</li></ul>");
+    }
+
+    #[test]
+    fn range_template_call_without_data_uses_current_dot() {
+        let template = Template::new("range-template-dot")
+            .parse(
+                "{{define \"item\"}}{{.Name}};{{end}}{{range .Items}}{{template \"item\"}}{{end}}",
+            )
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items":[{"Name":"a"},{"Name":"b"}]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "a;b;");
     }
 
     #[test]
