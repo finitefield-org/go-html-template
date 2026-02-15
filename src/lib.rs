@@ -1120,17 +1120,13 @@ impl Template {
                         self.render_text_segment(&text_node.raw, output, tracker);
                     }
                 }
-                Node::Expr { expr, mode } => {
+                Node::Expr {
+                    expr,
+                    mode,
+                    runtime_mode,
+                } => {
                     let mut mode = *mode;
-                    if matches!(
-                        mode,
-                        EscapeMode::AttrQuoted {
-                            kind: AttrKind::Normal,
-                            ..
-                        } | EscapeMode::AttrUnquoted {
-                            kind: AttrKind::Normal
-                        }
-                    ) {
+                    if *runtime_mode {
                         let inferred_mode = tracker.mode();
                         if !matches!(inferred_mode, EscapeMode::AttrName) {
                             mode = inferred_mode;
@@ -1145,7 +1141,19 @@ impl Template {
                         tracker.css_url_part_hint(),
                     )?;
                     output.push_str(&escaped);
-                    tracker.append_text(&escaped);
+                    let skip_tracker_update = !*runtime_mode
+                        && matches!(
+                            mode,
+                            EscapeMode::AttrQuoted {
+                                kind: AttrKind::Normal,
+                                ..
+                            } | EscapeMode::AttrUnquoted {
+                                kind: AttrKind::Normal
+                            }
+                        );
+                    if !skip_tracker_update {
+                        tracker.append_text(&escaped);
+                    }
                 }
                 Node::SetVar {
                     name,
@@ -2230,6 +2238,7 @@ enum Node {
     Expr {
         expr: Expr,
         mode: EscapeMode,
+        runtime_mode: bool,
     },
     SetVar {
         name: String,
@@ -3211,12 +3220,17 @@ impl<'a> ParseContextAnalyzer<'a> {
                 tracker.append_text(&text_node.raw);
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
-            Node::Expr { expr: _, mode, .. } => {
+            Node::Expr {
+                expr: _,
+                mode,
+                runtime_mode,
+            } => {
                 if should_validate_action_context(&tracker) {
                     validate_action_context_before_insertion(&tracker)?;
                 }
                 let escape_mode = tracker.mode();
                 *mode = escape_mode;
+                *runtime_mode = should_resolve_expr_mode_at_runtime(escape_mode, &tracker);
                 if placeholder_advances_parse_context(&tracker, escape_mode) {
                     tracker.append_expr_placeholder(escape_mode);
                 }
@@ -3524,6 +3538,24 @@ fn should_validate_action_context(tracker: &ContextTracker) -> bool {
         || state.in_css_attribute
         || state.is_script_tag_context()
         || state.is_style_tag_context()
+}
+
+fn should_resolve_expr_mode_at_runtime(mode: EscapeMode, tracker: &ContextTracker) -> bool {
+    if !matches!(
+        mode,
+        EscapeMode::AttrQuoted {
+            kind: AttrKind::Normal,
+            ..
+        } | EscapeMode::AttrUnquoted {
+            kind: AttrKind::Normal
+        }
+    ) {
+        return false;
+    }
+
+    current_tag_value_context(&tracker.rendered)
+        .as_ref()
+        .is_some_and(|context| context.attr_name.ends_with('x'))
 }
 
 fn placeholder_advances_parse_context(tracker: &ContextTracker, mode: EscapeMode) -> bool {
@@ -5634,6 +5666,7 @@ fn parse_nodes(
                             nodes.push(Node::Expr {
                                 expr,
                                 mode: EscapeMode::Html,
+                                runtime_mode: false,
                             });
                         }
                         *index += 1;

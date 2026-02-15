@@ -230,3 +230,25 @@ cargo run --release --quiet --bin perf_parse_breakdown
 | case | loops | before rust_parse_us | after rust_parse_us | change | output_match |
 |---|---:|---:|---:|---:|---|
 | static_200k | 20 | 3025 | 2407 | -20.4% | true |
+
+## Runtime Tracker Dependency Reduction For Fixed Expr Modes (Item 3)
+
+Optimization applied:
+- Added `runtime_mode` to `Node::Expr` and decide at parse-time whether mode needs runtime re-resolution.
+- In execute, fixed-mode expressions skip `tracker.mode()` inference.
+- For fixed `AttrKind::Normal` expressions, tracker context update now skips appending escaped output text (context is unchanged by escaping), reducing hot-path tracker work.
+
+### Before/After (`attr_20k`, same command pattern)
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_execute_us | after rust_execute_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| attr_20k | 10 | 25256 | 27091 | +7.3% | 20909 | 12877 | -38.4% | true |
+
+Reference command:
+
+```bash
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/attr_20k.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops 10
+```
