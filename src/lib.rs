@@ -2127,62 +2127,42 @@ impl ContextTracker {
     fn append_text(&mut self, text: &str) {
         self.rendered.push_str(text);
         let state = self.state();
-        if !matches!(state.mode, EscapeMode::AttrName)
-            && !in_css_attribute_context(&self.rendered)
-            && !matches!(
-                state.mode,
-                EscapeMode::ScriptExpr
-                    | EscapeMode::ScriptString { .. }
-                    | EscapeMode::ScriptJsonString { .. }
-                    | EscapeMode::ScriptTemplate
-                    | EscapeMode::ScriptRegexp
-                    | EscapeMode::ScriptLineComment
-                    | EscapeMode::ScriptBlockComment
-                    | EscapeMode::AttrQuoted {
-                        kind: AttrKind::Url,
-                        ..
-                    }
-                    | EscapeMode::AttrUnquoted {
-                        kind: AttrKind::Url
-                    }
-                    | EscapeMode::StyleString { .. }
-            )
-        {
-            self.normalize();
+        if should_normalize_tracker_state(&state) {
+            self.normalize_from_state(&state);
         }
     }
 
     fn append_expr_placeholder(&mut self, mode: EscapeMode) {
         self.rendered.push_str(placeholder_for_mode(mode));
-        if !matches!(mode, EscapeMode::AttrName)
-            && !in_css_attribute_context(&self.rendered)
-            && !matches!(
-                mode,
-                EscapeMode::ScriptExpr
-                    | EscapeMode::ScriptString { .. }
-                    | EscapeMode::ScriptJsonString { .. }
-                    | EscapeMode::ScriptTemplate
-                    | EscapeMode::ScriptRegexp
-                    | EscapeMode::ScriptLineComment
-                    | EscapeMode::ScriptBlockComment
-                    | EscapeMode::AttrQuoted {
-                        kind: AttrKind::Url,
-                        ..
-                    }
-                    | EscapeMode::AttrUnquoted {
-                        kind: AttrKind::Url
-                    }
-                    | EscapeMode::StyleString { .. }
-            )
-        {
-            self.normalize();
+        let state = self.state();
+        if should_normalize_tracker_state(&state) {
+            self.normalize_from_state(&state);
         }
     }
 
-    fn normalize(&mut self) {
-        let state = self.state();
-        self.rendered = seed_rendered_for_state(&state);
+    fn normalize_from_state(&mut self, state: &ContextState) {
+        let url_part = url_part_from_mode_and_rendered(state.mode, &self.rendered);
+        self.rendered = seed_rendered_for_state_with_url_part(state, url_part);
     }
+}
+
+fn should_normalize_tracker_state(state: &ContextState) -> bool {
+    if state.in_css_attribute {
+        return false;
+    }
+
+    !matches!(
+        state.mode,
+        EscapeMode::AttrName
+            | EscapeMode::ScriptExpr
+            | EscapeMode::ScriptString { .. }
+            | EscapeMode::ScriptJsonString { .. }
+            | EscapeMode::ScriptTemplate
+            | EscapeMode::ScriptRegexp
+            | EscapeMode::ScriptLineComment
+            | EscapeMode::ScriptBlockComment
+            | EscapeMode::StyleString { .. }
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2877,6 +2857,34 @@ fn attr_name_for_kind(kind: AttrKind) -> &'static str {
 }
 
 fn seed_rendered_for_state(state: &ContextState) -> String {
+    seed_rendered_for_state_with_url_part(state, None)
+}
+
+fn url_part_seed_suffix(url_part: Option<UrlPartContext>) -> &'static str {
+    match url_part.unwrap_or(UrlPartContext::Path) {
+        UrlPartContext::Path => "x",
+        UrlPartContext::Query => "x?x",
+        UrlPartContext::Fragment => "x#x",
+    }
+}
+
+fn url_part_from_mode_and_rendered(mode: EscapeMode, rendered: &str) -> Option<UrlPartContext> {
+    match mode {
+        EscapeMode::AttrQuoted {
+            kind: AttrKind::Url,
+            ..
+        }
+        | EscapeMode::AttrUnquoted {
+            kind: AttrKind::Url,
+        } => url_part_context(rendered),
+        _ => None,
+    }
+}
+
+fn seed_rendered_for_state_with_url_part(
+    state: &ContextState,
+    url_part: Option<UrlPartContext>,
+) -> String {
     match state.mode {
         EscapeMode::Html => {
             if state.in_open_tag {
@@ -2887,8 +2895,21 @@ fn seed_rendered_for_state(state: &ContextState) -> String {
         }
         EscapeMode::Rcdata => "<textarea>".to_string(),
         EscapeMode::AttrName => "<a x".to_string(),
+        EscapeMode::AttrQuoted {
+            kind: AttrKind::Url,
+            quote,
+        } => {
+            let seed = url_part_seed_suffix(url_part);
+            format!("<a {}={quote}{seed}", attr_name_for_kind(AttrKind::Url))
+        }
         EscapeMode::AttrQuoted { kind, quote } => {
             format!("<a {}={quote}x", attr_name_for_kind(kind))
+        }
+        EscapeMode::AttrUnquoted {
+            kind: AttrKind::Url,
+        } => {
+            let seed = url_part_seed_suffix(url_part);
+            format!("<a {}={seed}", attr_name_for_kind(AttrKind::Url))
         }
         EscapeMode::AttrUnquoted { kind } => format!("<a {}=x", attr_name_for_kind(kind)),
         EscapeMode::ScriptExpr => "<script>".to_string(),
@@ -5721,13 +5742,6 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
     }
 
     EscapeMode::Html
-}
-
-fn in_css_attribute_context(rendered: &str) -> bool {
-    match current_tag_value_context(rendered) {
-        Some(context) => attr_kind(&context.attr_name) == AttrKind::Css,
-        None => false,
-    }
 }
 
 fn current_tag_value_context(rendered: &str) -> Option<TagValueContext> {
