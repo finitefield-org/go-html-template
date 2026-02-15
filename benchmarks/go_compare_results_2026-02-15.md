@@ -153,3 +153,52 @@ Optimizations applied:
   - `script_2k.tmpl`
   - `style_100.tmpl`
   - `style_2k.tmpl`
+
+## Re-run After Revert (2026-02-15)
+
+Revert target:
+- Linear/static template execution-plan experiment (branchless `Text + Expr` fast path).
+
+Measurement command pattern:
+
+```bash
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/<case>.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops <case-specific>
+```
+
+| case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 20 | 3025 | 58 | 52.16 | 1633 | 256 | 6.38 | true |
+| expr_20k | 20 | 9520 | 9516 | 1.00 | 3073 | 13550 | 0.23 | true |
+| deep_path_20k | 20 | 17830 | 22916 | 0.78 | 3108 | 20114 | 0.15 | true |
+| func_print_20k | 20 | 14345 | 13602 | 1.05 | 4851 | 21742 | 0.22 | true |
+| range_no_vars | 30 | 13 | 6 | 2.17 | 1488 | 651 | 2.29 | true |
+| range_var_decl | 30 | 13 | 7 | 1.86 | 9225 | 24116 | 0.38 | true |
+| range_var_assign | 30 | 16 | 9 | 1.78 | 9245 | 24535 | 0.38 | true |
+| if_else_20k | 20 | 38904 | 32571 | 1.19 | 6921 | 16192 | 0.43 | true |
+| template_call_range | 30 | 14 | 6 | 2.33 | 5258 | 13489 | 0.39 | true |
+| attr_20k | 10 | 22800 | 12609 | 1.81 | 16386 | 15129 | 1.08 | true |
+| url_20k | 10 | 26707 | 12588 | 2.12 | 21617 | 26055 | 0.83 | true |
+| script_2 | 30 | 14 | 5 | 2.80 | 79 | 4 | 19.75 | true |
+| script_100 | 10 | 1036 | 71 | 14.59 | 155 | 92 | 1.68 | true |
+| script_2k | 3 | 330171 | 1285 | 256.94 | 1282 | 2291 | 0.56 | true |
+| style_100 | 10 | 837 | 73 | 11.47 | 144 | 127 | 1.13 | true |
+| style_2k | 3 | 252130 | 1271 | 198.37 | 1112 | 3279 | 0.34 | true |
+
+## Action-Context Validation Cache Optimization (Item 1)
+
+Optimization applied:
+- `validate_action_context_before_insertion` now uses `ContextTracker` cached state (`js_scan_state`, `in_js_attribute`, `in_css_attribute`) instead of rebuilding JS/CSS prefixes and rescanning per action.
+- Slash ambiguity check now reads JS expr context from tracker cache (`tracker_script_expr_context`) instead of rescanning rendered prefixes.
+- Trailing escape check switched to suffix byte scan (`has_unfinished_escape_suffix`) to avoid full-prefix allocations/scans.
+
+### Before/After (same templates, same loops)
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_exec_us | after rust_exec_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| script_100 | 10 | 1036 | 164 | -84.2% | 155 | 144 | -7.1% | true |
+| style_100 | 10 | 837 | 207 | -75.3% | 144 | 141 | -2.1% | true |
+| script_2k | 3 | 330171 | 2844 | -99.1% | 1282 | 1396 | +8.9% | true |
+| style_2k | 3 | 252130 | 2984 | -98.8% | 1112 | 1209 | +8.7% | true |

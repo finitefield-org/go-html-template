@@ -3271,7 +3271,7 @@ where
         if !matches!(flow.tracker.state().mode, EscapeMode::ScriptExpr) {
             continue;
         }
-        if let Some(context) = script_expr_context(&flow.tracker.rendered) {
+        if let Some(context) = tracker_script_expr_context(&flow.tracker) {
             js_contexts.insert(context);
         }
     }
@@ -3458,29 +3458,29 @@ fn validate_function_calls_in_term(term: &Term, funcs: &FuncMap) -> Result<()> {
 }
 
 fn validate_action_context_before_insertion(tracker: &ContextTracker) -> Result<()> {
-    if let Some(prefix) = javascript_prefix_for_context(&tracker.rendered) {
-        if has_unfinished_escape(&prefix) {
+    if tracker.state.in_js_attribute || tracker.state.is_script_tag_context() {
+        if has_unfinished_escape_suffix(&tracker.rendered) {
             return Err(TemplateError::Parse(
                 "unfinished escape sequence in JS string".to_string(),
             ));
         }
         if matches!(tracker.mode(), EscapeMode::ScriptRegexp)
             && matches!(
-                current_js_scan_state(&prefix),
-                JsScanState::RegExp {
+                tracker.js_scan_state,
+                Some(JsScanState::RegExp {
                     in_char_class: true,
                     ..
-                }
+                })
             )
         {
-            return Err(TemplateError::Parse(format!(
-                "unfinished JS regexp charset: {prefix:?}"
-            )));
+            return Err(TemplateError::Parse(
+                "unfinished JS regexp charset".to_string(),
+            ));
         }
     }
 
-    if let Some(prefix) = css_prefix_for_context(&tracker.rendered) {
-        if has_unfinished_escape(&prefix) {
+    if tracker.state.in_css_attribute || tracker.state.is_style_tag_context() {
+        if has_unfinished_escape_suffix(&tracker.rendered) {
             return Err(TemplateError::Parse(
                 "unfinished escape sequence in CSS string".to_string(),
             ));
@@ -3490,31 +3490,13 @@ fn validate_action_context_before_insertion(tracker: &ContextTracker) -> Result<
     Ok(())
 }
 
-fn has_unfinished_escape(prefix: &str) -> bool {
-    let mut slash_count = 0usize;
-    for ch in prefix.chars().rev() {
-        if ch == '\\' {
-            slash_count += 1;
-        } else {
-            break;
-        }
+fn has_unfinished_escape_suffix(rendered: &str) -> bool {
+    let bytes = rendered.as_bytes();
+    let mut index = bytes.len();
+    while index > 0 && bytes[index - 1] == b'\\' {
+        index -= 1;
     }
-    slash_count % 2 == 1
-}
-
-fn javascript_prefix_for_context(rendered: &str) -> Option<String> {
-    if let Some(context) = current_tag_value_context(rendered) {
-        if attr_kind(&context.attr_name) == AttrKind::Js {
-            return Some(context.value_prefix);
-        }
-    }
-
-    let script_tag = current_unclosed_script_tag(rendered)?;
-    if !is_script_type_javascript(script_tag) {
-        return None;
-    }
-
-    current_unclosed_tag_content(rendered, "script").map(str::to_string)
+    ((bytes.len() - index) & 1) == 1
 }
 
 fn css_prefix_for_context(rendered: &str) -> Option<String> {
@@ -3527,9 +3509,8 @@ fn css_prefix_for_context(rendered: &str) -> Option<String> {
     current_unclosed_tag_content(rendered, "style").map(str::to_string)
 }
 
-fn script_expr_context(rendered: &str) -> Option<JsContext> {
-    let prefix = javascript_prefix_for_context(rendered)?;
-    match current_js_scan_state(&prefix) {
+fn tracker_script_expr_context(tracker: &ContextTracker) -> Option<JsContext> {
+    match tracker.js_scan_state? {
         JsScanState::Expr { js_ctx }
         | JsScanState::TemplateExpr { js_ctx, .. }
         | JsScanState::TemplateExprSingleQuote { js_ctx, .. }
