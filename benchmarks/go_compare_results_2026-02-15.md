@@ -252,3 +252,31 @@ cargo run --release --quiet --bin compare_go_html_template -- \
   --data benchmarks/go_compare_cases/data_main.json \
   --loops 10
 ```
+
+## Static/Range Specialized Path Reinforcement (Item 4)
+
+Optimization applied:
+- `range` static-body fast path now computes a `RepeatedTextPlan` and skips tracker updates only when one-iteration state is proven invariant (state/url/js/css/json scan state unchanged).
+- `append_repeated_text` now has a tracker-skip branch that repeats directly into output without building tracker context.
+- Added top-level execute fast path for action-free text-only templates (excluding script/style tag content), bypassing tracker/render loop entirely.
+
+### Before/After (selected)
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_execute_us | after rust_execute_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| range_no_vars | 30 | 13 | 20 | +53.8% | 1488 | 209 | -86.0% | true |
+| static_200k | 20 | 1929 | 2099 | +8.8% | 599 | 467 | -22.0% | true |
+
+Reference commands:
+
+```bash
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/range_no_vars.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops 30
+
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/static_200k.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops 20
+```

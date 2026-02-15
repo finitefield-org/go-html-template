@@ -848,6 +848,14 @@ impl Template {
         }
     }
 
+    fn text_only_template_output(&self, name: &str) -> Result<Option<String>> {
+        let templates = self.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get(name)
+            .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
+        Ok(collect_text_only_template_output(nodes))
+    }
+
     pub fn execute<T: Serialize, W: Write>(&self, writer: &mut W, data: &T) -> Result<()> {
         self.execute_template(writer, &self.name, data)
     }
@@ -863,6 +871,10 @@ impl Template {
         data: &T,
     ) -> Result<()> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
+        if let Some(rendered) = self.text_only_template_output(name)? {
+            writer.write_all(rendered.as_bytes())?;
+            return Ok(());
+        }
         let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
         let root_json = match &root {
@@ -895,6 +907,9 @@ impl Template {
 
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
+        if let Some(rendered) = self.text_only_template_output(name)? {
+            return Ok(rendered);
+        }
         let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
         let root_json = match &root {
@@ -1227,10 +1242,16 @@ impl Template {
                     if vars_len == 0
                         && iteration_count > 0
                         && let Some(body_text) = range_static_text_body(body)
-                        && let Some(rendered_text) =
+                        && let Some(repeated_plan) =
                             range_static_text_fast_path_text(tracker, &body_text)
                     {
-                        append_repeated_text(output, tracker, &rendered_text, iteration_count);
+                        append_repeated_text(
+                            output,
+                            tracker,
+                            &repeated_plan.text,
+                            iteration_count,
+                            !repeated_plan.updates_tracker,
+                        );
                         continue;
                     }
                     match &iterable_value {
@@ -4971,6 +4992,25 @@ fn range_iteration_count(value: &Value) -> usize {
     }
 }
 
+fn collect_text_only_template_output(nodes: &[Node]) -> Option<String> {
+    let mut combined = String::new();
+    for node in nodes {
+        if let Node::Text(text_node) = node {
+            combined.push_str(&text_node.raw);
+        } else {
+            return None;
+        }
+    }
+    if contains_ascii_case_insensitive(&combined, b"<script")
+        || contains_ascii_case_insensitive(&combined, b"</script")
+        || contains_ascii_case_insensitive(&combined, b"<style")
+        || contains_ascii_case_insensitive(&combined, b"</style")
+    {
+        return None;
+    }
+    Some(combined)
+}
+
 fn term_may_reference_dot(term: &Term) -> bool {
     match term {
         Term::DotPath(_) | Term::Identifier(_) => true,
@@ -5088,9 +5128,20 @@ fn range_static_text_body(body: &[Node]) -> Option<String> {
     Some(combined)
 }
 
-fn range_static_text_fast_path_text(tracker: &ContextTracker, body_text: &str) -> Option<String> {
+struct RepeatedTextPlan {
+    text: String,
+    updates_tracker: bool,
+}
+
+fn range_static_text_fast_path_text(
+    tracker: &ContextTracker,
+    body_text: &str,
+) -> Option<RepeatedTextPlan> {
     if body_text.is_empty() {
-        return Some(String::new());
+        return Some(RepeatedTextPlan {
+            text: String::new(),
+            updates_tracker: false,
+        });
     }
     if !tracker.state.is_text_context() {
         return None;
@@ -5105,10 +5156,40 @@ fn range_static_text_fast_path_text(tracker: &ContextTracker, body_text: &str) -
         return None;
     }
 
-    if body_text.as_bytes().contains(&b'<') {
-        Some(filter_html_text_sections(&tracker.rendered, body_text))
+    let text = if body_text.as_bytes().contains(&b'<') {
+        filter_html_text_sections(&tracker.rendered, body_text)
     } else {
-        Some(body_text.to_string())
+        body_text.to_string()
+    };
+    if text.is_empty() {
+        return Some(RepeatedTextPlan {
+            text,
+            updates_tracker: false,
+        });
+    }
+
+    let mut probe = tracker.clone();
+    probe.append_text(&text);
+    let updates_tracker = probe.state != tracker.state
+        || probe.url_part != tracker.url_part
+        || probe.js_scan_state != tracker.js_scan_state
+        || probe.css_scan_state != tracker.css_scan_state
+        || probe.script_json != tracker.script_json;
+
+    Some(RepeatedTextPlan {
+        text,
+        updates_tracker,
+    })
+}
+
+fn append_text_repeated(output: &mut String, text: &str, iterations: usize) {
+    if iterations == 0 || text.is_empty() {
+        return;
+    }
+    let additional = text.len().saturating_mul(iterations);
+    output.reserve(additional);
+    for _ in 0..iterations {
+        output.push_str(text);
     }
 }
 
@@ -5117,13 +5198,20 @@ fn append_repeated_text(
     tracker: &mut ContextTracker,
     text: &str,
     iterations: usize,
+    skip_tracker_update: bool,
 ) {
     if iterations == 0 || text.is_empty() {
         return;
     }
     if iterations == 1 {
         output.push_str(text);
-        tracker.append_text(text);
+        if !skip_tracker_update {
+            tracker.append_text(text);
+        }
+        return;
+    }
+    if skip_tracker_update {
+        append_text_repeated(output, text, iterations);
         return;
     }
 
@@ -5132,7 +5220,9 @@ fn append_repeated_text(
         repeated.push_str(text);
     }
     output.push_str(&repeated);
-    tracker.append_text(&repeated);
+    if !skip_tracker_update {
+        tracker.append_text(&repeated);
+    }
 }
 
 fn push_scope(scopes: &mut ScopeStack) {
