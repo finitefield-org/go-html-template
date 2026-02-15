@@ -88,6 +88,23 @@ Optimizations applied:
 | style_2k parse (Rust, compare tool) | 999527 | 656331 | -34.3% |
 | style_2k execute (Rust, compare tool) | 900969 | 551245 | -38.8% |
 
+## Reanalyze Clone-Removal Optimization (Parse Phase)
+
+Optimizations applied:
+- `reanalyze_contexts` now analyzes under a single write lock without cloning the whole template map.
+- `ParseContextAnalyzer` now works on `&mut HashMap<String, Vec<Node>>`.
+- `analyze_template` now uses `remove/insert` per template to avoid `raw_nodes.clone()`.
+- `analyze_nodes` keeps the single-flow fast path to skip unnecessary dedup.
+
+### Before/After (`perf_parse_breakdown`)
+
+| benchmark | before (avg_us) | after (avg_us) | change |
+|---|---:|---:|---:|
+| parse_tree_expr_20k | 8522 | 8425 | -1.1% |
+| parse_expr_20k | 12166 | 10184 | -16.3% |
+| parse_tree_html_mix | 8353 | 8446 | +1.1% |
+| parse_html_mix | 20633 | 19012 | -7.9% |
+
 ## Template/Data Files Saved
 
 - Directory: `benchmarks/go_compare_cases`

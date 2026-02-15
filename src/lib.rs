@@ -1026,15 +1026,18 @@ impl Template {
     }
 
     fn reanalyze_contexts(&mut self) -> Result<()> {
-        let raw_templates = self.name_space.templates.read().unwrap().clone();
-        if !raw_templates.contains_key(&self.name) {
+        let mut templates = self.name_space.templates.write().unwrap();
+        if !templates.contains_key(&self.name) {
             return Err(TemplateError::Parse(format!(
                 "template `{}` is not defined",
                 self.name
             )));
         }
 
-        let mut analyzer = ParseContextAnalyzer::new(raw_templates.clone());
+        let mut names = templates.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+
+        let mut analyzer = ParseContextAnalyzer::new(&mut templates);
         let root_start = ContextState::html_text();
         let root_end = analyzer.analyze_template(&self.name, root_start)?;
         if !root_end.is_text_context() {
@@ -1046,15 +1049,12 @@ impl Template {
 
         // Analyze unreferenced templates with HTML start context so
         // execute_template(name, ...) has stable precomputed escaping.
-        let mut names = raw_templates.keys().cloned().collect::<Vec<_>>();
-        names.sort();
         for name in names.iter() {
             if !analyzer.has_analysis(name.as_str()) {
                 let _ = analyzer.analyze_template(name.as_str(), ContextState::html_text())?;
             }
         }
 
-        *self.name_space.templates.write().unwrap() = analyzer.finish();
         Ok(())
     }
 
@@ -2492,20 +2492,18 @@ impl AnalysisFlow {
     }
 }
 
-struct ParseContextAnalyzer {
-    raw_templates: HashMap<String, Vec<Node>>,
-    analyzed_templates: HashMap<String, Vec<Node>>,
+struct ParseContextAnalyzer<'a> {
+    raw_templates: &'a mut HashMap<String, Vec<Node>>,
     start_states: HashMap<String, ContextState>,
     end_states: HashMap<String, ContextState>,
     in_progress: HashSet<String>,
     recursive_templates: HashSet<String>,
 }
 
-impl ParseContextAnalyzer {
-    fn new(raw_templates: HashMap<String, Vec<Node>>) -> Self {
+impl<'a> ParseContextAnalyzer<'a> {
+    fn new(raw_templates: &'a mut HashMap<String, Vec<Node>>) -> Self {
         Self {
             raw_templates,
-            analyzed_templates: HashMap::new(),
             start_states: HashMap::new(),
             end_states: HashMap::new(),
             in_progress: HashSet::new(),
@@ -2514,11 +2512,7 @@ impl ParseContextAnalyzer {
     }
 
     fn has_analysis(&self, name: &str) -> bool {
-        self.analyzed_templates.contains_key(name)
-    }
-
-    fn finish(self) -> HashMap<String, Vec<Node>> {
-        self.analyzed_templates
+        self.end_states.contains_key(name)
     }
 
     fn analyze_template(&mut self, name: &str, start_state: ContextState) -> Result<ContextState> {
@@ -2533,18 +2527,16 @@ impl ParseContextAnalyzer {
             }
         }
 
-        let raw_nodes = self
+        let mut nodes = self
             .raw_templates
-            .get(name)
-            .cloned()
+            .remove(name)
             .ok_or_else(|| TemplateError::Parse(format!("no such template `{name}`")))?;
 
         self.start_states
             .insert(name.to_string(), start_state.clone());
         self.in_progress.insert(name.to_string());
 
-        let analysis = (|| -> Result<(Vec<Node>, ContextState)> {
-            let mut nodes = raw_nodes;
+        let analysis = (|| -> Result<ContextState> {
             let start_tracker = ContextTracker::from_state(start_state.clone());
             let flows = self.analyze_nodes(&mut nodes, start_tracker, false)?;
 
@@ -2579,13 +2571,13 @@ impl ParseContextAnalyzer {
                 .into_iter()
                 .next()
                 .unwrap_or_else(ContextState::html_text);
-            Ok((nodes, end_state))
+            Ok(end_state)
         })();
 
         self.in_progress.remove(name);
+        self.raw_templates.insert(name.to_string(), nodes);
 
-        let (nodes, end_state) = analysis?;
-        self.analyzed_templates.insert(name.to_string(), nodes);
+        let end_state = analysis?;
         self.end_states.insert(name.to_string(), end_state.clone());
         Ok(end_state)
     }
@@ -2607,7 +2599,23 @@ impl ParseContextAnalyzer {
                 }
             }
 
-            let mut next_flows = Vec::new();
+            if flows.len() == 1 {
+                let flow = flows.pop().expect("single flow exists");
+                if flow.kind != AnalysisFlowKind::Normal {
+                    flows.push(flow);
+                    continue;
+                }
+
+                let produced = self.analyze_node(node, flow.tracker, in_range)?;
+                flows = if produced.len() <= 1 {
+                    produced
+                } else {
+                    dedup_analysis_flows(produced)
+                };
+                continue;
+            }
+
+            let mut next_flows = Vec::with_capacity(flows.len());
             for flow in flows {
                 if flow.kind != AnalysisFlowKind::Normal {
                     next_flows.push(flow);
@@ -2617,7 +2625,11 @@ impl ParseContextAnalyzer {
                 let mut produced = self.analyze_node(node, flow.tracker, in_range)?;
                 next_flows.append(&mut produced);
             }
-            flows = dedup_analysis_flows(next_flows);
+            flows = if next_flows.len() <= 1 {
+                next_flows
+            } else {
+                dedup_analysis_flows(next_flows)
+            };
         }
 
         Ok(flows)
@@ -11837,11 +11849,11 @@ mod tests {
         template
             .parse_named("script", raw_quotes)
             .expect("parse_named should succeed");
-        let raw_templates = template.name_space.templates.read().unwrap().clone();
-        if let Some(nodes) = raw_templates.get("script") {
+        let mut raw_templates = template.name_space.templates.read().unwrap().clone();
+        if let Some(nodes) = raw_templates.get("script").cloned() {
             println!("quotes nodes = {:#?}", nodes);
             let mut tracker = ContextTracker::from_state(ContextState::html_text());
-            for node in nodes {
+            for node in &nodes {
                 match node {
                     Node::Text(text) => {
                         let before = tracker.state().mode;
@@ -11861,7 +11873,7 @@ mod tests {
             }
             println!("quotes raw final state = {:?}", tracker.state());
             let mut nodes_for_analysis = nodes.clone();
-            let mut analyze = ParseContextAnalyzer::new(raw_templates.clone());
+            let mut analyze = ParseContextAnalyzer::new(&mut raw_templates);
             let mut stepped_tracker = ContextTracker::from_state(ContextState::html_text());
             for node in &mut nodes_for_analysis {
                 let flows = analyze
@@ -11889,7 +11901,7 @@ mod tests {
                 "quotes stepped tracker state = {:?}",
                 stepped_tracker.state()
             );
-            let analyzed_flows = ParseContextAnalyzer::new(raw_templates.clone())
+            let analyzed_flows = ParseContextAnalyzer::new(&mut raw_templates)
                 .analyze_nodes(
                     &mut nodes_for_analysis,
                     ContextTracker::from_state(ContextState::html_text()),
@@ -11904,7 +11916,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-        let mut analyzer = ParseContextAnalyzer::new(raw_templates);
+        let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
         let quotes_end = analyzer
             .analyze_template("script", ContextState::html_text())
             .expect("analysis should succeed");
@@ -11915,12 +11927,12 @@ mod tests {
         template
             .parse_named("script", raw_line)
             .expect("parse_named should succeed");
-        let raw_templates = template.name_space.templates.read().unwrap().clone();
-        if let Some(nodes) = raw_templates.get("script") {
+        let mut raw_templates = template.name_space.templates.read().unwrap().clone();
+        if let Some(nodes) = raw_templates.get("script").cloned() {
             println!("line nodes = {:?}", nodes);
             let mut nodes_for_analysis = nodes.clone();
             let mut tracker = ContextTracker::from_state(ContextState::html_text());
-            let mut analyzer = ParseContextAnalyzer::new(raw_templates.clone());
+            let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
             for node in nodes_for_analysis.iter_mut() {
                 let flows = analyzer
                     .analyze_node(node, tracker.clone(), false)
@@ -11940,7 +11952,7 @@ mod tests {
             }
             println!("line manual final state = {:?}", tracker.state());
         }
-        let mut analyzer = ParseContextAnalyzer::new(raw_templates);
+        let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
         let line_end = analyzer
             .analyze_template("script", ContextState::html_text())
             .expect("analysis should succeed");
@@ -11951,12 +11963,12 @@ mod tests {
         template
             .parse_named("script", raw_block)
             .expect("parse_named should succeed");
-        let raw_templates = template.name_space.templates.read().unwrap().clone();
-        if let Some(nodes) = raw_templates.get("script") {
+        let mut raw_templates = template.name_space.templates.read().unwrap().clone();
+        if let Some(nodes) = raw_templates.get("script").cloned() {
             println!("block nodes = {:?}", nodes);
             let mut nodes_for_analysis = nodes.clone();
             let mut tracker = ContextTracker::from_state(ContextState::html_text());
-            let mut analyzer = ParseContextAnalyzer::new(raw_templates.clone());
+            let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
             for node in nodes_for_analysis.iter_mut() {
                 let flows = analyzer
                     .analyze_node(node, tracker.clone(), false)
@@ -11976,7 +11988,7 @@ mod tests {
             }
             println!("block manual final state = {:?}", tracker.state());
         }
-        let mut analyzer = ParseContextAnalyzer::new(raw_templates);
+        let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
         let block_end = analyzer
             .analyze_template("script", ContextState::html_text())
             .expect("analysis should succeed");
@@ -11988,13 +12000,13 @@ mod tests {
             .parse(source)
             .expect("parse should succeed");
 
-        let raw_templates = template.name_space.templates.read().unwrap().clone();
+        let mut raw_templates = template.name_space.templates.read().unwrap().clone();
         let mut nodes = raw_templates
             .get(name)
             .expect("template should exist")
             .clone();
 
-        let mut analyzer = ParseContextAnalyzer::new(raw_templates);
+        let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
         let mut tracker = ContextTracker::from_state(ContextState::html_text());
         for node in nodes.iter_mut() {
             let mut flows = analyzer
