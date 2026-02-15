@@ -2771,7 +2771,7 @@ enum Node {
 #[derive(Clone, Debug)]
 struct TextNode {
     raw: SharedText,
-    prepared: Option<PreparedTextPlan>,
+    prepared: Option<Arc<PreparedTextPlan>>,
 }
 
 impl TextNode {
@@ -3708,6 +3708,8 @@ struct ParseContextAnalyzer<'a> {
     recursive_templates: HashSet<String>,
     text_transition_cache:
         HashMap<TextTransitionCacheKey, HashMap<String, TextTransitionCacheValue>>,
+    prepared_text_plan_cache:
+        HashMap<PreparedTextPlanCacheKey, HashMap<String, Option<Arc<PreparedTextPlan>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3727,6 +3729,43 @@ struct TextTransitionCacheValue {
 }
 
 const TEXT_TRANSITION_CACHE_MAX_TEXT_LEN: usize = 256;
+const PREPARED_TEXT_PLAN_CACHE_MAX_TEXT_LEN: usize = 512;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PreparedTextPlanCacheKey {
+    state: ContextState,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+}
+
+fn prepared_text_plan_cache_key(
+    tracker: &ContextTracker,
+    text: &str,
+) -> Option<PreparedTextPlanCacheKey> {
+    if text.is_empty() || text.len() > PREPARED_TEXT_PLAN_CACHE_MAX_TEXT_LEN {
+        return None;
+    }
+    if !should_prepare_text_plan_for_script_style(&tracker.state, text) {
+        return None;
+    }
+
+    let js_scan_state = if tracker.state.is_script_tag_context() {
+        tracker.js_scan_state
+    } else {
+        None
+    };
+    let css_scan_state = if tracker.state.is_style_tag_context() {
+        tracker.css_scan_state
+    } else {
+        None
+    };
+
+    Some(PreparedTextPlanCacheKey {
+        state: tracker.state(),
+        js_scan_state,
+        css_scan_state,
+    })
+}
 
 fn text_transition_cache_key(
     tracker: &ContextTracker,
@@ -3795,6 +3834,7 @@ impl<'a> ParseContextAnalyzer<'a> {
             in_progress: HashSet::new(),
             recursive_templates: HashSet::new(),
             text_transition_cache: HashMap::new(),
+            prepared_text_plan_cache: HashMap::new(),
         }
     }
 
@@ -3932,14 +3972,34 @@ impl<'a> ParseContextAnalyzer<'a> {
     ) -> Result<Vec<AnalysisFlow>> {
         match node {
             Node::Text(text_node) => {
-                if text_node.prepared.is_none()
-                    && should_prepare_text_plan_for_script_style(&tracker.state, &text_node.raw)
-                {
-                    text_node.prepared = prepare_text_plan_for_script_style(
-                        &tracker.state,
-                        &tracker,
-                        &text_node.raw,
-                    );
+                if text_node.prepared.is_none() {
+                    let prepared_cache_key = prepared_text_plan_cache_key(&tracker, &text_node.raw);
+                    if let Some(key) = prepared_cache_key.as_ref()
+                        && let Some(cached) = self
+                            .prepared_text_plan_cache
+                            .get(key)
+                            .and_then(|entries| entries.get(text_node.raw.as_str()))
+                    {
+                        text_node.prepared = cached.clone();
+                    }
+
+                    if text_node.prepared.is_none()
+                        && should_prepare_text_plan_for_script_style(&tracker.state, &text_node.raw)
+                    {
+                        let prepared = prepare_text_plan_for_script_style(
+                            &tracker.state,
+                            &tracker,
+                            &text_node.raw,
+                        )
+                        .map(Arc::new);
+                        if let Some(key) = prepared_cache_key {
+                            self.prepared_text_plan_cache
+                                .entry(key)
+                                .or_default()
+                                .insert(text_node.raw.to_string(), prepared.clone());
+                        }
+                        text_node.prepared = prepared;
+                    }
                 }
 
                 let cache_key = text_transition_cache_key(&tracker, &text_node.raw);
@@ -14703,6 +14763,33 @@ mod tests {
         }
 
         assert!(has_style_close_chunk);
+    }
+
+    #[test]
+    fn parse_reuses_prepared_script_text_plans_for_identical_segments() {
+        let template = Template::new("prepared-shared")
+            .parse(
+                "<script>const x={{.X}};</script><script>const x={{.X}};</script><script>const x={{.X}};</script>",
+            )
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get("prepared-shared")
+            .expect("template nodes should exist");
+
+        let mut shared_candidates = Vec::new();
+        for node in nodes {
+            if let Node::Text(text_node) = node
+                && text_node.raw.as_str() == ";</script><script>const x="
+                && let Some(prepared) = text_node.prepared.as_ref()
+            {
+                shared_candidates.push(prepared.clone());
+            }
+        }
+
+        assert!(shared_candidates.len() >= 2);
+        assert!(Arc::ptr_eq(&shared_candidates[0], &shared_candidates[1]));
     }
 
     #[test]
