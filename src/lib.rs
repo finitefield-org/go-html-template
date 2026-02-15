@@ -1295,23 +1295,58 @@ impl Template {
         left_delim: &str,
         right_delim: &str,
     ) -> Result<ParseTree> {
-        let preprocessed = strip_html_comments(text);
-        let preprocessed = preprocessed.as_ref();
-        let source: Arc<str> = Arc::from(preprocessed);
-        if preprocessed.is_empty() {
+        if text.is_empty() {
             return Ok(ParseTree { nodes: Vec::new() });
         }
 
-        if !preprocessed.contains(left_delim) {
+        let has_left_delim = text.contains(left_delim);
+        if !has_left_delim {
+            if !maybe_has_html_comment_marker(text) {
+                return Ok(ParseTree {
+                    nodes: vec![Node::Text(TextNode::from_span(
+                        Arc::from(text),
+                        0,
+                        text.len(),
+                    ))],
+                });
+            }
+
+            let preprocessed = strip_html_comments(text);
+            let preprocessed = preprocessed.as_ref();
+            if preprocessed.is_empty() {
+                return Ok(ParseTree { nodes: Vec::new() });
+            }
             return Ok(ParseTree {
                 nodes: vec![Node::Text(TextNode::from_span(
-                    source.clone(),
+                    Arc::from(preprocessed),
                     0,
-                    source.len(),
+                    preprocessed.len(),
                 ))],
             });
         }
 
+        let has_html_comment = text.as_bytes().contains(&b'!') && text.contains("<!--");
+        let preprocessed = if has_html_comment {
+            strip_html_comments(text)
+        } else {
+            Cow::Borrowed(text)
+        };
+        let preprocessed = preprocessed.as_ref();
+        if preprocessed.is_empty() {
+            return Ok(ParseTree { nodes: Vec::new() });
+        }
+
+        if has_html_comment && !preprocessed.contains(left_delim) {
+            return Ok(ParseTree {
+                nodes: vec![Node::Text(TextNode::from_span(
+                    Arc::from(preprocessed),
+                    0,
+                    preprocessed.len(),
+                ))],
+            });
+        }
+
+        let source: Arc<str> = Arc::from(preprocessed);
         let tokens = tokenize(preprocessed, left_delim, right_delim)?;
         let mut index = 0;
         let (nodes, stop) = parse_nodes(&source, &tokens, &mut index, &[])?;
@@ -6737,6 +6772,14 @@ fn source_without_actions(source: &str) -> Cow<'_, str> {
         i += 1;
     }
     Cow::Owned(out)
+}
+
+fn maybe_has_html_comment_marker(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    if !bytes.contains(&b'<') || !bytes.contains(&b'!') || !bytes.contains(&b'-') {
+        return false;
+    }
+    source.contains("<!--")
 }
 
 fn strip_html_comments(source: &str) -> Cow<'_, str> {
@@ -14516,6 +14559,19 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<div>a&lt;b&gt;</div>");
+    }
+
+    #[test]
+    fn html_comments_are_stripped_without_actions() {
+        let template = Template::new("comments-only")
+            .parse("<div>a<!--hidden--></div>")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "<div>a</div>");
     }
 
     #[test]
