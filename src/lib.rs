@@ -3119,7 +3119,7 @@ impl ContextTracker {
         if delta.is_empty() {
             return false;
         }
-        if self.try_refresh_cached_state_incremental(delta) {
+        if self.try_refresh_cached_state_incremental_for_parse(delta) {
             return true;
         }
         if self.state.in_open_tag
@@ -3248,6 +3248,72 @@ impl ContextTracker {
             _ => {}
         }
         false
+    }
+
+    fn try_refresh_cached_state_incremental_for_parse(&mut self, delta: &str) -> bool {
+        if self.state.is_script_tag_context() {
+            let Some(scan_state) = self.js_scan_state else {
+                return false;
+            };
+            if contains_ascii_case_insensitive(delta, b"</script") {
+                if !matches!(scan_state, JsScanState::Expr { .. }) {
+                    return false;
+                }
+                let Some(close_start) = find_close_tag(delta, 0, b"script") else {
+                    return false;
+                };
+                let Some(close_end) = html_tag_end(delta, close_start) else {
+                    return false;
+                };
+
+                let before_close = &delta[..close_start];
+                let _ = advance_js_scan_state(before_close, scan_state);
+                self.state = ContextState::html_text();
+                self.url_part = None;
+                self.js_scan_state = None;
+                self.css_scan_state = None;
+                self.script_json = false;
+
+                let suffix = &delta[close_end..];
+                if !suffix.is_empty() && !self.try_refresh_html_text_with_delta(suffix) {
+                    self.state = ContextState::from_rendered(suffix);
+                    self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
+                    self.sync_incremental_scan_state_from_rendered(suffix);
+                }
+                return true;
+            }
+        } else if self.state.is_style_tag_context() {
+            let Some(scan_state) = self.css_scan_state else {
+                return false;
+            };
+            if contains_ascii_case_insensitive(delta, b"</style") {
+                let Some(close_start) = find_style_close_tag_with_state(delta, 0, scan_state)
+                else {
+                    return false;
+                };
+                let Some(close_end) = html_tag_end(delta, close_start) else {
+                    return false;
+                };
+
+                let before_close = &delta[..close_start];
+                let _ = advance_css_scan_state(before_close, scan_state);
+                self.state = ContextState::html_text();
+                self.url_part = None;
+                self.js_scan_state = None;
+                self.css_scan_state = None;
+                self.script_json = false;
+
+                let suffix = &delta[close_end..];
+                if !suffix.is_empty() && !self.try_refresh_html_text_with_delta(suffix) {
+                    self.state = ContextState::from_rendered(suffix);
+                    self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
+                    self.sync_incremental_scan_state_from_rendered(suffix);
+                }
+                return true;
+            }
+        }
+
+        self.try_refresh_cached_state_incremental(delta)
     }
 
     fn try_refresh_html_text_with_delta(&mut self, delta: &str) -> bool {
@@ -14799,6 +14865,24 @@ mod tests {
         assert!(style_tracker.should_skip_rendered_tail_update_for_parse_text(".x{color:red;}"));
         assert!(!style_tracker.should_skip_rendered_tail_update_for_parse_text("</style>"));
         assert!(!style_tracker.should_skip_rendered_tail_update_for_parse_text(".x{content:\\"));
+    }
+
+    #[test]
+    fn parse_incremental_transition_handles_script_close_with_html_suffix() {
+        let mut tracker = ContextTracker::from_state(ContextState::from_rendered("<script>"));
+        let delta = ";</script><script>const x=";
+
+        assert!(tracker.try_refresh_cached_state_incremental_for_parse(delta));
+        assert!(tracker.state.is_script_tag_context());
+        assert!(matches!(tracker.mode(), EscapeMode::ScriptExpr));
+        assert!(matches!(
+            tracker.js_scan_state,
+            Some(JsScanState::Expr { .. })
+        ));
+
+        let rendered = "<script>".to_string() + delta;
+        let expected_state = ContextState::from_rendered(&rendered);
+        assert_eq!(tracker.state, expected_state);
     }
 
     #[test]
