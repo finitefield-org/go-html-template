@@ -3,8 +3,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 #[cfg(not(feature = "web-rust"))]
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::ops::Deref;
 use std::path::Path;
@@ -3804,6 +3806,7 @@ struct ParseContextAnalyzer<'a> {
         HashMap<TextTransitionCacheKey, HashMap<String, TextTransitionCacheValue>>,
     prepared_text_plan_cache:
         HashMap<PreparedTextPlanCacheKey, HashMap<String, Option<Arc<PreparedTextPlan>>>>,
+    if_transition_cache: HashMap<IfTransitionCacheKey, IfTransitionCacheValue>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3831,6 +3834,49 @@ struct TextTransitionCacheValue {
 
 const TEXT_TRANSITION_CACHE_MAX_TEXT_LEN: usize = 256;
 const PREPARED_TEXT_PLAN_CACHE_MAX_TEXT_LEN: usize = 512;
+const IF_TRANSITION_CACHE_MAX_NODES: usize = 32;
+const IF_TRANSITION_CACHE_MAX_TEXT_LEN: usize = 128;
+const IF_TRANSITION_CACHE_MAX_RENDERED_LEN: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct IfExprModeCacheEntry {
+    mode: EscapeMode,
+    runtime_mode: bool,
+}
+
+#[derive(Clone, Debug)]
+struct IfTransitionCacheValue {
+    then_expr_modes: Vec<IfExprModeCacheEntry>,
+    else_expr_modes: Vec<IfExprModeCacheEntry>,
+    flows: Vec<AnalysisFlow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IfTrackerCacheKey {
+    rendered: String,
+    state: ContextState,
+    url_part: Option<UrlPartContext>,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+    script_json: bool,
+    attr_name_dynamic_pending: bool,
+    attr_value_from_dynamic_attr: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LinearNodesSignature {
+    hash: u64,
+    node_count: usize,
+    expr_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct IfTransitionCacheKey {
+    tracker: IfTrackerCacheKey,
+    in_range: bool,
+    then_signature: LinearNodesSignature,
+    else_signature: LinearNodesSignature,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PreparedTextPlanCacheKey {
@@ -3968,6 +4014,7 @@ impl<'a> ParseContextAnalyzer<'a> {
             recursive_templates: HashSet::new(),
             text_transition_cache: HashMap::new(),
             prepared_text_plan_cache: HashMap::new(),
+            if_transition_cache: HashMap::new(),
         }
     }
 
@@ -4144,12 +4191,42 @@ impl<'a> ParseContextAnalyzer<'a> {
                 else_branch,
                 ..
             } => {
+                let cache_key =
+                    if_transition_cache_key(&tracker, in_range, then_branch, else_branch);
+                if let Some(cache_key) = cache_key.as_ref()
+                    && let Some(cached) = self.if_transition_cache.get(cache_key).cloned()
+                    && apply_linear_expr_modes(then_branch, &cached.then_expr_modes)
+                    && apply_linear_expr_modes(else_branch, &cached.else_expr_modes)
+                {
+                    return Ok(cached.flows);
+                }
+
                 let then_flows = self.analyze_nodes(then_branch, tracker.clone(), in_range)?;
                 let else_flows = self.analyze_nodes(else_branch, tracker, in_range)?;
                 ensure_branch_normal_context("if", &then_flows, &else_flows)?;
                 let mut merged = then_flows;
                 merged.extend(else_flows);
-                Ok(dedup_analysis_flows(merged))
+                let merged = if merged.len() <= 1 {
+                    merged
+                } else {
+                    dedup_analysis_flows(merged)
+                };
+
+                if let Some(cache_key) = cache_key
+                    && let Some(then_expr_modes) = collect_linear_expr_modes(then_branch)
+                    && let Some(else_expr_modes) = collect_linear_expr_modes(else_branch)
+                {
+                    self.if_transition_cache.insert(
+                        cache_key,
+                        IfTransitionCacheValue {
+                            then_expr_modes,
+                            else_expr_modes,
+                            flows: merged.clone(),
+                        },
+                    );
+                }
+
+                Ok(merged)
             }
             Node::With {
                 body, else_branch, ..
@@ -4260,7 +4337,11 @@ impl<'a> ParseContextAnalyzer<'a> {
         }
     }
 
-    fn apply_text_node_transition(&mut self, text_node: &mut TextNode, tracker: &mut ContextTracker) {
+    fn apply_text_node_transition(
+        &mut self,
+        text_node: &mut TextNode,
+        tracker: &mut ContextTracker,
+    ) {
         if text_node.prepared.is_none() {
             let prepared_cache_key = prepared_text_plan_cache_key(tracker, &text_node.raw);
             if let Some(key) = prepared_cache_key.as_ref()
@@ -4335,9 +4416,112 @@ fn is_linear_text_expr_nodes(nodes: &[Node]) -> bool {
         .all(|node| matches!(node, Node::Text(_) | Node::Expr { .. }))
 }
 
+fn if_transition_cache_key(
+    tracker: &ContextTracker,
+    in_range: bool,
+    then_branch: &[Node],
+    else_branch: &[Node],
+) -> Option<IfTransitionCacheKey> {
+    let tracker_key = if_tracker_cache_key(tracker)?;
+    let then_signature = linear_nodes_signature_for_if_cache(then_branch)?;
+    let else_signature = linear_nodes_signature_for_if_cache(else_branch)?;
+    Some(IfTransitionCacheKey {
+        tracker: tracker_key,
+        in_range,
+        then_signature,
+        else_signature,
+    })
+}
+
+fn if_tracker_cache_key(tracker: &ContextTracker) -> Option<IfTrackerCacheKey> {
+    if tracker.rendered.len() > IF_TRANSITION_CACHE_MAX_RENDERED_LEN {
+        return None;
+    }
+    Some(IfTrackerCacheKey {
+        rendered: tracker.rendered.clone(),
+        state: tracker.state(),
+        url_part: tracker.url_part,
+        js_scan_state: tracker.js_scan_state,
+        css_scan_state: tracker.css_scan_state,
+        script_json: tracker.script_json,
+        attr_name_dynamic_pending: tracker.attr_name_dynamic_pending,
+        attr_value_from_dynamic_attr: tracker.attr_value_from_dynamic_attr,
+    })
+}
+
+fn linear_nodes_signature_for_if_cache(nodes: &[Node]) -> Option<LinearNodesSignature> {
+    if nodes.len() > IF_TRANSITION_CACHE_MAX_NODES {
+        return None;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    let mut expr_count = 0usize;
+    for node in nodes {
+        match node {
+            Node::Text(text_node) => {
+                let raw = text_node.raw.as_str();
+                if raw.len() > IF_TRANSITION_CACHE_MAX_TEXT_LEN {
+                    return None;
+                }
+                0u8.hash(&mut hasher);
+                raw.hash(&mut hasher);
+            }
+            Node::Expr { .. } => {
+                1u8.hash(&mut hasher);
+                expr_count += 1;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(LinearNodesSignature {
+        hash: hasher.finish(),
+        node_count: nodes.len(),
+        expr_count,
+    })
+}
+
+fn collect_linear_expr_modes(nodes: &[Node]) -> Option<Vec<IfExprModeCacheEntry>> {
+    let mut modes = Vec::new();
+    for node in nodes {
+        match node {
+            Node::Text(_) => {}
+            Node::Expr {
+                mode, runtime_mode, ..
+            } => modes.push(IfExprModeCacheEntry {
+                mode: *mode,
+                runtime_mode: *runtime_mode,
+            }),
+            _ => return None,
+        }
+    }
+    Some(modes)
+}
+
+fn apply_linear_expr_modes(nodes: &mut [Node], modes: &[IfExprModeCacheEntry]) -> bool {
+    let mut mode_index = 0usize;
+    for node in nodes {
+        match node {
+            Node::Text(_) => {}
+            Node::Expr {
+                mode, runtime_mode, ..
+            } => {
+                let Some(cached) = modes.get(mode_index) else {
+                    return false;
+                };
+                *mode = cached.mode;
+                *runtime_mode = cached.runtime_mode;
+                mode_index += 1;
+            }
+            _ => return false,
+        }
+    }
+    mode_index == modes.len()
+}
+
 fn dedup_analysis_flows(flows: Vec<AnalysisFlow>) -> Vec<AnalysisFlow> {
-    let mut deduped = Vec::new();
-    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(flows.len());
+    let mut seen = HashSet::with_capacity(flows.len());
 
     for flow in flows {
         let key = (
@@ -14872,6 +15056,58 @@ mod tests {
             "<script>const r = /{{.R}}/i;</script>",
         );
         assert_eq!(regexp_states, vec![EscapeMode::ScriptRegexp]);
+    }
+
+    #[test]
+    fn parse_if_branch_cache_keeps_expr_modes_in_script_context() {
+        let source =
+            "<script>{{if .X}}{{.A}}{{else}}z{{end}}{{if .X}}{{.B}}{{else}}y{{end}}</script>";
+        let mut template = Template::new("if-branch-cache");
+        template
+            .parse_named("if-branch-cache", source)
+            .expect("parse_named should succeed");
+
+        let mut raw_templates = template.name_space.templates.read().unwrap().clone();
+        let mut nodes = raw_templates
+            .get("if-branch-cache")
+            .expect("template nodes should exist")
+            .clone();
+
+        let mut analyzer = ParseContextAnalyzer::new(&mut raw_templates);
+        let flows = analyzer
+            .analyze_nodes(
+                &mut nodes,
+                ContextTracker::from_state(ContextState::html_text()),
+                false,
+            )
+            .expect("analyze_nodes should succeed");
+        assert!(!analyzer.if_transition_cache.is_empty());
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].tracker.state(), ContextState::html_text());
+
+        fn collect_if_branch_expr_modes(nodes: &[Node], out: &mut Vec<EscapeMode>) {
+            for node in nodes {
+                match node {
+                    Node::If {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        collect_if_branch_expr_modes(then_branch, out);
+                        collect_if_branch_expr_modes(else_branch, out);
+                    }
+                    Node::Expr { mode, .. } => out.push(*mode),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut expr_modes = Vec::new();
+        collect_if_branch_expr_modes(&nodes, &mut expr_modes);
+        assert_eq!(
+            expr_modes,
+            vec![EscapeMode::ScriptExpr, EscapeMode::ScriptExpr]
+        );
     }
 
     #[test]
