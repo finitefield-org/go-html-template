@@ -2530,6 +2530,9 @@ impl ContextTracker {
                     self.url_part = None;
                     return true;
                 }
+                if !self.state.in_open_tag && self.try_refresh_html_text_with_delta(delta) {
+                    return true;
+                }
             }
             EscapeMode::Rcdata => {
                 if !delta.as_bytes().contains(&b'<') {
@@ -2540,6 +2543,9 @@ impl ContextTracker {
                 if delta.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
                     return true;
                 }
+            }
+            EscapeMode::AttrQuoted { .. } | EscapeMode::AttrUnquoted { .. } => {
+                return self.try_refresh_cached_state_seeded_delta(delta);
             }
             _ if self.state.is_script_tag_context() => {
                 let Some(scan_state) = self.js_scan_state else {
@@ -2624,6 +2630,176 @@ impl ContextTracker {
             _ => {}
         }
         false
+    }
+
+    fn try_refresh_html_text_with_delta(&mut self, delta: &str) -> bool {
+        if !matches!(self.state.mode, EscapeMode::Html) || self.state.in_open_tag {
+            return false;
+        }
+
+        let bytes = delta.as_bytes();
+        let mut cursor = 0usize;
+
+        while cursor < bytes.len() {
+            let Some(offset) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+                self.state = ContextState::html_text();
+                self.url_part = None;
+                return true;
+            };
+            let start = cursor + offset;
+
+            if start + 1 >= bytes.len() {
+                self.refresh_cached_state_from_fragment(&delta[start..]);
+                return true;
+            }
+
+            let next = bytes[start + 1];
+            if next == b'!' {
+                if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"<!--" {
+                    if let Some(end_offset) = delta[start + 4..].find("-->") {
+                        cursor = start + 4 + end_offset + 3;
+                        continue;
+                    }
+                    self.refresh_cached_state_from_fragment(&delta[start..]);
+                    return true;
+                }
+
+                if let Some(end) = html_tag_end(delta, start) {
+                    cursor = end;
+                    continue;
+                }
+                self.refresh_cached_state_from_fragment(&delta[start..]);
+                return true;
+            }
+
+            if next == b'?' {
+                if let Some(end) = html_tag_end(delta, start) {
+                    cursor = end;
+                    continue;
+                }
+                self.refresh_cached_state_from_fragment(&delta[start..]);
+                return true;
+            }
+
+            let close = next == b'/';
+            let name_start = if close { start + 2 } else { start + 1 };
+            if name_start >= bytes.len() || !bytes[name_start].is_ascii_alphabetic() {
+                cursor = start + 1;
+                continue;
+            }
+
+            let mut name_end = name_start + 1;
+            while name_end < bytes.len() && is_html_tag_name_byte(bytes[name_end]) {
+                name_end += 1;
+            }
+            let tag_name = &bytes[name_start..name_end];
+
+            let Some(tag_end) = html_tag_end(delta, start) else {
+                self.refresh_cached_state_from_fragment(&delta[start..]);
+                return true;
+            };
+
+            if close {
+                cursor = tag_end;
+                continue;
+            }
+
+            if tag_name.eq_ignore_ascii_case(b"script") {
+                let open_tag = &delta[start..tag_end];
+                if !is_script_type_javascript(open_tag) {
+                    cursor = tag_end;
+                    continue;
+                }
+
+                let script_json = is_script_type_json(open_tag);
+                if let Some(close_start) = find_close_tag(delta, tag_end, b"script")
+                    && let Some(close_end) = html_tag_end(delta, close_start)
+                {
+                    cursor = close_end;
+                    continue;
+                }
+
+                let content = &delta[tag_end..];
+                let js_state = current_js_scan_state(content);
+                self.state.mode = js_scan_state_to_escape_mode(js_state, script_json);
+                self.state.in_open_tag = false;
+                self.state.in_css_attribute = false;
+                self.state.css_attribute_quote = None;
+                self.state.in_js_attribute = false;
+                self.url_part = None;
+                self.js_scan_state = Some(js_state);
+                self.css_scan_state = None;
+                self.script_json = script_json;
+                return true;
+            }
+
+            if tag_name.eq_ignore_ascii_case(b"style") {
+                if let Some(close_start) = find_close_tag(delta, tag_end, b"style")
+                    && let Some(close_end) = html_tag_end(delta, close_start)
+                {
+                    cursor = close_end;
+                    continue;
+                }
+
+                let content = &delta[tag_end..];
+                let css_state = current_css_scan_state(content);
+                self.state.mode = css_scan_state_to_escape_mode(css_state);
+                self.state.in_open_tag = false;
+                self.state.in_css_attribute = false;
+                self.state.css_attribute_quote = None;
+                self.state.in_js_attribute = false;
+                self.url_part = None;
+                self.js_scan_state = None;
+                self.css_scan_state = Some(css_state);
+                self.script_json = false;
+                return true;
+            }
+
+            if tag_name.eq_ignore_ascii_case(b"title") || tag_name.eq_ignore_ascii_case(b"textarea")
+            {
+                if let Some(close_start) = find_close_tag(delta, tag_end, tag_name)
+                    && let Some(close_end) = html_tag_end(delta, close_start)
+                {
+                    cursor = close_end;
+                    continue;
+                }
+
+                self.state.mode = EscapeMode::Rcdata;
+                self.state.in_open_tag = false;
+                self.state.in_css_attribute = false;
+                self.state.css_attribute_quote = None;
+                self.state.in_js_attribute = false;
+                self.url_part = None;
+                self.js_scan_state = None;
+                self.css_scan_state = None;
+                self.script_json = false;
+                return true;
+            }
+
+            cursor = tag_end;
+        }
+
+        self.state = ContextState::html_text();
+        self.url_part = None;
+        self.js_scan_state = None;
+        self.css_scan_state = None;
+        self.script_json = false;
+        true
+    }
+
+    fn try_refresh_cached_state_seeded_delta(&mut self, delta: &str) -> bool {
+        let mut rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
+        rendered.push_str(delta);
+        self.state = ContextState::from_rendered(&rendered);
+        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &rendered);
+        self.sync_incremental_scan_state_from_rendered(&rendered);
+        true
+    }
+
+    fn refresh_cached_state_from_fragment(&mut self, fragment: &str) {
+        self.state = ContextState::from_rendered(fragment);
+        self.url_part = url_part_from_mode_and_rendered(self.state.mode, fragment);
+        self.sync_incremental_scan_state_from_rendered(fragment);
     }
 
     fn sync_incremental_scan_state(&mut self) {
@@ -10853,6 +11029,10 @@ fn srcset_metadata_is_safe(metadata: &str) -> bool {
 
 fn is_html_space(byte: u8) -> bool {
     matches!(byte, b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ')
+}
+
+fn is_html_tag_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-')
 }
 
 fn is_html_space_or_ascii_alnum(byte: u8) -> bool {

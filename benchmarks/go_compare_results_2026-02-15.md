@@ -202,3 +202,31 @@ Optimization applied:
 | style_100 | 10 | 837 | 207 | -75.3% | 144 | 141 | -2.1% | true |
 | script_2k | 3 | 330171 | 2844 | -99.1% | 1282 | 1396 | +8.9% | true |
 | style_2k | 3 | 252130 | 2984 | -98.8% | 1112 | 1209 | +8.7% | true |
+
+## ContextState Full-Recompute Reduction (Item 2)
+
+Optimization applied:
+- Added byte-oriented HTML text transition in `ContextTracker::try_refresh_html_text_with_delta` so `EscapeMode::Html` no longer falls back to full `ContextState::from_rendered(&rendered)` whenever the chunk contains `<`.
+- Added seed+delta recompute path for `AttrQuoted` / `AttrUnquoted` (`try_refresh_cached_state_seeded_delta`) to avoid scanning the entire accumulated `rendered`.
+- Kept full fallback for `in_open_tag` and `AttrName` to preserve dynamic attribute-name correctness.
+
+### Parse Breakdown Before/After
+
+Command:
+
+```bash
+cargo run --release --quiet --bin perf_parse_breakdown
+```
+
+| benchmark | before (avg_us) | after (avg_us) | change |
+|---|---:|---:|---:|
+| parse_tree_expr_20k | 8292 | 8276 | -0.2% |
+| parse_expr_20k | 9249 | 8982 | -2.9% |
+| parse_tree_html_mix | 8266 | 8288 | +0.3% |
+| parse_html_mix | 13511 | 13646 | +1.0% |
+
+### Selected Go Compare Case (Parse)
+
+| case | loops | before rust_parse_us | after rust_parse_us | change | output_match |
+|---|---:|---:|---:|---:|---|
+| static_200k | 20 | 3025 | 2407 | -20.4% | true |
