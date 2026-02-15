@@ -2139,6 +2139,14 @@ impl ParseContextAnalyzer {
         let mut flows = vec![AnalysisFlow::normal(start_tracker)];
 
         for node in nodes {
+            if let Node::Text(text) = node {
+                if text_starts_with_js_slash(text) && has_slash_ambiguity(flows.iter()) {
+                    return Err(TemplateError::Parse(
+                        "'/' could start a division or regexp".to_string(),
+                    ));
+                }
+            }
+
             let mut next_flows = Vec::new();
             for flow in flows {
                 if flow.kind != AnalysisFlowKind::Normal {
@@ -2356,12 +2364,6 @@ fn ensure_branch_normal_context(
         )));
     }
 
-    if has_slash_ambiguity(left.iter().chain(right.iter())) {
-        return Err(TemplateError::Parse(
-            "'/' could start a division or regexp".to_string(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -2385,12 +2387,6 @@ fn ensure_single_normal_context(block_name: &str, flows: &[AnalysisFlow]) -> Res
         )));
     }
 
-    if has_slash_ambiguity(flows.iter()) {
-        return Err(TemplateError::Parse(
-            "'/' could start a division or regexp".to_string(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -2411,6 +2407,11 @@ where
         }
     }
     js_contexts.len() > 1
+}
+
+fn text_starts_with_js_slash(text: &str) -> bool {
+    let trimmed = text.trim_start_matches(is_html_space_char);
+    trimmed.starts_with('/')
 }
 
 fn has_url_part_ambiguity<'a, I>(flows: I) -> bool
@@ -2459,15 +2460,17 @@ fn url_part_context(rendered: &str) -> Option<UrlPartContext> {
 fn range_reentry_context_matches(start: &ContextTracker, candidate: &ContextTracker) -> bool {
     let start_state = start.state();
     let candidate_state = candidate.state();
-    if start_state != candidate_state {
-        return false;
-    }
-
-    if !matches!(start_state.mode, EscapeMode::ScriptExpr) {
+    if matches!(start_state.mode, EscapeMode::ScriptExpr)
+        && matches!(candidate_state.mode, EscapeMode::ScriptExpr)
+    {
+        // Go-compatible range re-entry accepts js_ctx drift in ScriptExpr
+        // (including JSON script types like application/json, application/ld+json,
+        // and *+json). Ambiguous slash handling is validated when the next
+        // text token actually starts with '/'.
         return true;
     }
 
-    script_expr_context(&start.rendered) == script_expr_context(&candidate.rendered)
+    start_state == candidate_state
 }
 
 fn is_empty_template_body(nodes: &[Node]) -> bool {
@@ -2773,11 +2776,7 @@ fn last_unclosed_tag_start(rendered: &str) -> Option<usize> {
         }
     }
 
-    if in_tag {
-        Some(tag_start)
-    } else {
-        None
-    }
+    if in_tag { Some(tag_start) } else { None }
 }
 
 fn is_in_unclosed_tag_context(rendered: &str) -> bool {
@@ -3644,7 +3643,8 @@ fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
         }
 
         i += 1;
-        while i < bytes.len() && !is_html_space(bytes[i]) && !matches!(bytes[i], b'>' | b'/' | b'=') {
+        while i < bytes.len() && !is_html_space(bytes[i]) && !matches!(bytes[i], b'>' | b'/' | b'=')
+        {
             i += 1;
         }
 
@@ -3729,9 +3729,7 @@ fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
                     || value.contains('\'')
                     || value.contains('`')
                 {
-                    return Err(TemplateError::Parse(format!(
-                        "in unquoted attr: {value:?}"
-                    )));
+                    return Err(TemplateError::Parse(format!("in unquoted attr: {value:?}")));
                 }
             }
         }
@@ -5337,65 +5335,61 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
             _ => Ok(escape_html(&value.to_plain_string())),
         },
         EscapeMode::AttrName => Ok(html_name_filter(&value.to_plain_string())),
-        EscapeMode::AttrQuoted { kind, quote } => {
-            match kind {
-                AttrKind::Normal => match value {
-                    Value::SafeHtml(raw) => Ok(escape_html_norm(&strip_tags(raw))),
-                    _ => Ok(escape_html(&value.to_plain_string())),
-                },
-                AttrKind::Js => {
-                    let text = js_val_escaper(value)?;
-                    Ok(escape_html(&text))
-                }
-                AttrKind::Css => {
-                    let text = match value {
-                        Value::SafeCss(raw) => raw.clone(),
-                        Value::SafeHtml(_)
-                        | Value::SafeHtmlAttr(_)
-                        | Value::SafeJs(_)
-                        | Value::SafeJsStr(_)
-                        | Value::SafeUrl(_)
-                        | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
-                        _ => css_value_filter(&value.to_plain_string()),
-                    };
-                    Ok(escape_html(&text))
-                }
-                AttrKind::Url | AttrKind::Srcset => {
-                    let text = transform_attr_value(value, kind, Some(quote), rendered_prefix);
-                    Ok(escape_html(&text))
-                }
+        EscapeMode::AttrQuoted { kind, quote } => match kind {
+            AttrKind::Normal => match value {
+                Value::SafeHtml(raw) => Ok(escape_html_norm(&strip_tags(raw))),
+                _ => Ok(escape_html(&value.to_plain_string())),
+            },
+            AttrKind::Js => {
+                let text = js_val_escaper(value)?;
+                Ok(escape_html(&text))
             }
-        }
-        EscapeMode::AttrUnquoted { kind } => {
-            match kind {
-                AttrKind::Normal => match value {
-                    Value::SafeHtml(raw) => Ok(html_nospace_escaper_norm(&strip_tags(raw))),
-                    _ => Ok(html_nospace_escaper(&value.to_plain_string())),
-                },
-                AttrKind::Css => {
-                    let text = match value {
-                        Value::SafeCss(raw) => raw.clone(),
-                        Value::SafeHtml(_)
-                        | Value::SafeHtmlAttr(_)
-                        | Value::SafeJs(_)
-                        | Value::SafeJsStr(_)
-                        | Value::SafeUrl(_)
-                        | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
-                        _ => css_value_filter(&value.to_plain_string()),
-                    };
+            AttrKind::Css => {
+                let text = match value {
+                    Value::SafeCss(raw) => raw.clone(),
+                    Value::SafeHtml(_)
+                    | Value::SafeHtmlAttr(_)
+                    | Value::SafeJs(_)
+                    | Value::SafeJsStr(_)
+                    | Value::SafeUrl(_)
+                    | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
+                    _ => css_value_filter(&value.to_plain_string()),
+                };
+                Ok(escape_html(&text))
+            }
+            AttrKind::Url | AttrKind::Srcset => {
+                let text = transform_attr_value(value, kind, Some(quote), rendered_prefix);
+                Ok(escape_html(&text))
+            }
+        },
+        EscapeMode::AttrUnquoted { kind } => match kind {
+            AttrKind::Normal => match value {
+                Value::SafeHtml(raw) => Ok(html_nospace_escaper_norm(&strip_tags(raw))),
+                _ => Ok(html_nospace_escaper(&value.to_plain_string())),
+            },
+            AttrKind::Css => {
+                let text = match value {
+                    Value::SafeCss(raw) => raw.clone(),
+                    Value::SafeHtml(_)
+                    | Value::SafeHtmlAttr(_)
+                    | Value::SafeJs(_)
+                    | Value::SafeJsStr(_)
+                    | Value::SafeUrl(_)
+                    | Value::SafeSrcset(_) => "ZgotmplZ".to_string(),
+                    _ => css_value_filter(&value.to_plain_string()),
+                };
+                Ok(escape_attr_unquoted(&text))
+            }
+            AttrKind::Url | AttrKind::Srcset | AttrKind::Js => {
+                if kind == AttrKind::Js {
+                    let text = js_val_escaper(value)?;
+                    Ok(html_nospace_escaper(&text))
+                } else {
+                    let text = transform_attr_value(value, kind, None, rendered_prefix);
                     Ok(escape_attr_unquoted(&text))
                 }
-                AttrKind::Url | AttrKind::Srcset | AttrKind::Js => {
-                    if kind == AttrKind::Js {
-                        let text = js_val_escaper(value)?;
-                        Ok(html_nospace_escaper(&text))
-                    } else {
-                        let text = transform_attr_value(value, kind, None, rendered_prefix);
-                        Ok(escape_attr_unquoted(&text))
-                    }
-                }
             }
-        }
+        },
         EscapeMode::ScriptExpr => escape_script_value(value),
         EscapeMode::ScriptTemplate => Ok(escape_js_string_fragment(&value.to_plain_string(), '`')),
         EscapeMode::ScriptRegexp => Ok(escape_js_string_fragment(&value.to_plain_string(), '/')),
@@ -5442,6 +5436,14 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
         || current_unclosed_tag_content(rendered, "title").is_some()
     {
         return EscapeMode::Rcdata;
+    }
+
+    if let Some(mode) = script_escape_mode(rendered) {
+        return mode;
+    }
+
+    if let Some(mode) = style_escape_mode(rendered) {
+        return mode;
     }
 
     if let Some(context) = current_tag_value_context(rendered) {
@@ -5491,14 +5493,6 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
 
     if current_attr_name_context(rendered) {
         return EscapeMode::AttrName;
-    }
-
-    if let Some(mode) = script_escape_mode(rendered) {
-        return mode;
-    }
-
-    if let Some(mode) = style_escape_mode(rendered) {
-        return mode;
     }
 
     EscapeMode::Html
@@ -6011,9 +6005,14 @@ fn current_css_url_value_prefix(prefix: &str) -> Option<String> {
     }
 
     match state {
-        State::SingleQuote { is_url: true, start } | State::DoubleQuote { is_url: true, start } => {
-            Some(prefix[start..].to_string())
+        State::SingleQuote {
+            is_url: true,
+            start,
         }
+        | State::DoubleQuote {
+            is_url: true,
+            start,
+        } => Some(prefix[start..].to_string()),
         _ => None,
     }
 }
@@ -6069,11 +6068,7 @@ fn is_script_type_json(script_tag: &str) -> bool {
         return false;
     };
     let lower = type_value.trim().to_ascii_lowercase();
-    let mime = lower
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default();
+    let mime = lower.split(';').next().map(str::trim).unwrap_or_default();
     mime == "application/json" || mime.ends_with("+json")
 }
 
@@ -8852,7 +8847,10 @@ fn encode_url_attribute_value(input: &str) -> String {
     while i < bytes.len() {
         let byte = bytes[i];
         if byte == b'%' {
-            if i + 2 < bytes.len() && bytes[i + 1].is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit() {
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
                 encoded.push('%');
                 encoded.push(bytes[i + 1] as char);
                 encoded.push(bytes[i + 2] as char);
@@ -9617,7 +9615,8 @@ fn strip_tags(input: &str) -> String {
                     break;
                 };
                 let candidate = cursor + rel;
-                if let Some((close_end, close_is_close, close_name)) = parse_tag_at(input, candidate)
+                if let Some((close_end, close_is_close, close_name)) =
+                    parse_tag_at(input, candidate)
                     && close_is_close
                     && close_name == "script"
                 {
@@ -11297,7 +11296,10 @@ mod tests {
             .execute_to_string(&json!({"Y": 2}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const x = 1;\u{2028}const y =  2 ;</script>");
+        assert_eq!(
+            output,
+            "<script>const x = 1;\u{2028}const y =  2 ;</script>"
+        );
     }
 
     #[test]
@@ -11310,7 +11312,10 @@ mod tests {
             .execute_to_string(&json!({"Y": 2}))
             .expect("execute should succeed");
 
-        assert_eq!(output, "<script>const x = 1;\u{2029}const y =  2 ;</script>");
+        assert_eq!(
+            output,
+            "<script>const x = 1;\u{2029}const y =  2 ;</script>"
+        );
     }
 
     #[test]
@@ -11556,10 +11561,7 @@ mod tests {
             .execute_to_string(&json!({"A": "</style>"}))
             .expect("execute to succeed");
 
-        assert_eq!(
-            output,
-            "<style>// </style>\n.a{color: ZgotmplZ}</style>"
-        );
+        assert_eq!(output, "<style>// </style>\n.a{color: ZgotmplZ}</style>");
     }
 
     #[test]
@@ -11602,10 +11604,7 @@ mod tests {
             .execute_to_string(&json!({"A": "</style>"}))
             .expect("execute should succeed");
 
-        assert_eq!(
-            output,
-            "<style>/* </style> */.a{color: ZgotmplZ}</style>"
-        );
+        assert_eq!(output, "<style>/* </style> */.a{color: ZgotmplZ}</style>");
     }
 
     #[test]
@@ -13241,7 +13240,9 @@ mod tests {
                 Err(error) => error,
             };
             assert!(
-                error.to_string().contains("{{range}} branches end in different contexts")
+                error
+                    .to_string()
+                    .contains("{{range}} branches end in different contexts")
                     || error.to_string().contains("on range loop re-entry"),
                 "unexpected error for {source:?}: {error}"
             );
@@ -13272,7 +13273,10 @@ mod tests {
                 .contains("cannot compute output context for template")
                 || output_context
                     .to_string()
-                    .contains("could start a division or regexp"),
+                    .contains("could start a division or regexp")
+                || output_context
+                    .to_string()
+                    .contains("ends in a non-text context"),
             "unexpected output-context error: {output_context}"
         );
     }
@@ -13351,7 +13355,11 @@ mod tests {
             (json!(-0.5), " -0.5 ", false),
             (json!(""), "\"\"", false),
             (json!("foo"), "\"foo\"", false),
-            (json!("\r\n\u{2028}\u{2029}"), "\"\\r\\n\\u2028\\u2029\"", false),
+            (
+                json!("\r\n\u{2028}\u{2029}"),
+                "\"\\r\\n\\u2028\\u2029\"",
+                false,
+            ),
             (json!("\t\u{000B}"), "\"\\t\\u000b\"", false),
             (json!({"X": 1, "Y": 2}), "{\"X\":1,\"Y\":2}", false),
             (json!([]), "[]", false),
@@ -13380,8 +13388,9 @@ mod tests {
             }
 
             let nested = JsonValue::Array(vec![value.clone()]);
-            let nested_got = js_val_escaper(&Value::Json(nested))
-                .unwrap_or_else(|error| panic!("nested js_val_escaper failed for {value:?}: {error}"));
+            let nested_got = js_val_escaper(&Value::Json(nested)).unwrap_or_else(|error| {
+                panic!("nested js_val_escaper failed for {value:?}: {error}")
+            });
             let nested_want = format!("[{}]", want.trim());
             assert_eq!(nested_got, nested_want, "nested {value:?}");
         }
@@ -13535,7 +13544,11 @@ mod tests {
                 "javascript:alert(1), /foo.png",
                 "#ZgotmplZ, /foo.png",
             ),
-            ("right bad", "/bogus#, javascript:alert(1)", "/bogus#,#ZgotmplZ"),
+            (
+                "right bad",
+                "/bogus#, javascript:alert(1)",
+                "/bogus#,#ZgotmplZ",
+            ),
         ];
 
         for (name, input, want) in tests {
@@ -13564,7 +13577,11 @@ mod tests {
         for (input, want) in tests {
             let got = encode_url_attribute_value(input);
             assert_eq!(got, want, "{input:?}");
-            assert_eq!(encode_url_attribute_value(want), want, "not idempotent: {want}");
+            assert_eq!(
+                encode_url_attribute_value(want),
+                want,
+                "not idempotent: {want}"
+            );
         }
     }
 
@@ -13904,10 +13921,7 @@ mod tests {
             (r#"<input type=button value= 1+1=2>"#, "in unquoted attr"),
             (r#"<a class=`foo>"#, "in unquoted attr"),
             (r#"<a style=font:'Arial'>"#, "in unquoted attr"),
-            (
-                r#"<a=foo>"#,
-                "expected space, attr name, or end of tag",
-            ),
+            (r#"<a=foo>"#, "expected space, attr name, or end of tag"),
         ];
 
         for (source, want) in tests {
@@ -13961,7 +13975,10 @@ mod tests {
             ("", ""),
             ("Hello, World!", "Hello, World!"),
             ("foo&amp;bar", "foo&amp;bar"),
-            (r#"Hello <a href="www.example.com/">World</a>!"#, "Hello World!"),
+            (
+                r#"Hello <a href="www.example.com/">World</a>!"#,
+                "Hello World!",
+            ),
             ("Foo <textarea>Bar</textarea> Baz", "Foo Bar Baz"),
             ("Foo <!-- Bar --> Baz", "Foo  Baz"),
             ("<", "<"),
@@ -14002,7 +14019,9 @@ mod tests {
         ];
 
         for (input, tag, want) in tests {
-            let got = index_tag_end(input, tag).map(|value| value as i32).unwrap_or(-1);
+            let got = index_tag_end(input, tag)
+                .map(|value| value as i32)
+                .unwrap_or(-1);
             assert_eq!(got, want, "{input:?}/{tag:?}");
         }
     }
@@ -14018,7 +14037,8 @@ mod tests {
             Value::from(JSStr(r#"Hello, World & O'Reilly\u0021"#.to_string())),
             Value::from(URL(r#"greeting=H%69,&addressee=(World)"#.to_string())),
             Value::from(Srcset(
-                r#"greeting=H%69,&addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#.to_string(),
+                r#"greeting=H%69,&addressee=(World) 2x, https://golang.org/favicon.ico 500.5w"#
+                    .to_string(),
             )),
             Value::from(URL(r#",foo/,"#.to_string())),
         ];
@@ -14518,7 +14538,9 @@ mod tests {
             }
         }
 
-        let template = Template::new("x").parse("{{.}}").expect("parse should succeed");
+        let template = Template::new("x")
+            .parse("{{.}}")
+            .expect("parse should succeed");
 
         let stringer_output = template
             .execute_to_string(&MyStringer { v: 3 })
@@ -14567,6 +14589,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_allows_range_reentry_patterns_in_json_script_contexts() {
+        let json_array = Template::new("json-array-range").parse(
+            r#"<script type="application/json">
+{
+  "items": [
+    {{- range $index, $item := .Items -}}
+    {{- if $index}},{{end}}
+    {{printf "%q" $item}}
+    {{- end -}}
+  ]
+}
+</script>"#,
+        );
+        assert!(
+            json_array.is_ok(),
+            "expected parse success for JSON array range: {}",
+            json_array
+                .err()
+                .unwrap_or_else(|| TemplateError::Parse("".to_string()))
+        );
+
+        let json_object = Template::new("json-object-range").parse(
+            r#"<script type="application/ld+json">
+{
+  "map": {
+    {{- $first := true -}}
+    {{- range $key, $value := .Map -}}
+    {{- if not $first}},{{end}}
+    {{- $first = false -}}
+    {{printf "%q" $key}}: {{printf "%q" $value}}
+    {{- end -}}
+  }
+}
+</script>"#,
+        );
+        assert!(
+            json_object.is_ok(),
+            "expected parse success for JSON object range: {}",
+            json_object
+                .err()
+                .unwrap_or_else(|| TemplateError::Parse("".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_allows_range_reentry_patterns_in_javascript_array_literals() {
+        let js_array = Template::new("js-array-range").parse(
+            r#"<script>
+const values = [
+  {{- range $index, $item := .Items -}}
+  {{- if $index}},{{end}}
+  {{printf "%q" $item}}
+  {{- end -}}
+];
+</script>"#,
+        );
+        assert!(
+            js_array.is_ok(),
+            "expected parse success for JS array range: {}",
+            js_array
+                .err()
+                .unwrap_or_else(|| TemplateError::Parse("".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_allows_range_reentry_inside_script_template_literals_with_html_fragments() {
+        let script_template = Template::new("js-template-literal-range").parse(
+            r#"<script>
+const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
+</script>"#,
+        );
+        assert!(
+            script_template.is_ok(),
+            "expected parse success for JS template literal range: {}",
+            script_template
+                .err()
+                .unwrap_or_else(|| TemplateError::Parse("".to_string()))
+        );
+    }
+
+    #[test]
     fn go_test_skip_escape_comments_matches_go_behavior() {
         let template = Template::new("comments")
             .parse("{{/* A comment */}}{{ 1 }}{{/* Another comment */}}")
@@ -14592,7 +14696,9 @@ mod tests {
             e: Option<JsonValue>,
         }
 
-        let template = Template::new("x").parse("{{.E}}").expect("parse should succeed");
+        let template = Template::new("x")
+            .parse("{{.E}}")
+            .expect("parse should succeed");
 
         let got = template
             .execute_to_string(&NonEmptyLike { e: None })
@@ -14830,8 +14936,7 @@ mod tests {
             .execute_to_string(&json!({}))
             .expect_err("execute should fail");
         assert!(
-            error.to_string().contains("not defined")
-                || error.to_string().contains("incomplete")
+            error.to_string().contains("not defined") || error.to_string().contains("incomplete")
         );
     }
 
@@ -15045,7 +15150,10 @@ mod tests {
             let template = Template::new("good-func-name")
                 .add_func(name, |_args: &[Value]| Ok(Value::from("ok")))
                 .parse(format!("{{{{{name}}}}}").as_str());
-            assert!(template.is_ok(), "function name {name:?} should be accepted");
+            assert!(
+                template.is_ok(),
+                "function name {name:?} should be accepted"
+            );
         }
     }
 
@@ -15053,7 +15161,8 @@ mod tests {
     fn go_test_bad_func_names_match_go() {
         for name in ["", "1x", "bad-name", ".dot", "x y"] {
             let result = std::panic::catch_unwind(|| {
-                Template::new("bad-func-name").add_func(name, |_args: &[Value]| Ok(Value::from("ok")))
+                Template::new("bad-func-name")
+                    .add_func(name, |_args: &[Value]| Ok(Value::from("ok")))
             });
             assert!(result.is_err(), "function name {name:?} should be rejected");
         }
@@ -15173,7 +15282,7 @@ mod tests {
     #[test]
     fn go_test_redefine_nested_by_template_after_execution_matches_go() {
         let template = Template::new("root")
-            .parse("{{define \"x\"}}foo{{end}}<{{template \"x\" .}}>") 
+            .parse("{{define \"x\"}}foo{{end}}<{{template \"x\" .}}>")
             .expect("parse should succeed");
         let _ = template
             .execute_to_string(&json!({}))
@@ -15301,8 +15410,14 @@ mod tests {
 
         let fs = MemoryFS {
             files: std::collections::HashMap::from([
-                ("tmpl1.tmpl".to_string(), include_bytes!("../html/template/testdata/tmpl1.tmpl").to_vec()),
-                ("tmpl2.tmpl".to_string(), include_bytes!("../html/template/testdata/tmpl2.tmpl").to_vec()),
+                (
+                    "tmpl1.tmpl".to_string(),
+                    include_bytes!("../html/template/testdata/tmpl1.tmpl").to_vec(),
+                ),
+                (
+                    "tmpl2.tmpl".to_string(),
+                    include_bytes!("../html/template/testdata/tmpl2.tmpl").to_vec(),
+                ),
             ]),
         };
 
@@ -15401,8 +15516,7 @@ mod tests {
             .execute_to_string(&json!({}))
             .expect_err("execute should fail");
         assert!(
-            error.to_string().contains("not defined")
-                || error.to_string().contains("incomplete")
+            error.to_string().contains("not defined") || error.to_string().contains("incomplete")
         );
     }
 
@@ -15424,9 +15538,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error
-                .to_string()
-                .contains("unterminated")
+            error.to_string().contains("unterminated")
                 || error.to_string().contains("invalid string literal")
         );
     }
@@ -15499,8 +15611,7 @@ mod tests {
             .execute_template_to_string("page", &json!("nothing"))
             .expect_err("execute should fail");
         assert!(
-            error.to_string().contains("not defined")
-                || error.to_string().contains("incomplete")
+            error.to_string().contains("not defined") || error.to_string().contains("incomplete")
         );
     }
 
@@ -15509,10 +15620,7 @@ mod tests {
         let first = Template::new("foo")
             .parse(r#"<a href="{{.}}">link1</a>"#)
             .expect("parse should succeed");
-        let second = first
-            .New("foo")
-            .parse("bar")
-            .expect("parse should succeed");
+        let second = first.New("foo").parse("bar").expect("parse should succeed");
 
         let second_output = second
             .execute_to_string(&json!({}))
@@ -15714,10 +15822,22 @@ mod tests {
             ("copy", "A\ttext\nstring", "A\ttext\nstring"),
             ("simple", "&amp; &gt; &lt;", "& > <"),
             ("stringEnd", "&amp &amp", "& &"),
-            ("multiCodepoint", "text &gesl; blah", "text \u{22DB}\u{FE00} blah"),
+            (
+                "multiCodepoint",
+                "text &gesl; blah",
+                "text \u{22DB}\u{FE00} blah",
+            ),
             ("decimalEntity", "Delta = &#916; ", "Delta = \u{0394} "),
-            ("hexadecimalEntity", "Lambda = &#x3bb; = &#X3Bb ", "Lambda = \u{03BB} = \u{03BB} "),
-            ("numericEnds", "&# &#x &#128;43 &copy = &#169f = &#xa9", "&# &#x \u{20AC}43 \u{00A9} = \u{00A9}f = \u{00A9}"),
+            (
+                "hexadecimalEntity",
+                "Lambda = &#x3bb; = &#X3Bb ",
+                "Lambda = \u{03BB} = \u{03BB} ",
+            ),
+            (
+                "numericEnds",
+                "&# &#x &#128;43 &copy = &#169f = &#xa9",
+                "&# &#x \u{20AC}43 \u{00A9} = \u{00A9}f = \u{00A9}",
+            ),
             ("numericReplacements", "Footnote&#x87;", "Footnote\u{2021}"),
             ("copySingleAmpersand", "&", "&"),
             ("copyAmpersandNonEntity", "text &test", "text &test"),
@@ -15788,7 +15908,10 @@ mod tests {
         for input in corpus {
             let escaped = EscapeString(input);
             let unescaped = UnescapeString(&escaped);
-            assert_eq!(unescaped, input, "roundtrip should preserve input: {input:?}");
+            assert_eq!(
+                unescaped, input,
+                "roundtrip should preserve input: {input:?}"
+            );
 
             // As in Go's fuzz test, ensure reverse composition does not panic.
             let _ = EscapeString(&UnescapeString(input));
@@ -15797,8 +15920,7 @@ mod tests {
 
     #[test]
     fn go_test_template_example_matches_go() {
-        let source =
-            r#"<ul>{{range .Items}}<li>{{.}}</li>{{else}}<li><strong>no rows</strong></li>{{end}}</ul>"#;
+        let source = r#"<ul>{{range .Items}}<li>{{.}}</li>{{else}}<li><strong>no rows</strong></li>{{end}}</ul>"#;
 
         let template = Template::new("webpage")
             .parse(source)
@@ -15822,7 +15944,10 @@ mod tests {
             .expect("parse should succeed");
 
         let output = template
-            .execute_template_to_string("T", &json!("<script>alert('you have been pwned')</script>"))
+            .execute_template_to_string(
+                "T",
+                &json!("<script>alert('you have been pwned')</script>"),
+            )
             .expect("execute should succeed");
         assert_eq!(
             output,
@@ -15906,14 +16031,17 @@ mod tests {
 
     #[test]
     fn go_test_template_example_template_block_matches_go() {
-        let master = r#"Names:{{block "list" .}}{{"\n"}}{{range .}}{{println "-" .}}{{end}}{{end}}"#;
+        let master =
+            r#"Names:{{block "list" .}}{{"\n"}}{{range .}}{{println "-" .}}{{end}}{{end}}"#;
         let overlay = r#"{{define "list"}} {{join . ", "}}{{end}}"#;
         let guardians = json!(["Gamora", "Groot", "Nebula", "Rocket", "Star-Lord"]);
 
         let master_tmpl = Template::new("master")
             .add_func("join", |args: &[Value]| {
                 if args.len() != 2 {
-                    return Err(TemplateError::Render("join expects two arguments".to_string()));
+                    return Err(TemplateError::Render(
+                        "join expects two arguments".to_string(),
+                    ));
                 }
                 let sep = args[1].to_plain_string();
                 let parts = match &args[0] {
@@ -15940,7 +16068,9 @@ mod tests {
             .execute_to_string(&guardians)
             .expect("execute should succeed");
 
-        assert!(base_output.contains("Names:\n- Gamora\n- Groot\n- Nebula\n- Rocket\n- Star-Lord\n"));
+        assert!(
+            base_output.contains("Names:\n- Gamora\n- Groot\n- Nebula\n- Rocket\n- Star-Lord\n")
+        );
         assert_eq!(
             overlay_output,
             "Names: Gamora, Groot, Nebula, Rocket, Star-Lord"
@@ -15952,7 +16082,10 @@ mod tests {
     fn go_test_template_example_template_glob_matches_go() {
         let dir = create_template_dir(&[
             ("T0.tmpl", r#"T0 invokes T1: ({{template "T1"}})"#),
-            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            (
+                "T1.tmpl",
+                r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#,
+            ),
             ("T2.tmpl", r#"{{define "T2"}}This is T2{{end}}"#),
         ]);
         let pattern = format!("{}/*.tmpl", dir.path().display());
@@ -15986,19 +16119,26 @@ mod tests {
     #[test]
     fn go_test_template_example_template_helpers_matches_go() {
         let dir = create_template_dir(&[
-            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            (
+                "T1.tmpl",
+                r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#,
+            ),
             ("T2.tmpl", r#"{{define "T2"}}This is T2{{end}}"#),
         ]);
         let pattern = format!("{}/*.tmpl", dir.path().display());
 
         let templates = parse_glob(&pattern).expect("parse_glob should succeed");
         let templates = templates
-            .parse(r#"{{define "driver1"}}Driver 1 calls T1: ({{template "T1"}})
-{{end}}"#)
+            .parse(
+                r#"{{define "driver1"}}Driver 1 calls T1: ({{template "T1"}})
+{{end}}"#,
+            )
             .expect("parse driver1 should succeed");
         let templates = templates
-            .parse(r#"{{define "driver2"}}Driver 2 calls T2: ({{template "T2"}})
-{{end}}"#)
+            .parse(
+                r#"{{define "driver2"}}Driver 2 calls T2: ({{template "T2"}})
+{{end}}"#,
+            )
             .expect("parse driver2 should succeed");
 
         let out_driver1 = templates
@@ -16017,8 +16157,14 @@ mod tests {
     #[test]
     fn go_test_template_example_template_share_matches_go() {
         let dir = create_template_dir(&[
-            ("T0.tmpl", "T0 ({{.}} version) invokes T1: ({{template \"T1\"}})\n"),
-            ("T1.tmpl", r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#),
+            (
+                "T0.tmpl",
+                "T0 ({{.}} version) invokes T1: ({{template \"T1\"}})\n",
+            ),
+            (
+                "T1.tmpl",
+                r#"{{define "T1"}}T1 invokes T2: ({{template "T2"}}){{end}}"#,
+            ),
             ("T2.tmpl", r#"{{define "T2"}}{{end}}"#),
         ]);
         let pattern = format!("{}/*.tmpl", dir.path().display());
@@ -16047,7 +16193,6 @@ mod tests {
             "T0 (second version) invokes T1: (T1 invokes T2: (T2, version B))\nT0 (first version) invokes T1: (T1 invokes T2: (T2, version A))\n"
         );
     }
-
 
     #[test]
     fn parse_numbers_supports_go_style_numeric_literals() {
