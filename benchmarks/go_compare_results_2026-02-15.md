@@ -465,3 +465,65 @@ Key change:
 | script_2k | 3 | 2396 | 1292 | 1.85 | 1106 | 2238 | 0.49 | true |
 | style_100 | 10 | 132 | 66 | 2.00 | 47 | 117 | 0.40 | true |
 | style_2k | 3 | 2295 | 1330 | 1.73 | 1001 | 3030 | 0.33 | true |
+
+## Full Compare Snapshot (Higher Loops for Sub-1ms Cases)
+
+Run date: 2026-02-15  
+Policy: cases with prior `avg_us < 1000` were rerun with larger `--loops` to reduce measurement noise.
+
+| case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 1000 | 508 | 38 | 13.37 | 4 | 66 | 0.06 | true |
+| expr_20k | 20 | 9091 | 9524 | 0.95 | 2290 | 13446 | 0.17 | true |
+| deep_path_20k | 20 | 17232 | 23065 | 0.75 | 2426 | 20342 | 0.12 | true |
+| func_print_20k | 20 | 13632 | 13896 | 0.98 | 4120 | 21694 | 0.19 | true |
+| range_no_vars | 5000 | 5 | 3 | 1.67 | 103 | 614 | 0.17 | true |
+| range_var_decl | 500 | 6 | 5 | 1.20 | 7765 | 24496 | 0.32 | true |
+| range_var_assign | 500 | 7 | 6 | 1.17 | 8048 | 24592 | 0.33 | true |
+| if_else_20k | 20 | 38383 | 32550 | 1.18 | 6775 | 17135 | 0.40 | true |
+| template_call_range | 500 | 6 | 5 | 1.20 | 4356 | 13548 | 0.32 | true |
+| attr_20k | 10 | 15886 | 12732 | 1.25 | 12389 | 14961 | 0.83 | true |
+| url_20k | 10 | 15413 | 12426 | 1.24 | 15304 | 26508 | 0.58 | true |
+| script_2 | 10000 | 5 | 3 | 1.67 | 1 | 1 | 1.00 | true |
+| script_100 | 2000 | 116 | 58 | 2.00 | 54 | 67 | 0.81 | true |
+| script_2k | 3 | 2337 | 1222 | 1.91 | 1136 | 2422 | 0.47 | true |
+| style_100 | 2000 | 106 | 61 | 1.74 | 47 | 98 | 0.48 | true |
+| style_2k | 3 | 2234 | 1343 | 1.66 | 1020 | 2799 | 0.36 | true |
+
+## Revert: Parse Preprocess One-Pass Integration (Prescan Rollback)
+
+Run date: 2026-02-15  
+Change: reverted prescan-based parse preprocessing (`prescan_parse_input`/`prescan_validation_input`/`strip_html_comments_with_flag`) while keeping span-based token/text storage.
+
+### Go Compare (Key Cases)
+
+Command pattern:
+```bash
+cargo run --release --quiet --bin compare_go_html_template -- \
+  --template benchmarks/go_compare_cases/<case>.tmpl \
+  --data benchmarks/go_compare_cases/data_main.json \
+  --loops <loops>
+```
+
+| case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 1000 | 538 | 51 | 10.55 | 4 | 61 | 0.07 | true |
+| expr_20k | 80 | 8640 | 9338 | 0.93 | 2140 | 12075 | 0.18 | true |
+| attr_20k | 40 | 13882 | 12656 | 1.10 | 12088 | 12783 | 0.95 | true |
+
+### Parse Breakdown (Rust-only)
+
+```bash
+cargo run --release --quiet --bin perf_parse_breakdown
+```
+
+| benchmark | avg_us |
+|---|---:|
+| parse_tree_expr_20k | 7732 |
+| parse_expr_20k | 8161 |
+| parse_tree_html_mix | 6109 |
+| parse_html_mix | 9152 |
+
+Notes:
+- `static_200k` parse regression observed after prescan integration is improved after rollback (`627us` -> `538us` in this environment).
+- Output parity with Go remains `true` for all rerun cases.

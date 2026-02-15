@@ -5,6 +5,7 @@ use std::collections::HashSet;
 #[cfg(not(feature = "web-rust"))]
 use std::fs;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -670,29 +671,9 @@ impl Template {
     }
 
     pub fn parse_tree(&self, text: &str) -> Result<ParseTree> {
-        let preprocessed = strip_html_comments(text);
         let left_delim = self.name_space.left_delim.read().unwrap().clone();
         let right_delim = self.name_space.right_delim.read().unwrap().clone();
-        let preprocessed = preprocessed.as_ref();
-        if preprocessed.is_empty() {
-            return Ok(ParseTree { nodes: Vec::new() });
-        }
-        if !preprocessed.contains(&left_delim) {
-            return Ok(ParseTree {
-                nodes: vec![Node::Text(TextNode::new(preprocessed.to_string()))],
-            });
-        }
-
-        let tokens = tokenize(preprocessed, &left_delim, &right_delim)?;
-        let mut index = 0;
-        let (nodes, stop) = parse_nodes(&tokens, &mut index, &[])?;
-        if let Some(stop) = stop {
-            return Err(TemplateError::Parse(format!(
-                "unexpected control action `{}`",
-                stop.keyword
-            )));
-        }
-        Ok(ParseTree { nodes })
+        self.parse_tree_with_delims(text, &left_delim, &right_delim)
     }
 
     #[allow(non_snake_case)]
@@ -1111,13 +1092,50 @@ impl Template {
         if text.as_bytes().contains(&b'=') {
             validate_template_hazards(text)?;
         }
-        let tree = self.parse_tree(text)?;
+        let left_delim = self.name_space.left_delim.read().unwrap().clone();
+        let right_delim = self.name_space.right_delim.read().unwrap().clone();
+        let tree = self.parse_tree_with_delims(text, &left_delim, &right_delim)?;
         self.validate_function_calls(&tree.nodes)?;
         self.clear_text_only_output_cache();
         let mut templates = self.name_space.templates.write().unwrap();
         self.merge_template_nodes(&mut templates, name, tree.nodes);
 
         Ok(())
+    }
+
+    fn parse_tree_with_delims(
+        &self,
+        text: &str,
+        left_delim: &str,
+        right_delim: &str,
+    ) -> Result<ParseTree> {
+        let preprocessed = strip_html_comments(text);
+        let preprocessed = preprocessed.as_ref();
+        let source: Arc<str> = Arc::from(preprocessed);
+        if preprocessed.is_empty() {
+            return Ok(ParseTree { nodes: Vec::new() });
+        }
+
+        if !preprocessed.contains(left_delim) {
+            return Ok(ParseTree {
+                nodes: vec![Node::Text(TextNode::from_span(
+                    source.clone(),
+                    0,
+                    source.len(),
+                ))],
+            });
+        }
+
+        let tokens = tokenize(preprocessed, left_delim, right_delim)?;
+        let mut index = 0;
+        let (nodes, stop) = parse_nodes(&source, &tokens, &mut index, &[])?;
+        if let Some(stop) = stop {
+            return Err(TemplateError::Parse(format!(
+                "unexpected control action `{}`",
+                stop.keyword
+            )));
+        }
+        Ok(ParseTree { nodes })
     }
 
     fn merge_template_nodes(
@@ -2452,16 +2470,51 @@ enum Node {
 
 #[derive(Clone, Debug)]
 struct TextNode {
-    raw: String,
+    raw: SharedText,
     prepared: Option<PreparedTextPlan>,
 }
 
 impl TextNode {
-    fn new(raw: String) -> Self {
+    fn from_span(source: Arc<str>, start: usize, end: usize) -> Self {
         Self {
-            raw,
+            raw: SharedText::new(source, start, end),
             prepared: None,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedText {
+    source: Arc<str>,
+    start: usize,
+    end: usize,
+}
+
+impl SharedText {
+    fn new(source: Arc<str>, start: usize, end: usize) -> Self {
+        debug_assert!(start <= end);
+        debug_assert!(end <= source.len());
+        Self { source, start, end }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.source[self.start..self.end]
+    }
+}
+
+impl Deref for SharedText {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl From<String> for SharedText {
+    fn from(value: String) -> Self {
+        let source: Arc<str> = Arc::from(value);
+        let end = source.len();
+        SharedText::new(source, 0, end)
     }
 }
 
@@ -2510,8 +2563,8 @@ enum Term {
 
 #[derive(Clone, Debug)]
 enum Token {
-    Text(String),
-    Action(String),
+    Text { start: usize, end: usize },
+    Action { start: usize, end: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -3521,7 +3574,7 @@ impl<'a> ParseContextAnalyzer<'a> {
                     self.text_transition_cache
                         .entry(key)
                         .or_default()
-                        .insert(text_node.raw.clone(), cached);
+                        .insert(text_node.raw.to_string(), cached);
                 }
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
@@ -6065,7 +6118,7 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
     while let Some(start_offset) = source[cursor..].find(left_delim) {
         let start = cursor + start_offset;
         if start > cursor {
-            tokens.push(Token::Text(source[cursor..start].to_string()));
+            tokens.push(Token::Text { start: cursor, end: start });
         }
 
         let mut action_start = start + left_delim.len();
@@ -6079,7 +6132,7 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
 
             if !should_treat_as_unary_minus {
                 action_start += 1;
-                trim_last_text_whitespace(&mut tokens);
+                trim_last_text_whitespace(&mut tokens, source);
             }
         }
 
@@ -6088,14 +6141,21 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
         })?;
         let end = action_start + end_offset;
 
-        let mut action = source[action_start..end].trim().to_string();
-        let trim_right = action.ends_with('-');
+        let mut action_start_trimmed = trim_start_whitespace(source, action_start, end);
+        let mut action_end_trimmed = trim_end_whitespace(source, action_start_trimmed, end);
+        let trim_right = action_start_trimmed < action_end_trimmed
+            && source[action_start_trimmed..action_end_trimmed].ends_with('-');
         if trim_right {
-            action.pop();
-            action = action.trim_end().to_string();
+            action_end_trimmed = previous_char_boundary(source, action_start_trimmed, action_end_trimmed);
+            action_end_trimmed =
+                trim_end_whitespace(source, action_start_trimmed, action_end_trimmed);
         }
 
-        tokens.push(Token::Action(action));
+        action_start_trimmed = trim_start_whitespace(source, action_start_trimmed, action_end_trimmed);
+        tokens.push(Token::Action {
+            start: action_start_trimmed,
+            end: action_end_trimmed,
+        });
         cursor = end + right_delim.len();
 
         if trim_right {
@@ -6113,20 +6173,70 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
     }
 
     if cursor < source.len() {
-        tokens.push(Token::Text(source[cursor..].to_string()));
+        tokens.push(Token::Text {
+            start: cursor,
+            end: source.len(),
+        });
     }
 
     Ok(tokens)
 }
 
-fn trim_last_text_whitespace(tokens: &mut [Token]) {
-    if let Some(Token::Text(last)) = tokens.last_mut() {
-        let trimmed = last.trim_end().to_string();
-        *last = trimmed;
+fn trim_start_whitespace(source: &str, mut start: usize, end: usize) -> usize {
+    while start < end {
+        let mut chars = source[start..end].chars();
+        let Some(ch) = chars.next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            start += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    start
+}
+
+fn trim_end_whitespace(source: &str, start: usize, end: usize) -> usize {
+    if start >= end {
+        return start;
+    }
+    let segment = &source[start..end];
+    let mut trimmed_end = end;
+    for (offset, ch) in segment.char_indices().rev() {
+        if ch.is_whitespace() {
+            trimmed_end = start + offset;
+        } else {
+            break;
+        }
+    }
+    trimmed_end
+}
+
+fn previous_char_boundary(source: &str, start: usize, end: usize) -> usize {
+    if start >= end {
+        return start;
+    }
+    source[..end]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(start)
+}
+
+fn trim_last_text_whitespace(tokens: &mut Vec<Token>, source: &str) {
+    let mut remove_last = false;
+    if let Some(Token::Text { start, end }) = tokens.last_mut() {
+        *end = trim_end_whitespace(source, *start, *end);
+        remove_last = *start == *end;
+    }
+    if remove_last {
+        let _ = tokens.pop();
     }
 }
 
 fn parse_nodes(
+    source: &Arc<str>,
     tokens: &[Token],
     index: &mut usize,
     stop_keywords: &[&str],
@@ -6135,11 +6245,16 @@ fn parse_nodes(
 
     while *index < tokens.len() {
         match &tokens[*index] {
-            Token::Text(text) => {
-                nodes.push(Node::Text(TextNode::new(text.clone())));
+            Token::Text { start, end } => {
+                nodes.push(Node::Text(TextNode::from_span(
+                    source.clone(),
+                    *start,
+                    *end,
+                )));
                 *index += 1;
             }
-            Token::Action(raw_action) => {
+            Token::Action { start, end } => {
+                let raw_action = &source[*start..*end];
                 let action = raw_action.trim();
                 if action.is_empty() {
                     *index += 1;
@@ -6172,7 +6287,7 @@ fn parse_nodes(
                         }
                         *index += 1;
                         let condition = parse_expression(tail)?;
-                        let parsed = parse_if_from_condition(tokens, index, condition)?;
+                        let parsed = parse_if_from_condition(source, tokens, index, condition)?;
                         nodes.push(parsed);
                     }
                     "range" => {
@@ -6184,7 +6299,7 @@ fn parse_nodes(
                         *index += 1;
                         let (vars, iterable, declare_vars) = parse_range_clause(tail)?;
                         let (body, else_branch) =
-                            parse_optional_else_block(tokens, index, "range")?;
+                            parse_optional_else_block(source, tokens, index, "range")?;
                         nodes.push(Node::Range {
                             vars,
                             declare_vars,
@@ -6201,13 +6316,13 @@ fn parse_nodes(
                         }
                         *index += 1;
                         let value = parse_expression(tail)?;
-                        let parsed = parse_with_from_value(tokens, index, value)?;
+                        let parsed = parse_with_from_value(source, tokens, index, value)?;
                         nodes.push(parsed);
                     }
                     "define" => {
                         let name = parse_quoted_name(tail)?;
                         *index += 1;
-                        let (body, stop) = parse_nodes(tokens, index, &["end"])?;
+                        let (body, stop) = parse_nodes(source, tokens, index, &["end"])?;
                         match stop {
                             Some(stop) if stop.keyword == "end" => {
                                 nodes.push(Node::Define { name, body });
@@ -6232,7 +6347,7 @@ fn parse_nodes(
                         }
                         let (name, data) = parse_template_call(tail)?;
                         *index += 1;
-                        let (body, stop) = parse_nodes(tokens, index, &["end"])?;
+                        let (body, stop) = parse_nodes(source, tokens, index, &["end"])?;
                         match stop {
                             Some(stop) if stop.keyword == "end" => {
                                 nodes.push(Node::Block { name, data, body });
@@ -6286,15 +6401,20 @@ fn parse_nodes(
     Ok((nodes, None))
 }
 
-fn parse_if_from_condition(tokens: &[Token], index: &mut usize, condition: Expr) -> Result<Node> {
-    let (then_branch, stop) = parse_nodes(tokens, index, &["else", "end"])?;
+fn parse_if_from_condition(
+    source: &Arc<str>,
+    tokens: &[Token],
+    index: &mut usize,
+    condition: Expr,
+) -> Result<Node> {
+    let (then_branch, stop) = parse_nodes(source, tokens, index, &["else", "end"])?;
     let mut else_branch = Vec::new();
 
     match stop {
         Some(stop) if stop.keyword == "end" => {}
         Some(stop) if stop.keyword == "else" => {
             if stop.tail.is_empty() {
-                let (parsed_else, end) = parse_nodes(tokens, index, &["end"])?;
+                let (parsed_else, end) = parse_nodes(source, tokens, index, &["end"])?;
                 match end {
                     Some(end) if end.keyword == "end" => {
                         else_branch = parsed_else;
@@ -6314,7 +6434,8 @@ fn parse_if_from_condition(tokens: &[Token], index: &mut usize, condition: Expr)
                         ));
                     }
                     let else_if_condition = parse_expression(tail)?;
-                    let nested = parse_if_from_condition(tokens, index, else_if_condition)?;
+                    let nested =
+                        parse_if_from_condition(source, tokens, index, else_if_condition)?;
                     else_branch.push(nested);
                 } else {
                     return Err(TemplateError::Parse(format!(
@@ -6344,15 +6465,20 @@ fn parse_if_from_condition(tokens: &[Token], index: &mut usize, condition: Expr)
     })
 }
 
-fn parse_with_from_value(tokens: &[Token], index: &mut usize, value: Expr) -> Result<Node> {
-    let (body, stop) = parse_nodes(tokens, index, &["else", "end"])?;
+fn parse_with_from_value(
+    source: &Arc<str>,
+    tokens: &[Token],
+    index: &mut usize,
+    value: Expr,
+) -> Result<Node> {
+    let (body, stop) = parse_nodes(source, tokens, index, &["else", "end"])?;
     let mut else_branch = Vec::new();
 
     match stop {
         Some(stop) if stop.keyword == "end" => {}
         Some(stop) if stop.keyword == "else" => {
             if stop.tail.is_empty() {
-                let (parsed_else, end) = parse_nodes(tokens, index, &["end"])?;
+                let (parsed_else, end) = parse_nodes(source, tokens, index, &["end"])?;
                 match end {
                     Some(end) if end.keyword == "end" => {
                         else_branch = parsed_else;
@@ -6372,7 +6498,7 @@ fn parse_with_from_value(tokens: &[Token], index: &mut usize, value: Expr) -> Re
                         ));
                     }
                     let else_with_value = parse_expression(tail)?;
-                    let nested = parse_with_from_value(tokens, index, else_with_value)?;
+                    let nested = parse_with_from_value(source, tokens, index, else_with_value)?;
                     else_branch.push(nested);
                 } else {
                     return Err(TemplateError::Parse(format!(
@@ -6403,11 +6529,12 @@ fn parse_with_from_value(tokens: &[Token], index: &mut usize, value: Expr) -> Re
 }
 
 fn parse_optional_else_block(
+    source: &Arc<str>,
     tokens: &[Token],
     index: &mut usize,
     block_name: &str,
 ) -> Result<(Vec<Node>, Vec<Node>)> {
-    let (body, stop) = parse_nodes(tokens, index, &["else", "end"])?;
+    let (body, stop) = parse_nodes(source, tokens, index, &["else", "end"])?;
     match stop {
         Some(stop) if stop.keyword == "end" => Ok((body, Vec::new())),
         Some(stop) if stop.keyword == "else" => {
@@ -6417,7 +6544,7 @@ fn parse_optional_else_block(
                     stop.tail
                 )));
             }
-            let (else_branch, end) = parse_nodes(tokens, index, &["end"])?;
+            let (else_branch, end) = parse_nodes(source, tokens, index, &["end"])?;
             match end {
                 Some(end) if end.keyword == "end" => Ok((body, else_branch)),
                 _ => Err(TemplateError::Parse(format!(
