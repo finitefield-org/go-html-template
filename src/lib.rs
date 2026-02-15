@@ -2655,7 +2655,9 @@ impl<'a> ParseContextAnalyzer<'a> {
             let mut normal_states = HashSet::new();
             for flow in &flows {
                 if flow.kind == AnalysisFlowKind::Normal {
-                    validate_action_context_before_insertion(&flow.tracker)?;
+                    if should_validate_action_context(&flow.tracker) {
+                        validate_action_context_before_insertion(&flow.tracker)?;
+                    }
                     normal_states.insert(flow.tracker.state());
                 }
             }
@@ -2759,10 +2761,14 @@ impl<'a> ParseContextAnalyzer<'a> {
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::Expr { expr: _, mode, .. } => {
-                validate_action_context_before_insertion(&tracker)?;
+                if should_validate_action_context(&tracker) {
+                    validate_action_context_before_insertion(&tracker)?;
+                }
                 let escape_mode = tracker.mode();
                 *mode = escape_mode;
-                tracker.append_expr_placeholder(escape_mode);
+                if placeholder_advances_parse_context(&tracker, escape_mode) {
+                    tracker.append_expr_placeholder(escape_mode);
+                }
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::SetVar { .. } | Node::Define { .. } => Ok(vec![AnalysisFlow::normal(tracker)]),
@@ -2834,7 +2840,9 @@ impl<'a> ParseContextAnalyzer<'a> {
                 Ok(dedup_analysis_flows(output_flows))
             }
             Node::TemplateCall { name, .. } => {
-                validate_action_context_before_insertion(&tracker)?;
+                if should_validate_action_context(&tracker) {
+                    validate_action_context_before_insertion(&tracker)?;
+                }
                 let start_state = tracker.state();
                 let end_state = self.analyze_template(name, start_state.clone())?;
                 if start_state == end_state {
@@ -2848,7 +2856,9 @@ impl<'a> ParseContextAnalyzer<'a> {
             }
             Node::Block { name, body, .. } => {
                 if self.raw_templates.contains_key(name) {
-                    validate_action_context_before_insertion(&tracker)?;
+                    if should_validate_action_context(&tracker) {
+                        validate_action_context_before_insertion(&tracker)?;
+                    }
                     let start_state = tracker.state();
                     let end_state = self.analyze_template(name, start_state)?;
                     Ok(vec![AnalysisFlow::normal(ContextTracker::from_state(
@@ -3055,6 +3065,25 @@ fn range_reentry_context_matches(start: &ContextTracker, candidate: &ContextTrac
     }
 
     start_state == candidate_state
+}
+
+fn should_validate_action_context(tracker: &ContextTracker) -> bool {
+    let state = &tracker.state;
+    state.in_js_attribute
+        || state.in_css_attribute
+        || state.is_script_tag_context()
+        || state.is_style_tag_context()
+}
+
+fn placeholder_advances_parse_context(tracker: &ContextTracker, mode: EscapeMode) -> bool {
+    match mode {
+        EscapeMode::Html => tracker.state.in_open_tag,
+        EscapeMode::Rcdata => false,
+        EscapeMode::AttrQuoted { kind, .. } | EscapeMode::AttrUnquoted { kind } => {
+            matches!(kind, AttrKind::Js | AttrKind::Css)
+        }
+        _ => true,
+    }
 }
 
 fn is_empty_template_body(nodes: &[Node]) -> bool {
