@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -5591,7 +5592,7 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
             _ => Ok(escape_html(&value.to_plain_string())),
         },
         EscapeMode::AttrName => Ok(html_name_filter(&value.to_plain_string())),
-        EscapeMode::AttrQuoted { kind, quote } => match kind {
+        EscapeMode::AttrQuoted { kind, quote: _ } => match kind {
             AttrKind::Normal => match value {
                 Value::SafeHtml(raw) => Ok(escape_html_norm(&strip_tags(raw))),
                 _ => Ok(escape_html(&value.to_plain_string())),
@@ -5613,10 +5614,15 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
                 };
                 Ok(escape_html(&text))
             }
-            AttrKind::Url | AttrKind::Srcset => {
-                let text = transform_attr_value(value, kind, Some(quote), rendered_prefix);
-                Ok(escape_html(&text))
-            }
+            AttrKind::Url => Ok(escape_url_attribute_value_single_pass(
+                value,
+                rendered_prefix,
+                HtmlAttributeEscapeMode::Quoted,
+            )),
+            AttrKind::Srcset => Ok(escape_srcset_attribute_value_single_pass(
+                value,
+                HtmlAttributeEscapeMode::Quoted,
+            )),
         },
         EscapeMode::AttrUnquoted { kind } => match kind {
             AttrKind::Normal => match value {
@@ -5636,14 +5642,18 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
                 };
                 Ok(escape_attr_unquoted(&text))
             }
-            AttrKind::Url | AttrKind::Srcset | AttrKind::Js => {
-                if kind == AttrKind::Js {
-                    let text = js_val_escaper(value)?;
-                    Ok(html_nospace_escaper(&text))
-                } else {
-                    let text = transform_attr_value(value, kind, None, rendered_prefix);
-                    Ok(escape_attr_unquoted(&text))
-                }
+            AttrKind::Url => Ok(escape_url_attribute_value_single_pass(
+                value,
+                rendered_prefix,
+                HtmlAttributeEscapeMode::Unquoted,
+            )),
+            AttrKind::Srcset => Ok(escape_srcset_attribute_value_single_pass(
+                value,
+                HtmlAttributeEscapeMode::Unquoted,
+            )),
+            AttrKind::Js => {
+                let text = js_val_escaper(value)?;
+                Ok(html_nospace_escaper(&text))
             }
         },
         EscapeMode::ScriptExpr => escape_script_value(value),
@@ -6069,42 +6079,271 @@ fn html_name_filter(input: &str) -> String {
     name
 }
 
-fn transform_attr_value(
-    value: &Value,
-    kind: AttrKind,
-    quote: Option<char>,
-    rendered_prefix: &str,
-) -> String {
-    match kind {
-        AttrKind::Normal => value.to_plain_string(),
-        AttrKind::Url => {
-            let raw = value.to_plain_string();
-            let url_part = url_part_context(rendered_prefix).unwrap_or(UrlPartContext::Path);
-            if matches!(url_part, UrlPartContext::Path)
-                && !matches!(value, Value::SafeUrl(_))
-                && !is_safe_url(&raw)
+#[derive(Clone, Copy)]
+enum HtmlAttributeEscapeMode {
+    Quoted,
+    Unquoted,
+}
+
+fn plain_string_cow_for_url(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::SafeUrl(raw) => Cow::Borrowed(raw),
+        Value::Json(JsonValue::String(raw)) => Cow::Borrowed(raw),
+        _ => Cow::Owned(value.to_plain_string()),
+    }
+}
+
+fn append_html_attr_escaped_char(output: &mut String, ch: char, mode: HtmlAttributeEscapeMode) {
+    match mode {
+        HtmlAttributeEscapeMode::Quoted => match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&#34;"),
+            '\'' => output.push_str("&#39;"),
+            '+' => output.push_str("&#43;"),
+            '\0' => output.push('\u{FFFD}'),
+            _ => output.push(ch),
+        },
+        HtmlAttributeEscapeMode::Unquoted => match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&#34;"),
+            '\'' => output.push_str("&#39;"),
+            '`' => output.push_str("&#96;"),
+            '=' => output.push_str("&#61;"),
+            '+' => output.push_str("&#43;"),
+            ' ' => output.push_str("&#32;"),
+            '\n' => output.push_str("&#10;"),
+            '\r' => output.push_str("&#13;"),
+            '\t' => output.push_str("&#9;"),
+            '\0' => output.push_str("&#xfffd;"),
+            _ => output.push(ch),
+        },
+    }
+}
+
+fn append_html_attr_escaped_text(output: &mut String, input: &str, mode: HtmlAttributeEscapeMode) {
+    for ch in input.chars() {
+        append_html_attr_escaped_char(output, ch, mode);
+    }
+}
+
+fn append_html_attr_escaped_byte(output: &mut String, byte: u8, mode: HtmlAttributeEscapeMode) {
+    append_html_attr_escaped_char(output, byte as char, mode);
+}
+
+fn append_url_attribute_encoded_and_escaped(
+    input: &str,
+    output: &mut String,
+    escape_mode: HtmlAttributeEscapeMode,
+) {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'%' {
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
             {
-                return "#ZgotmplZ".to_string();
+                append_html_attr_escaped_byte(output, b'%', escape_mode);
+                append_html_attr_escaped_byte(output, bytes[i + 1], escape_mode);
+                append_html_attr_escaped_byte(output, bytes[i + 2], escape_mode);
+                i += 3;
+                continue;
             }
-            if matches!(value, Value::SafeUrl(_)) || matches!(url_part, UrlPartContext::Path) {
-                encode_url_attribute_value(&raw)
-            } else {
-                percent_encode_url(&raw)
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, b'2', escape_mode);
+            append_html_attr_escaped_byte(output, b'5', escape_mode);
+            i += 1;
+            continue;
+        }
+
+        if is_safe_url_attr_byte(byte) {
+            append_html_attr_escaped_byte(output, byte, escape_mode);
+        } else {
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower((byte >> 4) & 0x0F) as u8, escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower(byte & 0x0F) as u8, escape_mode);
+        }
+        i += 1;
+    }
+}
+
+fn append_percent_encoded_and_escaped(
+    input: &str,
+    output: &mut String,
+    escape_mode: HtmlAttributeEscapeMode,
+) {
+    for &byte in input.as_bytes() {
+        if is_unreserved_url_byte(byte) {
+            append_html_attr_escaped_byte(output, byte, escape_mode);
+        } else {
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower((byte >> 4) & 0x0F) as u8, escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower(byte & 0x0F) as u8, escape_mode);
+        }
+    }
+}
+
+fn escape_url_attribute_value_single_pass(
+    value: &Value,
+    rendered_prefix: &str,
+    escape_mode: HtmlAttributeEscapeMode,
+) -> String {
+    let raw = plain_string_cow_for_url(value);
+    let url_part = url_part_context(rendered_prefix).unwrap_or(UrlPartContext::Path);
+    let is_safe_value = matches!(value, Value::SafeUrl(_));
+    if matches!(url_part, UrlPartContext::Path) && !is_safe_value && !is_safe_url(raw.as_ref()) {
+        return "#ZgotmplZ".to_string();
+    }
+
+    let mut output = String::with_capacity(raw.len().saturating_mul(3));
+    if is_safe_value || matches!(url_part, UrlPartContext::Path) {
+        append_url_attribute_encoded_and_escaped(raw.as_ref(), &mut output, escape_mode);
+    } else {
+        append_percent_encoded_and_escaped(raw.as_ref(), &mut output, escape_mode);
+    }
+    output
+}
+
+fn append_srcset_url_encoded_and_escaped(
+    input: &str,
+    output: &mut String,
+    escape_mode: HtmlAttributeEscapeMode,
+) {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b',' {
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, b'2', escape_mode);
+            append_html_attr_escaped_byte(output, b'c', escape_mode);
+            i += 1;
+            continue;
+        }
+        if byte == b'%' {
+            if i + 2 < bytes.len()
+                && bytes[i + 1].is_ascii_hexdigit()
+                && bytes[i + 2].is_ascii_hexdigit()
+            {
+                append_html_attr_escaped_byte(output, b'%', escape_mode);
+                append_html_attr_escaped_byte(output, bytes[i + 1], escape_mode);
+                append_html_attr_escaped_byte(output, bytes[i + 2], escape_mode);
+                i += 3;
+                continue;
             }
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, b'2', escape_mode);
+            append_html_attr_escaped_byte(output, b'5', escape_mode);
+            i += 1;
+            continue;
         }
-        AttrKind::Srcset => match value {
-            Value::SafeSrcset(raw) => raw.clone(),
-            Value::SafeUrl(raw) => normalize_url_for_attribute(raw).replace(',', "%2c"),
-            _ => filter_srcset_attribute_value(&value.to_plain_string()),
-        },
-        AttrKind::Js => {
-            let q = quote.unwrap_or('"');
-            escape_js_string_fragment(&value.to_plain_string(), q)
+        if is_safe_url_attr_byte(byte) {
+            append_html_attr_escaped_byte(output, byte, escape_mode);
+        } else {
+            append_html_attr_escaped_byte(output, b'%', escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower((byte >> 4) & 0x0F) as u8, escape_mode);
+            append_html_attr_escaped_byte(output, hex_lower(byte & 0x0F) as u8, escape_mode);
         }
-        AttrKind::Css => match quote {
-            Some(q) => escape_css_string_fragment(&value.to_plain_string(), q),
-            None => escape_css_text(&value.to_plain_string()),
-        },
+        i += 1;
+    }
+}
+
+fn append_filtered_srcset_element_and_escaped(
+    input: &str,
+    bytes: &[u8],
+    start: &mut usize,
+    end: usize,
+    output: &mut String,
+    escape_mode: HtmlAttributeEscapeMode,
+) {
+    let mut left = *start;
+    while left < end && is_html_space(bytes[left]) {
+        left += 1;
+    }
+
+    let mut element_end = end;
+    let mut i = left;
+    while i < end {
+        if is_html_space(bytes[i]) {
+            element_end = i;
+            break;
+        }
+        i += 1;
+    }
+
+    let url = &input[left..element_end];
+    if !url.is_empty() && is_safe_url(url) && srcset_metadata_is_safe(&input[element_end..end]) {
+        append_html_attr_escaped_text(output, &input[*start..left], escape_mode);
+        append_srcset_url_encoded_and_escaped(url, output, escape_mode);
+        append_html_attr_escaped_text(output, &input[element_end..end], escape_mode);
+    } else {
+        append_html_attr_escaped_text(output, "#ZgotmplZ", escape_mode);
+    }
+
+    *start = end;
+}
+
+fn escape_filtered_srcset_single_pass(input: &str, escape_mode: HtmlAttributeEscapeMode) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len().saturating_mul(2));
+    let mut start = 0usize;
+
+    for i in 0..bytes.len() {
+        if bytes[i] != b',' {
+            continue;
+        }
+        append_filtered_srcset_element_and_escaped(
+            input,
+            bytes,
+            &mut start,
+            i,
+            &mut output,
+            escape_mode,
+        );
+        append_html_attr_escaped_byte(&mut output, b',', escape_mode);
+        start = i + 1;
+    }
+
+    append_filtered_srcset_element_and_escaped(
+        input,
+        bytes,
+        &mut start,
+        bytes.len(),
+        &mut output,
+        escape_mode,
+    );
+    output
+}
+
+fn escape_srcset_attribute_value_single_pass(
+    value: &Value,
+    escape_mode: HtmlAttributeEscapeMode,
+) -> String {
+    match value {
+        Value::SafeSrcset(raw) => {
+            let mut output = String::with_capacity(raw.len().saturating_mul(2));
+            append_html_attr_escaped_text(&mut output, raw, escape_mode);
+            output
+        }
+        Value::SafeUrl(raw) => {
+            if !is_safe_url(raw) {
+                let mut output = String::with_capacity("#ZgotmplZ".len());
+                append_html_attr_escaped_text(&mut output, "#ZgotmplZ", escape_mode);
+                return output;
+            }
+            let mut output = String::with_capacity(raw.len().saturating_mul(3));
+            append_srcset_url_encoded_and_escaped(raw, &mut output, escape_mode);
+            output
+        }
+        _ => {
+            let raw = value.to_plain_string();
+            escape_filtered_srcset_single_pass(&raw, escape_mode)
+        }
     }
 }
 
@@ -9068,6 +9307,7 @@ fn sanitize_json_for_script(input: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
+#[cfg(test)]
 fn normalize_url_for_attribute(input: &str) -> String {
     if !is_safe_url(input) {
         return "#ZgotmplZ".to_string();
@@ -9122,6 +9362,7 @@ fn encode_url_attribute_value(input: &str) -> String {
     encoded
 }
 
+#[cfg(test)]
 fn filter_srcset_attribute_value(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = String::new();
@@ -9141,6 +9382,7 @@ fn filter_srcset_attribute_value(input: &str) -> String {
     output
 }
 
+#[cfg(test)]
 fn filter_srcset_element(
     input: &str,
     bytes: &[u8],
