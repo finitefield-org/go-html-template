@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use serde::Serialize;
@@ -428,6 +429,12 @@ pub type Method = Arc<dyn Fn(&Value, &[Value]) -> Result<Value> + Send + Sync + 
 pub type MethodMap = HashMap<String, Method>;
 type ScopeStack = Vec<HashMap<String, Value>>;
 
+struct RuntimeContext<'a> {
+    funcs: RwLockReadGuard<'a, FuncMap>,
+    methods: RwLockReadGuard<'a, MethodMap>,
+    missing_key_mode: MissingKeyMode,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParseTree {
     nodes: Vec<Node>,
@@ -832,6 +839,14 @@ impl Template {
         ))
     }
 
+    fn runtime_context(&self) -> RuntimeContext<'_> {
+        RuntimeContext {
+            funcs: self.name_space.funcs.read().unwrap(),
+            methods: self.name_space.methods.read().unwrap(),
+            missing_key_mode: *self.name_space.missing_key_mode.read().unwrap(),
+        }
+    }
+
     pub fn execute<T: Serialize, W: Write>(&self, writer: &mut W, data: &T) -> Result<()> {
         self.execute_template(writer, &self.name, data)
     }
@@ -847,6 +862,7 @@ impl Template {
         data: &T,
     ) -> Result<()> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
+        let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut tracker = ContextTracker::from_state(ContextState::html_text());
@@ -858,6 +874,7 @@ impl Template {
             &mut scopes,
             &mut rendered,
             &mut tracker,
+            &runtime,
             false,
             0,
         )?;
@@ -872,6 +889,7 @@ impl Template {
 
     pub fn execute_template_to_string<T: Serialize>(&self, name: &str, data: &T) -> Result<String> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
+        let runtime = self.runtime_context();
         let root = Value::from_serializable(data)?;
         let mut rendered = String::new();
         let mut tracker = ContextTracker::from_state(ContextState::html_text());
@@ -883,6 +901,7 @@ impl Template {
             &mut scopes,
             &mut rendered,
             &mut tracker,
+            &runtime,
             false,
             0,
         )?;
@@ -1046,6 +1065,7 @@ impl Template {
         scopes: &mut ScopeStack,
         output: &mut String,
         tracker: &mut ContextTracker,
+        runtime: &RuntimeContext<'_>,
         in_range: bool,
         depth: usize,
     ) -> Result<RenderFlow> {
@@ -1059,7 +1079,9 @@ impl Template {
         let nodes = templates
             .get(name)
             .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
-        self.render_nodes(nodes, root, dot, scopes, output, tracker, in_range, depth)
+        self.render_nodes(
+            nodes, root, dot, scopes, output, tracker, runtime, in_range, depth,
+        )
     }
 
     fn render_nodes(
@@ -1070,6 +1092,7 @@ impl Template {
         scopes: &mut ScopeStack,
         output: &mut String,
         tracker: &mut ContextTracker,
+        runtime: &RuntimeContext<'_>,
         in_range: bool,
         depth: usize,
     ) -> Result<RenderFlow> {
@@ -1106,7 +1129,7 @@ impl Template {
                             mode = inferred_mode;
                         }
                     }
-                    let value = self.eval_expr(expr, root, dot, scopes)?;
+                    let value = self.eval_expr(expr, root, dot, runtime, scopes)?;
                     let escaped = escape_value_for_mode(&value, mode, &tracker.rendered)?;
                     output.push_str(&escaped);
                     tracker.append_text(&escaped);
@@ -1116,7 +1139,7 @@ impl Template {
                     value,
                     declare,
                 } => {
-                    let evaluated = self.eval_expr(value, root, dot, scopes)?;
+                    let evaluated = self.eval_expr(value, root, dot, runtime, scopes)?;
                     if *declare {
                         declare_variable(scopes, name, evaluated);
                     } else {
@@ -1128,7 +1151,7 @@ impl Template {
                     then_branch,
                     else_branch,
                 } => {
-                    let condition_value = self.eval_expr(condition, root, dot, scopes)?;
+                    let condition_value = self.eval_expr(condition, root, dot, runtime, scopes)?;
                     if condition_value.truthy() {
                         push_scope(scopes);
                         let flow = self.render_nodes(
@@ -1138,6 +1161,7 @@ impl Template {
                             scopes,
                             output,
                             tracker,
+                            runtime,
                             in_range,
                             depth,
                         )?;
@@ -1154,6 +1178,7 @@ impl Template {
                             scopes,
                             output,
                             tracker,
+                            runtime,
                             in_range,
                             depth,
                         )?;
@@ -1170,7 +1195,7 @@ impl Template {
                     body,
                     else_branch,
                 } => {
-                    let iterable_value = self.eval_expr(iterable, root, dot, scopes)?;
+                    let iterable_value = self.eval_expr(iterable, root, dot, runtime, scopes)?;
                     let vars_len = vars.len();
                     match &iterable_value {
                         Value::Json(JsonValue::Array(items)) if !items.is_empty() => {
@@ -1194,7 +1219,8 @@ impl Template {
                                     }
                                 }
                                 let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, true, depth,
+                                    body, root, &item, scopes, output, tracker, runtime, true,
+                                    depth,
                                 )?;
                                 pop_scope(scopes);
                                 match flow {
@@ -1229,7 +1255,8 @@ impl Template {
                                     }
                                 }
                                 let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, true, depth,
+                                    body, root, &item, scopes, output, tracker, runtime, true,
+                                    depth,
                                 )?;
                                 pop_scope(scopes);
                                 match flow {
@@ -1260,7 +1287,8 @@ impl Template {
                                     }
                                 }
                                 let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, true, depth,
+                                    body, root, &item, scopes, output, tracker, runtime, true,
+                                    depth,
                                 )?;
                                 pop_scope(scopes);
                                 match flow {
@@ -1279,6 +1307,7 @@ impl Template {
                                 scopes,
                                 output,
                                 tracker,
+                                runtime,
                                 true,
                                 depth,
                             )?;
@@ -1294,11 +1323,11 @@ impl Template {
                     body,
                     else_branch,
                 } => {
-                    let value = self.eval_expr(value, root, dot, scopes)?;
+                    let value = self.eval_expr(value, root, dot, runtime, scopes)?;
                     if value.truthy() {
                         push_scope(scopes);
                         let flow = self.render_nodes(
-                            body, root, &value, scopes, output, tracker, in_range, depth,
+                            body, root, &value, scopes, output, tracker, runtime, in_range, depth,
                         )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
@@ -1313,6 +1342,7 @@ impl Template {
                             scopes,
                             output,
                             tracker,
+                            runtime,
                             in_range,
                             depth,
                         )?;
@@ -1324,7 +1354,7 @@ impl Template {
                 }
                 Node::TemplateCall { name, data } => {
                     let next_dot = match data {
-                        Some(expr) => self.eval_expr(expr, root, dot, scopes)?,
+                        Some(expr) => self.eval_expr(expr, root, dot, runtime, scopes)?,
                         None => dot.clone(),
                     };
                     let next_depth = depth + 1;
@@ -1341,6 +1371,7 @@ impl Template {
                         &mut template_scopes,
                         output,
                         tracker,
+                        runtime,
                         in_range,
                         next_depth,
                     )?;
@@ -1350,7 +1381,7 @@ impl Template {
                 }
                 Node::Block { name, data, body } => {
                     let next_dot = match data {
-                        Some(expr) => self.eval_expr(expr, root, dot, scopes)?,
+                        Some(expr) => self.eval_expr(expr, root, dot, runtime, scopes)?,
                         None => dot.clone(),
                     };
 
@@ -1369,6 +1400,7 @@ impl Template {
                             &mut template_scopes,
                             output,
                             tracker,
+                            runtime,
                             in_range,
                             next_depth,
                         )?;
@@ -1378,7 +1410,8 @@ impl Template {
                     } else {
                         push_scope(scopes);
                         let flow = self.render_nodes(
-                            body, root, &next_dot, scopes, output, tracker, in_range, depth,
+                            body, root, &next_dot, scopes, output, tracker, runtime, in_range,
+                            depth,
                         )?;
                         pop_scope(scopes);
                         if !matches!(flow, RenderFlow::Normal) {
@@ -1414,6 +1447,7 @@ impl Template {
         expr: &Expr,
         root: &Value,
         dot: &Value,
+        runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
         let mut piped: Option<Value> = None;
@@ -1426,12 +1460,12 @@ impl Template {
                             "pipeline command must be a function".to_string(),
                         ));
                     }
-                    piped = Some(self.eval_term(term, root, dot, scopes)?);
+                    piped = Some(self.eval_term(term, root, dot, runtime, scopes)?);
                 }
                 Command::Call { name, args } => {
                     let mut evaluated_args = args
                         .iter()
-                        .map(|arg| self.eval_term(arg, root, dot, scopes))
+                        .map(|arg| self.eval_term(arg, root, dot, runtime, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
                     if index > 0 {
@@ -1442,31 +1476,32 @@ impl Template {
                     }
 
                     if index == 0 && evaluated_args.is_empty() {
-                        let methods = self.name_space.methods.read().unwrap();
-                        let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                        if let Some(value) =
-                            lookup_identifier(dot, root, name, &methods, missing_key_mode)?
-                        {
+                        if let Some(value) = lookup_identifier(
+                            dot,
+                            root,
+                            name,
+                            &runtime.methods,
+                            runtime.missing_key_mode,
+                        )? {
                             piped = Some(value);
                             continue;
                         }
 
-                        let funcs = self.name_space.funcs.read().unwrap();
-                        if !funcs.contains_key(name) {
+                        if !runtime.funcs.contains_key(name) {
                             if matches!(dot, Value::Json(JsonValue::Object(_)))
                                 || matches!(root, Value::Json(JsonValue::Object(_)))
                             {
-                                piped = Some(missing_value_for_key(name, missing_key_mode)?);
+                                piped =
+                                    Some(missing_value_for_key(name, runtime.missing_key_mode)?);
                                 continue;
                             }
                         }
                     }
 
                     if name == "call" {
-                        piped = Some(self.eval_call_function(&evaluated_args)?);
+                        piped = Some(self.eval_call_function(&evaluated_args, runtime)?);
                     } else {
-                        let funcs = self.name_space.funcs.read().unwrap();
-                        let function = funcs.get(name).ok_or_else(|| {
+                        let function = runtime.funcs.get(name).ok_or_else(|| {
                             TemplateError::Render(format!("function `{name}` is not registered"))
                         })?;
                         piped = Some(function(&evaluated_args)?);
@@ -1475,7 +1510,7 @@ impl Template {
                 Command::Invoke { callee, args } => {
                     let mut evaluated_args = args
                         .iter()
-                        .map(|arg| self.eval_term(arg, root, dot, scopes))
+                        .map(|arg| self.eval_term(arg, root, dot, runtime, scopes))
                         .collect::<Result<Vec<_>>>()?;
 
                     if index > 0 {
@@ -1484,8 +1519,14 @@ impl Template {
                         })?;
                         evaluated_args.push(value);
                     }
-                    piped =
-                        Some(self.eval_method_call(callee, &evaluated_args, root, dot, scopes)?);
+                    piped = Some(self.eval_method_call(
+                        callee,
+                        &evaluated_args,
+                        root,
+                        dot,
+                        runtime,
+                        scopes,
+                    )?);
                 }
             }
         }
@@ -1498,52 +1539,49 @@ impl Template {
         term: &Term,
         root: &Value,
         dot: &Value,
+        runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
         match term {
             Term::DotPath(path) => {
-                let methods = self.name_space.methods.read().unwrap();
-                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                lookup_path_with_methods(dot, path, &methods, missing_key_mode)
+                lookup_path_with_methods(dot, path, &runtime.methods, runtime.missing_key_mode)
             }
             Term::RootPath(path) => {
-                let methods = self.name_space.methods.read().unwrap();
-                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                lookup_path_with_methods(root, path, &methods, missing_key_mode)
+                lookup_path_with_methods(root, path, &runtime.methods, runtime.missing_key_mode)
             }
             Term::Literal(value) => Ok(value.clone()),
             Term::Variable { name, path } => {
                 let variable = lookup_variable(scopes, name).ok_or_else(|| {
                     TemplateError::Render(format!("variable `${name}` could not be resolved"))
                 })?;
-                let methods = self.name_space.methods.read().unwrap();
-                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                lookup_path_with_methods(&variable, path, &methods, missing_key_mode)
+                lookup_path_with_methods(
+                    &variable,
+                    path,
+                    &runtime.methods,
+                    runtime.missing_key_mode,
+                )
             }
             Term::Identifier(name) => {
-                let methods = self.name_space.methods.read().unwrap();
-                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                if let Some(value) = lookup_identifier(dot, root, name, &methods, missing_key_mode)?
+                if let Some(value) =
+                    lookup_identifier(dot, root, name, &runtime.methods, runtime.missing_key_mode)?
                 {
                     Ok(value)
-                } else if self.name_space.funcs.read().unwrap().contains_key(name) {
+                } else if runtime.funcs.contains_key(name) {
                     Ok(Value::FunctionRef(name.clone()))
                 } else if matches!(dot, Value::Json(JsonValue::Object(_)))
                     || matches!(root, Value::Json(JsonValue::Object(_)))
                 {
-                    missing_value_for_key(name, missing_key_mode)
+                    missing_value_for_key(name, runtime.missing_key_mode)
                 } else {
                     Err(TemplateError::Render(format!(
                         "identifier `{name}` could not be resolved"
                     )))
                 }
             }
-            Term::SubExpr(expr) => self.eval_expr(expr, root, dot, scopes),
+            Term::SubExpr(expr) => self.eval_expr(expr, root, dot, runtime, scopes),
             Term::SubExprPath { expr, path } => {
-                let base = self.eval_expr(expr, root, dot, scopes)?;
-                let methods = self.name_space.methods.read().unwrap();
-                let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-                lookup_path_with_methods(&base, path, &methods, missing_key_mode)
+                let base = self.eval_expr(expr, root, dot, runtime, scopes)?;
+                lookup_path_with_methods(&base, path, &runtime.methods, runtime.missing_key_mode)
             }
         }
     }
@@ -1554,20 +1592,20 @@ impl Template {
         args: &[Value],
         root: &Value,
         dot: &Value,
+        runtime: &RuntimeContext<'_>,
         scopes: &ScopeStack,
     ) -> Result<Value> {
         match callee {
-            Term::DotPath(path) => self.call_path_method(dot, path, args),
-            Term::RootPath(path) => self.call_path_method(root, path, args),
+            Term::DotPath(path) => self.call_path_method(dot, path, args, runtime),
+            Term::RootPath(path) => self.call_path_method(root, path, args, runtime),
             Term::Variable { name, path } => {
                 let variable = lookup_variable(scopes, name).ok_or_else(|| {
                     TemplateError::Render(format!("variable `${name}` could not be resolved"))
                 })?;
-                self.call_path_method(&variable, path, args)
+                self.call_path_method(&variable, path, args, runtime)
             }
             Term::Identifier(name) => {
-                let methods = self.name_space.methods.read().unwrap();
-                if let Some(method) = methods.get(name) {
+                if let Some(method) = runtime.methods.get(name) {
                     return method(dot, args);
                 }
                 Err(TemplateError::Render(format!(
@@ -1581,28 +1619,37 @@ impl Template {
                 "parenthesized expressions are not callable".to_string(),
             )),
             Term::SubExprPath { expr, path } => {
-                let receiver = self.eval_expr(expr, root, dot, scopes)?;
-                self.call_path_method(&receiver, path, args)
+                let receiver = self.eval_expr(expr, root, dot, runtime, scopes)?;
+                self.call_path_method(&receiver, path, args, runtime)
             }
         }
     }
 
-    fn call_path_method(&self, base: &Value, path: &[String], args: &[Value]) -> Result<Value> {
+    fn call_path_method(
+        &self,
+        base: &Value,
+        path: &[String],
+        args: &[Value],
+        runtime: &RuntimeContext<'_>,
+    ) -> Result<Value> {
         if path.is_empty() {
             return Err(TemplateError::Render("path is not callable".to_string()));
         }
 
         let (method_name, receiver_path) = split_last_path(path);
-        let methods = self.name_space.methods.read().unwrap();
-        let missing_key_mode = *self.name_space.missing_key_mode.read().unwrap();
-        let receiver = lookup_path_with_methods(base, receiver_path, &methods, missing_key_mode)?;
-        let method = methods.get(method_name).ok_or_else(|| {
+        let receiver = lookup_path_with_methods(
+            base,
+            receiver_path,
+            &runtime.methods,
+            runtime.missing_key_mode,
+        )?;
+        let method = runtime.methods.get(method_name).ok_or_else(|| {
             TemplateError::Render(format!("method `{method_name}` is not registered"))
         })?;
         method(&receiver, args)
     }
 
-    fn eval_call_function(&self, args: &[Value]) -> Result<Value> {
+    fn eval_call_function(&self, args: &[Value], runtime: &RuntimeContext<'_>) -> Result<Value> {
         if args.is_empty() {
             return Err(TemplateError::Render(
                 "call expects at least one argument".to_string(),
@@ -1620,12 +1667,10 @@ impl Template {
             }
         };
 
-        let function = {
-            let funcs = self.name_space.funcs.read().unwrap();
-            funcs.get(&name).cloned().ok_or_else(|| {
+        let function =
+            runtime.funcs.get(&name).cloned().ok_or_else(|| {
                 TemplateError::Render(format!("function `{name}` is not registered"))
-            })?
-        };
+            })?;
         function(&args[1..])
     }
 }
