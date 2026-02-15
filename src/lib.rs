@@ -913,7 +913,7 @@ impl Template {
         for path in paths {
             let path = path.as_ref();
             let source = fs::read(path)?;
-            let source = std::str::from_utf8(&source).map_err(|error| {
+            let source = String::from_utf8(source).map_err(|error| {
                 TemplateError::Parse(format!(
                     "template `{}` is not valid UTF-8: {error}",
                     path.display()
@@ -927,7 +927,7 @@ impl Template {
                 })?
                 .to_string();
 
-            self.parse_named(&name, &source)?;
+            self.parse_named_owned(&name, source)?;
             if !self
                 .name_space
                 .templates
@@ -7360,12 +7360,12 @@ where
         let path = std::path::Path::new(&path);
         let name = template_name_from_path(path)?;
         let source = fs.read_file(path.to_string_lossy().as_ref())?;
-        let source = std::str::from_utf8(&source).map_err(|error| {
+        let source = String::from_utf8(source).map_err(|error| {
             TemplateError::Parse(format!(
                 "template file `{path:?}` is not valid UTF-8: {error}"
             ))
         })?;
-        template.parse_named(&name, source)?;
+        template.parse_named_owned(&name, source)?;
         if !template
             .name_space
             .templates
