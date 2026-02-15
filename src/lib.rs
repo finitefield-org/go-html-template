@@ -859,6 +859,14 @@ impl Template {
         Ok(self)
     }
 
+    pub fn parse_arc(mut self, text: Arc<str>) -> Result<Self> {
+        self.ensure_not_executed()?;
+        let root = self.name.clone();
+        self.parse_named_arc(&root, text)?;
+        self.finalize_contexts_after_parse()?;
+        Ok(self)
+    }
+
     #[allow(non_snake_case)]
     pub fn New(&self, name: impl Into<String>) -> Self {
         let mut clone = self.clone();
@@ -1328,6 +1336,19 @@ impl Template {
         Ok(())
     }
 
+    fn parse_named_arc(&mut self, name: &str, text: Arc<str>) -> Result<()> {
+        let left_delim = self.name_space.left_delim.read().unwrap().clone();
+        let right_delim = self.name_space.right_delim.read().unwrap().clone();
+        let (tree, root_parse_meta_hint) =
+            self.parse_tree_with_delims_and_meta_arc(text, &left_delim, &right_delim)?;
+        self.validate_function_calls(&tree.nodes)?;
+        self.clear_text_only_output_cache();
+        let mut templates = self.name_space.templates.write().unwrap();
+        self.merge_template_nodes(&mut templates, name, tree.nodes, root_parse_meta_hint);
+
+        Ok(())
+    }
+
     fn parse_tree_with_delims(
         &self,
         text: &str,
@@ -1509,6 +1530,121 @@ impl Template {
         }
 
         self.parse_tree_with_delims_and_meta(&text, left_delim, right_delim)
+    }
+
+    fn parse_tree_with_delims_and_meta_arc(
+        &self,
+        text: Arc<str>,
+        left_delim: &str,
+        right_delim: &str,
+    ) -> Result<(ParseTree, Option<TemplateParseMeta>)> {
+        let text_len = text.len();
+        let text_ref = text.as_ref();
+        if text_len == 0 {
+            return Ok((ParseTree { nodes: Vec::new() }, None));
+        }
+
+        let (has_left_delim, no_default_delim_scan) =
+            if left_delim == "{{" && right_delim == "}}" {
+                match scan_text_summary_if_no_default_delim(text_ref) {
+                    Some(scan) => (false, Some(scan)),
+                    None => (true, None),
+                }
+            } else {
+                (text_ref.contains(left_delim), None)
+            };
+        if !has_left_delim {
+            let scan = no_default_delim_scan.unwrap_or_else(|| scan_text_summary(text_ref));
+            if scan.has_lt && scan.has_eq {
+                validate_unquoted_attr_hazards(text_ref, scan.has_lt, scan.has_eq)?;
+            }
+
+            if !scan.has_comment_open {
+                let parse_meta = TemplateParseMeta::from_single_text_with_scan(text_ref, &scan);
+                return Ok((
+                    ParseTree {
+                        nodes: vec![Node::Text(TextNode::from_span(text, 0, text_len))],
+                    },
+                    Some(parse_meta),
+                ));
+            }
+
+            let preprocessed = strip_html_comments(text_ref);
+            let preprocessed_ref = preprocessed.as_ref();
+            if preprocessed_ref.is_empty() {
+                return Ok((ParseTree { nodes: Vec::new() }, None));
+            }
+            let preprocessed_scan = scan_text_summary(preprocessed_ref);
+            let parse_meta =
+                TemplateParseMeta::from_single_text_with_scan(preprocessed_ref, &preprocessed_scan);
+            let text_node = match preprocessed {
+                Cow::Borrowed(_) => Node::Text(TextNode::from_span(text, 0, text_len)),
+                Cow::Owned(preprocessed_owned) => {
+                    Node::Text(TextNode::from_owned_string(preprocessed_owned))
+                }
+            };
+            return Ok((
+                ParseTree {
+                    nodes: vec![text_node],
+                },
+                Some(parse_meta),
+            ));
+        }
+
+        let has_html_comment = text_ref.as_bytes().contains(&b'!') && text_ref.contains("<!--");
+        let preprocessed = if has_html_comment {
+            strip_html_comments(text_ref)
+        } else {
+            Cow::Borrowed(text_ref)
+        };
+        let preprocessed_ref = preprocessed.as_ref();
+        if preprocessed_ref.is_empty() {
+            return Ok((ParseTree { nodes: Vec::new() }, None));
+        }
+
+        if has_html_comment && !preprocessed_ref.contains(left_delim) {
+            let preprocessed_scan = scan_text_summary(preprocessed_ref);
+            if preprocessed_scan.has_lt && preprocessed_scan.has_eq {
+                validate_unquoted_attr_hazards(
+                    preprocessed_ref,
+                    preprocessed_scan.has_lt,
+                    preprocessed_scan.has_eq,
+                )?;
+            }
+            if !preprocessed_scan.has_comment_open {
+                let parse_meta = TemplateParseMeta::from_single_text_with_scan(
+                    preprocessed_ref,
+                    &preprocessed_scan,
+                );
+                let text_node = match preprocessed {
+                    Cow::Borrowed(_) => Node::Text(TextNode::from_span(text, 0, text_len)),
+                    Cow::Owned(preprocessed_owned) => {
+                        Node::Text(TextNode::from_owned_string(preprocessed_owned))
+                    }
+                };
+                return Ok((
+                    ParseTree {
+                        nodes: vec![text_node],
+                    },
+                    Some(parse_meta),
+                ));
+            }
+        }
+
+        let source: Arc<str> = match preprocessed {
+            Cow::Borrowed(_) => text,
+            Cow::Owned(preprocessed_owned) => Arc::from(preprocessed_owned),
+        };
+        let tokens = tokenize(source.as_ref(), left_delim, right_delim)?;
+        let mut index = 0;
+        let (nodes, stop) = parse_nodes(&source, &tokens, &mut index, &[])?;
+        if let Some(stop) = stop {
+            return Err(TemplateError::Parse(format!(
+                "unexpected control action `{}`",
+                stop.keyword
+            )));
+        }
+        Ok((ParseTree { nodes }, None))
     }
 
     fn merge_template_nodes(
@@ -20669,5 +20805,56 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
             Err(error) => error,
         };
         assert!(error.to_string().contains("non-text context"));
+    }
+
+    #[test]
+    fn parse_arc_renders_same_as_parse() {
+        let source = "<ul>{{.X}}</ul>";
+        let parsed = Template::new("same")
+            .parse(source)
+            .expect("parse should succeed")
+            .execute_to_string(&json!({"X": "ok"}))
+            .expect("execute should succeed");
+        let parsed_arc = Template::new("same")
+            .parse_arc(Arc::<str>::from(source))
+            .expect("parse_arc should succeed")
+            .execute_to_string(&json!({"X": "ok"}))
+            .expect("execute should succeed");
+
+        assert_eq!(parsed, parsed_arc);
+    }
+
+    #[test]
+    fn parse_arc_preserves_context_checks() {
+        let error = match Template::new("bad").parse_arc(Arc::<str>::from("<a href='")) {
+            Ok(_) => panic!("parse_arc should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-text context"));
+    }
+
+    #[test]
+    fn parse_arc_reuses_input_buffer_for_text_only_templates() {
+        let source = Arc::<str>::from("<ul><li>x</li></ul>");
+        let template = Template::new("arc")
+            .parse_arc(source.clone())
+            .expect("parse_arc should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get("arc")
+            .expect("root template should be registered");
+        let Some(Node::Text(text_node)) = nodes.first() else {
+            panic!("root template should start with text node");
+        };
+
+        match &text_node.raw.source {
+            SharedTextSource::Slice(stored) => {
+                assert!(Arc::ptr_eq(stored, &source));
+            }
+            SharedTextSource::Owned(_) => {
+                panic!("parse_arc should preserve Arc-backed source for text-only input");
+            }
+        }
     }
 }
