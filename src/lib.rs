@@ -851,6 +851,14 @@ impl Template {
         Ok(self)
     }
 
+    pub fn parse_owned(mut self, text: String) -> Result<Self> {
+        self.ensure_not_executed()?;
+        let root = self.name.clone();
+        self.parse_named_owned(&root, text)?;
+        self.finalize_contexts_after_parse()?;
+        Ok(self)
+    }
+
     #[allow(non_snake_case)]
     pub fn New(&self, name: impl Into<String>) -> Self {
         let mut clone = self.clone();
@@ -1307,6 +1315,19 @@ impl Template {
         Ok(())
     }
 
+    fn parse_named_owned(&mut self, name: &str, text: String) -> Result<()> {
+        let left_delim = self.name_space.left_delim.read().unwrap().clone();
+        let right_delim = self.name_space.right_delim.read().unwrap().clone();
+        let (tree, root_parse_meta_hint) =
+            self.parse_tree_with_delims_and_meta_owned(text, &left_delim, &right_delim)?;
+        self.validate_function_calls(&tree.nodes)?;
+        self.clear_text_only_output_cache();
+        let mut templates = self.name_space.templates.write().unwrap();
+        self.merge_template_nodes(&mut templates, name, tree.nodes, root_parse_meta_hint);
+
+        Ok(())
+    }
+
     fn parse_tree_with_delims(
         &self,
         text: &str,
@@ -1416,6 +1437,62 @@ impl Template {
             )));
         }
         Ok((ParseTree { nodes }, None))
+    }
+
+    fn parse_tree_with_delims_and_meta_owned(
+        &self,
+        text: String,
+        left_delim: &str,
+        right_delim: &str,
+    ) -> Result<(ParseTree, Option<TemplateParseMeta>)> {
+        if text.is_empty() {
+            return Ok((ParseTree { nodes: Vec::new() }, None));
+        }
+
+        let has_left_delim = text.contains(left_delim);
+        if !has_left_delim {
+            let scan = scan_text_summary(&text);
+            if scan.has_lt && scan.has_eq {
+                validate_unquoted_attr_hazards(&text, scan.has_lt, scan.has_eq)?;
+            }
+
+            if !scan.has_comment_open {
+                let parse_meta = TemplateParseMeta::from_single_text_with_scan(&text, &scan);
+                return Ok((
+                    ParseTree {
+                        nodes: vec![Node::Text(TextNode::from_owned_string(text))],
+                    },
+                    Some(parse_meta),
+                ));
+            }
+
+            let preprocessed = strip_html_comments(&text);
+            let preprocessed_ref = preprocessed.as_ref();
+            if preprocessed_ref.is_empty() {
+                return Ok((ParseTree { nodes: Vec::new() }, None));
+            }
+            let preprocessed_scan = scan_text_summary(preprocessed_ref);
+            let parse_meta =
+                TemplateParseMeta::from_single_text_with_scan(preprocessed_ref, &preprocessed_scan);
+            let text_node = match preprocessed {
+                Cow::Owned(preprocessed_owned) => {
+                    Node::Text(TextNode::from_owned_string(preprocessed_owned))
+                }
+                Cow::Borrowed(preprocessed_borrowed) => Node::Text(TextNode::from_span(
+                    Arc::from(preprocessed_borrowed),
+                    0,
+                    preprocessed_borrowed.len(),
+                )),
+            };
+            return Ok((
+                ParseTree {
+                    nodes: vec![text_node],
+                },
+                Some(parse_meta),
+            ));
+        }
+
+        self.parse_tree_with_delims_and_meta(&text, left_delim, right_delim)
     }
 
     fn merge_template_nodes(
@@ -2884,11 +2961,24 @@ impl TextNode {
             prepared: None,
         }
     }
+
+    fn from_owned_string(value: String) -> Self {
+        Self {
+            raw: SharedText::from(value),
+            prepared: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SharedTextSource {
+    Slice(Arc<str>),
+    Owned(Arc<String>),
 }
 
 #[derive(Clone, Debug)]
 struct SharedText {
-    source: Arc<str>,
+    source: SharedTextSource,
     start: usize,
     end: usize,
 }
@@ -2897,11 +2987,28 @@ impl SharedText {
     fn new(source: Arc<str>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end);
         debug_assert!(end <= source.len());
-        Self { source, start, end }
+        Self {
+            source: SharedTextSource::Slice(source),
+            start,
+            end,
+        }
+    }
+
+    fn from_owned(value: String) -> Self {
+        let source = Arc::new(value);
+        let end = source.len();
+        Self {
+            source: SharedTextSource::Owned(source),
+            start: 0,
+            end,
+        }
     }
 
     fn as_str(&self) -> &str {
-        &self.source[self.start..self.end]
+        match &self.source {
+            SharedTextSource::Slice(source) => &source[self.start..self.end],
+            SharedTextSource::Owned(source) => &source[self.start..self.end],
+        }
     }
 }
 
@@ -2915,9 +3022,7 @@ impl Deref for SharedText {
 
 impl From<String> for SharedText {
     fn from(value: String) -> Self {
-        let source: Arc<str> = Arc::from(value);
-        let end = source.len();
-        SharedText::new(source, 0, end)
+        SharedText::from_owned(value)
     }
 }
 
@@ -20477,5 +20582,31 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
 
         assert_eq!(first, source);
         assert_eq!(second, source);
+    }
+
+    #[test]
+    fn parse_owned_renders_same_as_parse() {
+        let source = "<ul>".to_string() + &"<li>x</li>".repeat(100) + "</ul>";
+        let parsed = Template::new("same")
+            .parse(&source)
+            .expect("parse should succeed")
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+        let parsed_owned = Template::new("same")
+            .parse_owned(source.clone())
+            .expect("parse_owned should succeed")
+            .execute_to_string(&json!({}))
+            .expect("execute should succeed");
+
+        assert_eq!(parsed, parsed_owned);
+    }
+
+    #[test]
+    fn parse_owned_preserves_context_checks() {
+        let error = match Template::new("bad").parse_owned("<a href='".to_string()) {
+            Ok(_) => panic!("parse_owned should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-text context"));
     }
 }
