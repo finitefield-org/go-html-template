@@ -2131,11 +2131,15 @@ impl Template {
     fn render_text_segment(&self, text: &str, output: &mut String, tracker: &mut ContextTracker) {
         let mode = tracker.mode();
         if matches!(mode, EscapeMode::ScriptExpr) {
-            let filtered = if let Some(scan_state) = tracker.js_scan_state {
-                filter_script_text_with_state(scan_state, text)
-            } else {
-                filter_script_text(&tracker.rendered, text)
-            };
+            let scan_state = tracker
+                .js_scan_state
+                .or_else(|| {
+                    current_unclosed_tag_content(&tracker.rendered, "script").map(current_js_scan_state)
+                })
+                .unwrap_or(JsScanState::Expr {
+                    js_ctx: JsContext::RegExp,
+                });
+            let filtered = filter_script_text_with_state(scan_state, text);
             output.push_str(&filtered);
             tracker.append_text(&filtered);
         } else if matches!(mode, EscapeMode::Html) {
@@ -2920,6 +2924,292 @@ struct ContextState {
     in_js_attribute: bool,
 }
 
+#[derive(Clone, Debug)]
+struct RenderedContextSnapshot {
+    state: ContextState,
+    url_part: Option<UrlPartContext>,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+    script_json: bool,
+}
+
+fn rendered_snapshot_from_open_tag_fragment(fragment: &str) -> RenderedContextSnapshot {
+    let tag_value_context = current_tag_value_context(fragment);
+
+    let (mode, in_css_attribute, css_attribute_quote, in_js_attribute, url_part, js_scan_state, css_scan_state) =
+        if let Some(context) = tag_value_context {
+            let kind = attr_kind(&context.attr_name);
+            match kind {
+                AttrKind::Js => {
+                    let mode = match script_attribute_mode(&context.value_prefix) {
+                        Some(EscapeMode::ScriptExpr)
+                            if context.quoted && !context.value_prefix.trim().is_empty() =>
+                        {
+                            EscapeMode::AttrQuoted {
+                                kind,
+                                quote: context.quote.unwrap_or('"'),
+                            }
+                        }
+                        Some(mode) => mode,
+                        None => EscapeMode::ScriptExpr,
+                    };
+                    let js_scan_state = if is_script_escape_mode(mode) {
+                        Some(current_js_scan_state(&context.value_prefix))
+                    } else {
+                        None
+                    };
+                    (mode, false, None, true, None, js_scan_state, None)
+                }
+                AttrKind::Css => {
+                    let mode = match style_attribute_mode(&context.value_prefix) {
+                        Some(EscapeMode::StyleExpr) | None => {
+                            if context.quoted {
+                                EscapeMode::AttrQuoted {
+                                    kind,
+                                    quote: context.quote.unwrap_or('"'),
+                                }
+                            } else {
+                                EscapeMode::AttrUnquoted { kind }
+                            }
+                        }
+                        Some(mode) => mode,
+                    };
+                    let css_scan_state = if is_style_escape_mode(mode) {
+                        Some(current_css_scan_state(&context.value_prefix))
+                    } else {
+                        None
+                    };
+                    (
+                        mode,
+                        true,
+                        context.quote,
+                        false,
+                        None,
+                        None,
+                        css_scan_state,
+                    )
+                }
+                AttrKind::Url | AttrKind::Normal | AttrKind::Srcset => {
+                    let mode = if context.quoted {
+                        EscapeMode::AttrQuoted {
+                            kind,
+                            quote: context.quote.unwrap_or('"'),
+                        }
+                    } else {
+                        EscapeMode::AttrUnquoted { kind }
+                    };
+                    let url_part = if matches!(kind, AttrKind::Url) {
+                        Some(if context.value_prefix.contains('#') {
+                            UrlPartContext::Fragment
+                        } else if context.value_prefix.contains('?') {
+                            UrlPartContext::Query
+                        } else {
+                            UrlPartContext::Path
+                        })
+                    } else {
+                        None
+                    };
+                    (mode, false, None, false, url_part, None, None)
+                }
+            }
+        } else if current_attr_name_context(fragment) {
+            (
+                EscapeMode::AttrName,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+        } else {
+            (
+                EscapeMode::Html,
+                false,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+        };
+
+    let in_open_tag = (matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(fragment))
+        || matches!(mode, EscapeMode::AttrName);
+    let state = ContextState {
+        mode,
+        in_open_tag,
+        in_css_attribute,
+        css_attribute_quote,
+        in_js_attribute,
+    };
+
+    RenderedContextSnapshot {
+        state,
+        url_part,
+        js_scan_state,
+        css_scan_state,
+        script_json: false,
+    }
+}
+
+fn rendered_snapshot_html_text() -> RenderedContextSnapshot {
+    RenderedContextSnapshot {
+        state: ContextState::html_text(),
+        url_part: None,
+        js_scan_state: None,
+        css_scan_state: None,
+        script_json: false,
+    }
+}
+
+fn analyze_rendered_context(rendered: &str) -> RenderedContextSnapshot {
+    let bytes = rendered.as_bytes();
+    let mut cursor = 0usize;
+
+    while cursor < bytes.len() {
+        let Some(offset) = bytes[cursor..].iter().position(|byte| *byte == b'<') else {
+            return rendered_snapshot_html_text();
+        };
+        let start = cursor + offset;
+
+        if start + 1 >= bytes.len() {
+            return rendered_snapshot_from_open_tag_fragment(&rendered[start..]);
+        }
+
+        let next = bytes[start + 1];
+        if next == b'!' {
+            if start + 4 <= bytes.len() && &bytes[start..start + 4] == b"<!--" {
+                if let Some(end_rel) = rendered[start + 4..].find("-->") {
+                    cursor = start + 4 + end_rel + 3;
+                    continue;
+                }
+                return rendered_snapshot_html_text();
+            }
+
+            let Some(tag_end) = html_tag_end(rendered, start) else {
+                return rendered_snapshot_from_open_tag_fragment(&rendered[start..]);
+            };
+            cursor = tag_end;
+            continue;
+        }
+
+        if next == b'?' {
+            let Some(tag_end) = html_tag_end(rendered, start) else {
+                return rendered_snapshot_from_open_tag_fragment(&rendered[start..]);
+            };
+            cursor = tag_end;
+            continue;
+        }
+
+        let close = next == b'/';
+        let name_start = if close { start + 2 } else { start + 1 };
+        if name_start >= bytes.len() || !bytes[name_start].is_ascii_alphabetic() {
+            cursor = start + 1;
+            continue;
+        }
+
+        let mut name_end = name_start + 1;
+        while name_end < bytes.len() && is_html_tag_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        let tag_name = &bytes[name_start..name_end];
+
+        let Some(tag_end) = html_tag_end(rendered, start) else {
+            return rendered_snapshot_from_open_tag_fragment(&rendered[start..]);
+        };
+
+        if close {
+            cursor = tag_end;
+            continue;
+        }
+
+        if tag_name.eq_ignore_ascii_case(b"script") {
+            let open_tag = &rendered[start..tag_end];
+            if !is_script_type_javascript(open_tag) {
+                cursor = tag_end;
+                continue;
+            }
+
+            let script_json = is_script_type_json(open_tag);
+            if let Some(close_start) = find_script_close_tag(rendered, tag_end) {
+                let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                cursor = close_end;
+                continue;
+            }
+
+            let content = &rendered[tag_end..];
+            let js_scan_state = current_js_scan_state(content);
+            let state = ContextState {
+                mode: js_scan_state_to_escape_mode(js_scan_state, script_json),
+                in_open_tag: false,
+                in_css_attribute: false,
+                css_attribute_quote: None,
+                in_js_attribute: false,
+            };
+            return RenderedContextSnapshot {
+                state,
+                url_part: None,
+                js_scan_state: Some(js_scan_state),
+                css_scan_state: None,
+                script_json,
+            };
+        }
+
+        if tag_name.eq_ignore_ascii_case(b"style") {
+            if let Some(close_start) = find_style_close_tag(rendered, tag_end) {
+                let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                cursor = close_end;
+                continue;
+            }
+
+            let content = &rendered[tag_end..];
+            let css_scan_state = current_css_scan_state(content);
+            let state = ContextState {
+                mode: css_scan_state_to_escape_mode(css_scan_state),
+                in_open_tag: false,
+                in_css_attribute: false,
+                css_attribute_quote: None,
+                in_js_attribute: false,
+            };
+            return RenderedContextSnapshot {
+                state,
+                url_part: None,
+                js_scan_state: None,
+                css_scan_state: Some(css_scan_state),
+                script_json: false,
+            };
+        }
+
+        if tag_name.eq_ignore_ascii_case(b"title") || tag_name.eq_ignore_ascii_case(b"textarea") {
+            if let Some(close_start) = find_close_tag(rendered, tag_end, tag_name) {
+                let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+                cursor = close_end;
+                continue;
+            }
+
+            let state = ContextState {
+                mode: EscapeMode::Rcdata,
+                in_open_tag: false,
+                in_css_attribute: false,
+                css_attribute_quote: None,
+                in_js_attribute: false,
+            };
+            return RenderedContextSnapshot {
+                state,
+                url_part: None,
+                js_scan_state: None,
+                css_scan_state: None,
+                script_json: false,
+            };
+        }
+
+        cursor = tag_end;
+    }
+
+    rendered_snapshot_html_text()
+}
+
 impl ContextState {
     fn html_text() -> Self {
         Self {
@@ -2931,27 +3221,9 @@ impl ContextState {
         }
     }
 
+    #[cfg(test)]
     fn from_rendered(rendered: &str) -> Self {
-        let tag_value_context = current_tag_value_context(rendered);
-        let mode = infer_escape_mode_with_tag_context(rendered, tag_value_context.as_ref());
-        let (in_css_attribute, css_attribute_quote, in_js_attribute) = match &tag_value_context {
-            Some(context) => match attr_kind(&context.attr_name) {
-                AttrKind::Css => (true, context.quote, false),
-                AttrKind::Js => (false, None, true),
-                _ => (false, None, false),
-            },
-            None => (false, None, false),
-        };
-        let in_open_tag = (matches!(mode, EscapeMode::Html)
-            && is_in_unclosed_tag_context(rendered))
-            || matches!(mode, EscapeMode::AttrName);
-        Self {
-            mode,
-            in_open_tag,
-            in_css_attribute,
-            css_attribute_quote,
-            in_js_attribute,
-        }
+        analyze_rendered_context(rendered).state
     }
 
     fn is_text_context(&self) -> bool {
@@ -3003,6 +3275,14 @@ impl ContextTracker {
 
     fn mode(&self) -> EscapeMode {
         self.state.mode
+    }
+
+    fn apply_rendered_context_snapshot(&mut self, snapshot: RenderedContextSnapshot) {
+        self.state = snapshot.state;
+        self.url_part = snapshot.url_part;
+        self.js_scan_state = snapshot.js_scan_state;
+        self.css_scan_state = snapshot.css_scan_state;
+        self.script_json = snapshot.script_json;
     }
 
     fn css_url_part_hint(&self) -> Option<Option<UrlPartContext>> {
@@ -3064,9 +3344,7 @@ impl ContextTracker {
         self.attr_value_from_dynamic_attr = false;
         if !suffix.is_empty() {
             self.rendered.push_str(suffix);
-            self.state = ContextState::from_rendered(suffix);
-            self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-            self.sync_incremental_scan_state_from_rendered(suffix);
+            self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
         }
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
@@ -3088,9 +3366,7 @@ impl ContextTracker {
         self.attr_value_from_dynamic_attr = false;
         if !suffix.is_empty() {
             self.rendered.push_str(suffix);
-            self.state = ContextState::from_rendered(suffix);
-            self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-            self.sync_incremental_scan_state_from_rendered(suffix);
+            self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
         }
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
@@ -3174,9 +3450,7 @@ impl ContextTracker {
     }
 
     fn refresh_cached_state_full(&mut self) {
-        self.state = ContextState::from_rendered(&self.rendered);
-        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &self.rendered);
-        self.sync_incremental_scan_state();
+        self.apply_rendered_context_snapshot(analyze_rendered_context(&self.rendered));
     }
 
     fn try_refresh_cached_state_incremental(&mut self, delta: &str) -> bool {
@@ -3228,9 +3502,7 @@ impl ContextTracker {
 
                     let suffix = &delta[close_end..];
                     if !suffix.is_empty() {
-                        self.state = ContextState::from_rendered(suffix);
-                        self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-                        self.sync_incremental_scan_state_from_rendered(suffix);
+                        self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
                     }
                     return true;
                 }
@@ -3267,9 +3539,7 @@ impl ContextTracker {
 
                     let suffix = &delta[close_end..];
                     if !suffix.is_empty() {
-                        self.state = ContextState::from_rendered(suffix);
-                        self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-                        self.sync_incremental_scan_state_from_rendered(suffix);
+                        self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
                     }
                     return true;
                 }
@@ -3314,9 +3584,7 @@ impl ContextTracker {
 
                 let suffix = &delta[close_end..];
                 if !suffix.is_empty() && !self.try_refresh_html_text_with_delta(suffix) {
-                    self.state = ContextState::from_rendered(suffix);
-                    self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-                    self.sync_incremental_scan_state_from_rendered(suffix);
+                    self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
                 }
                 return true;
             }
@@ -3343,9 +3611,7 @@ impl ContextTracker {
 
                 let suffix = &delta[close_end..];
                 if !suffix.is_empty() && !self.try_refresh_html_text_with_delta(suffix) {
-                    self.state = ContextState::from_rendered(suffix);
-                    self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
-                    self.sync_incremental_scan_state_from_rendered(suffix);
+                    self.apply_rendered_context_snapshot(analyze_rendered_context(suffix));
                 }
                 return true;
             }
@@ -3517,36 +3783,22 @@ impl ContextTracker {
     fn refresh_cached_state_seeded_delta(&mut self, delta: &str) {
         let mut rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
         rendered.push_str(delta);
-        self.state = ContextState::from_rendered(&rendered);
-        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &rendered);
-        self.sync_incremental_scan_state_from_rendered(&rendered);
+        self.apply_rendered_context_snapshot(analyze_rendered_context(&rendered));
     }
 
     fn refresh_cached_state_with_rendered_tail_delta_for_parse(&mut self, delta: &str) {
         let mut rendered = self.rendered.clone();
         rendered.push_str(delta);
-        self.state = ContextState::from_rendered(&rendered);
-        self.url_part = url_part_from_mode_and_rendered(self.state.mode, &rendered);
-        self.sync_incremental_scan_state_from_rendered(&rendered);
+        self.apply_rendered_context_snapshot(analyze_rendered_context(&rendered));
     }
 
     fn refresh_cached_state_from_fragment(&mut self, fragment: &str) {
-        self.state = ContextState::from_rendered(fragment);
-        self.url_part = url_part_from_mode_and_rendered(self.state.mode, fragment);
-        self.sync_incremental_scan_state_from_rendered(fragment);
+        self.apply_rendered_context_snapshot(analyze_rendered_context(fragment));
     }
 
     fn sync_incremental_scan_state(&mut self) {
         let (js_scan_state, css_scan_state, script_json) =
             incremental_scan_state_from_rendered(&self.state, &self.rendered);
-        self.js_scan_state = js_scan_state;
-        self.css_scan_state = css_scan_state;
-        self.script_json = script_json;
-    }
-
-    fn sync_incremental_scan_state_from_rendered(&mut self, rendered: &str) {
-        let (js_scan_state, css_scan_state, script_json) =
-            incremental_scan_state_from_rendered(&self.state, rendered);
         self.js_scan_state = js_scan_state;
         self.css_scan_state = css_scan_state;
         self.script_json = script_json;
@@ -8657,6 +8909,7 @@ fn escape_value_for_mode(
     }
 }
 
+#[cfg(test)]
 fn infer_escape_mode_with_tag_context(
     rendered: &str,
     tag_value_context: Option<&TagValueContext>,
@@ -9376,6 +9629,7 @@ fn style_attribute_mode(value_prefix: &str) -> Option<EscapeMode> {
     Some(current_css_mode(value_prefix))
 }
 
+#[cfg(test)]
 fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let script_tag = current_unclosed_script_tag(rendered)?;
     if !is_script_type_javascript(script_tag) {
@@ -9392,6 +9646,7 @@ fn script_escape_mode(rendered: &str) -> Option<EscapeMode> {
     Some(mode)
 }
 
+#[cfg(test)]
 fn style_escape_mode(rendered: &str) -> Option<EscapeMode> {
     let content = current_unclosed_tag_content(rendered, "style")?;
     Some(current_css_mode(content))
@@ -9443,12 +9698,12 @@ fn current_css_url_value_prefix(prefix: &str) -> Option<String> {
         state = match state {
             State::Expr => match bytes[i] {
                 b'\'' => {
-                    let is_url = ends_with_css_url_start(&prefix[..i]);
+                    let is_url = ends_with_css_url_start_bytes(bytes, i);
                     i += 1;
                     State::SingleQuote { is_url, start: i }
                 }
                 b'"' => {
-                    let is_url = ends_with_css_url_start(&prefix[..i]);
+                    let is_url = ends_with_css_url_start_bytes(bytes, i);
                     i += 1;
                     State::DoubleQuote { is_url, start: i }
                 }
@@ -9526,17 +9781,25 @@ fn current_css_url_value_prefix(prefix: &str) -> Option<String> {
     }
 }
 
-fn ends_with_css_url_start(prefix: &str) -> bool {
-    let trimmed = prefix.trim_end_matches(is_html_space_char);
-    let Some(before_paren) = trimmed.strip_suffix('(') else {
-        return false;
-    };
-    let before_paren = before_paren.trim_end_matches(is_html_space_char);
-    if before_paren.len() < 3 {
+fn ends_with_css_url_start_bytes(bytes: &[u8], end: usize) -> bool {
+    let mut end = end.min(bytes.len());
+    while end > 0 && is_css_space_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    if end == 0 || bytes[end - 1] != b'(' {
         return false;
     }
-    let start = before_paren.len() - 3;
-    if !before_paren[start..].eq_ignore_ascii_case("url") {
+
+    end -= 1;
+    while end > 0 && is_css_space_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    if end < 3 {
+        return false;
+    }
+
+    let start = end - 3;
+    if !bytes[start..end].eq_ignore_ascii_case(b"url") {
         return false;
     }
 
@@ -9544,7 +9807,7 @@ fn ends_with_css_url_start(prefix: &str) -> bool {
         return true;
     }
 
-    let prev = before_paren.as_bytes()[start - 1];
+    let prev = bytes[start - 1];
     !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-')
 }
 
@@ -9816,37 +10079,55 @@ fn is_utf8_line_separator(bytes: &[u8], index: usize) -> bool {
     is_utf8_line_separator_2028(bytes, index) || is_utf8_line_separator_2029(bytes, index)
 }
 
-fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanState {
+fn scan_js_state_until(
+    content: &str,
+    start: usize,
+    initial_state: JsScanState,
+    stop_on_script_close: bool,
+) -> (JsScanState, Option<usize>) {
     let bytes = content.as_bytes();
+    if start >= bytes.len() {
+        return (initial_state, None);
+    }
+
     let mut state = initial_state;
-    let mut segment_start = 0usize;
-    let mut i = 0usize;
+    let mut segment_start = start;
+    let mut i = start;
 
     while i < bytes.len() {
         state = match state {
             JsScanState::Expr { js_ctx } => {
+                if stop_on_script_close && is_html_close_tag(bytes, i, b"script") {
+                    return (
+                        JsScanState::Expr {
+                            js_ctx: next_js_ctx_bytes(&bytes[segment_start..i], js_ctx),
+                        },
+                        Some(i),
+                    );
+                }
+
                 let ch = bytes[i];
                 match ch {
                     b'\'' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::SingleQuote
                     }
                     b'"' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::DoubleQuote
                     }
                     b'`' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let _ = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         segment_start = i + 1;
                         i += 1;
                         JsScanState::TemplateLiteral
                     }
                     b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 2;
                         segment_start = i;
                         JsScanState::LineComment {
@@ -9856,13 +10137,13 @@ fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanSta
                         }
                     }
                     b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 2;
                         segment_start = i;
                         JsScanState::BlockComment { js_ctx }
                     }
                     b'<' if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 4;
                         segment_start = i;
                         JsScanState::LineComment {
@@ -9872,7 +10153,7 @@ fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanSta
                         }
                     }
                     b'-' if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
                         JsScanState::LineComment {
@@ -9882,7 +10163,7 @@ fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanSta
                         }
                     }
                     b'#' if i + 1 < bytes.len() && bytes[i + 1] == b'!' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 2;
                         segment_start = i;
                         JsScanState::LineComment {
@@ -9892,19 +10173,19 @@ fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanSta
                         }
                     }
                     _ if is_utf8_line_separator_2028(bytes, i) => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
                         JsScanState::Expr { js_ctx }
                     }
                     _ if is_utf8_line_separator_2029(bytes, i) => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         i += 3;
                         segment_start = i;
                         JsScanState::Expr { js_ctx }
                     }
                     b'/' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
+                        let js_ctx = next_js_ctx_bytes(&bytes[segment_start..i], js_ctx);
                         if js_ctx == JsContext::RegExp {
                             i += 1;
                             segment_start = i;
@@ -10308,14 +10589,19 @@ fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanSta
         };
     }
 
-    match state {
+    state = match state {
         JsScanState::Expr { js_ctx } => JsScanState::Expr {
-            js_ctx: next_js_ctx(&content[segment_start..], js_ctx),
+            js_ctx: next_js_ctx_bytes(&bytes[segment_start..], js_ctx),
         },
         _ => state,
-    }
+    };
+
+    (state, None)
 }
 
+fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanState {
+    scan_js_state_until(content, 0, initial_state, false).0
+}
 fn current_js_scan_state(content: &str) -> JsScanState {
     advance_js_scan_state(
         content,
@@ -10946,6 +11232,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
     output
 }
 
+#[cfg(test)]
 fn filter_script_text(prefix: &str, text: &str) -> String {
     filter_script_text_with_state(current_js_scan_state(prefix), text)
 }
@@ -11030,512 +11317,16 @@ fn find_close_tag(content: &str, start: usize, tag: &[u8]) -> Option<usize> {
 }
 
 fn find_script_close_tag(content: &str, start: usize) -> Option<usize> {
-    let bytes = content.as_bytes();
-    if start >= bytes.len() {
-        return None;
-    }
-
-    let mut state = JsScanState::Expr {
-        js_ctx: JsContext::RegExp,
-    };
-    let mut segment_start = start;
-    let mut i = start;
-
-    while i < bytes.len() {
-        state = match state {
-            JsScanState::Expr { js_ctx } => {
-                if is_html_close_tag(bytes, i, b"script") {
-                    return Some(i);
-                }
-
-                let ch = bytes[i];
-                match ch {
-                    b'\'' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
-                        segment_start = i + 1;
-                        i += 1;
-                        JsScanState::SingleQuote
-                    }
-                    b'"' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
-                        segment_start = i + 1;
-                        i += 1;
-                        JsScanState::DoubleQuote
-                    }
-                    b'`' => {
-                        let _ = next_js_ctx(&content[segment_start..i], js_ctx);
-                        segment_start = i + 1;
-                        i += 1;
-                        JsScanState::TemplateLiteral
-                    }
-                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        i += 2;
-                        segment_start = i;
-                        JsScanState::LineComment {
-                            js_ctx,
-                            preserve_body: true,
-                            keep_terminator: true,
-                        }
-                    }
-                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        i += 2;
-                        segment_start = i;
-                        JsScanState::BlockComment { js_ctx }
-                    }
-                    b'<' if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        i += 4;
-                        segment_start = i;
-                        JsScanState::LineComment {
-                            js_ctx,
-                            preserve_body: false,
-                            keep_terminator: true,
-                        }
-                    }
-                    b'-' if i + 3 <= bytes.len() && &bytes[i..i + 3] == b"-->" => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        i += 3;
-                        segment_start = i;
-                        JsScanState::LineComment {
-                            js_ctx,
-                            preserve_body: false,
-                            keep_terminator: true,
-                        }
-                    }
-                    b'#' if i + 1 < bytes.len() && bytes[i + 1] == b'!' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        i += 2;
-                        segment_start = i;
-                        JsScanState::LineComment {
-                            js_ctx,
-                            preserve_body: false,
-                            keep_terminator: true,
-                        }
-                    }
-                    b'/' => {
-                        let js_ctx = next_js_ctx(&content[segment_start..i], js_ctx);
-                        if js_ctx == JsContext::RegExp {
-                            i += 1;
-                            segment_start = i;
-                            JsScanState::RegExp {
-                                in_char_class: false,
-                                js_ctx,
-                            }
-                        } else {
-                            i += 1;
-                            segment_start = i;
-                            JsScanState::Expr { js_ctx }
-                        }
-                    }
-                    _ => {
-                        i += 1;
-                        JsScanState::Expr { js_ctx }
-                    }
-                }
-            }
-            JsScanState::SingleQuote => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::SingleQuote
-                } else if bytes[i] == b'\'' {
-                    i += 1;
-                    JsScanState::Expr {
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::SingleQuote
-                }
-            }
-            JsScanState::DoubleQuote => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::DoubleQuote
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    JsScanState::Expr {
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::DoubleQuote
-                }
-            }
-            JsScanState::RegExp {
-                mut in_char_class,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::RegExp {
-                        in_char_class,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'[' {
-                    in_char_class = true;
-                    i += 1;
-                    JsScanState::RegExp {
-                        in_char_class,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b']' {
-                    in_char_class = false;
-                    i += 1;
-                    JsScanState::RegExp {
-                        in_char_class,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'/' && !in_char_class {
-                    if is_script_tag_close_in_regexp(bytes, i) {
-                        i += 1;
-                        JsScanState::RegExp {
-                            in_char_class,
-                            js_ctx,
-                        }
-                    } else {
-                        i += 1;
-                        JsScanState::Expr { js_ctx }
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::RegExp {
-                        in_char_class,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateLiteral => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateLiteral
-                } else if bytes[i] == b'`' {
-                    i += 1;
-                    JsScanState::Expr {
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                    i += 2;
-                    JsScanState::TemplateExpr {
-                        brace_depth: 1,
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateLiteral
-                }
-            }
-            JsScanState::TemplateExpr {
-                mut brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'\'' {
-                    i += 1;
-                    JsScanState::TemplateExprSingleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    JsScanState::TemplateExprDoubleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'`' {
-                    i += 1;
-                    JsScanState::TemplateExprTemplateLiteral {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    i += 2;
-                    JsScanState::TemplateExprLineComment {
-                        brace_depth,
-                        js_ctx,
-                        preserve_body: true,
-                        keep_terminator: true,
-                    }
-                } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                    i += 2;
-                    JsScanState::TemplateExprBlockComment {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'{' {
-                    brace_depth += 1;
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'/' {
-                    if js_ctx == JsContext::RegExp {
-                        i += 1;
-                        JsScanState::TemplateExprRegExp {
-                            in_char_class: false,
-                            brace_depth,
-                            js_ctx,
-                        }
-                    } else {
-                        i += 1;
-                        JsScanState::TemplateExpr {
-                            brace_depth,
-                            js_ctx,
-                        }
-                    }
-                } else if bytes[i] == b'}' {
-                    if brace_depth > 0 {
-                        brace_depth -= 1;
-                    }
-                    i += 1;
-                    if brace_depth == 0 {
-                        JsScanState::TemplateLiteral
-                    } else {
-                        JsScanState::TemplateExpr {
-                            brace_depth,
-                            js_ctx,
-                        }
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateExprSingleQuote {
-                brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateExprSingleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'\'' {
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprSingleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateExprDoubleQuote {
-                brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateExprDoubleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprDoubleQuote {
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateExprRegExp {
-                mut in_char_class,
-                brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateExprRegExp {
-                        in_char_class,
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'[' {
-                    in_char_class = true;
-                    i += 1;
-                    JsScanState::TemplateExprRegExp {
-                        in_char_class,
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b']' {
-                    in_char_class = false;
-                    i += 1;
-                    JsScanState::TemplateExprRegExp {
-                        in_char_class,
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'/' && !in_char_class {
-                    if is_script_tag_close_in_regexp(bytes, i) {
-                        i += 1;
-                        JsScanState::TemplateExprRegExp {
-                            in_char_class,
-                            brace_depth,
-                            js_ctx,
-                        }
-                    } else {
-                        i += 1;
-                        JsScanState::TemplateExpr {
-                            brace_depth,
-                            js_ctx,
-                        }
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprRegExp {
-                        in_char_class,
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateExprTemplateLiteral {
-                brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    JsScanState::TemplateExprTemplateLiteral {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == b'`' {
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                    i += 2;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx: JsContext::DivOp,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprTemplateLiteral {
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::TemplateExprLineComment {
-                brace_depth,
-                js_ctx,
-                preserve_body: _,
-                keep_terminator: _,
-            } => {
-                if bytes[i] == b'\n' || bytes[i] == b'\r' {
-                    i += 1;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else if bytes[i] == 0xE2
-                    && i + 2 < bytes.len()
-                    && ((bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8)
-                        || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9))
-                {
-                    i += 3;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprLineComment {
-                        brace_depth,
-                        js_ctx,
-                        preserve_body: true,
-                        keep_terminator: true,
-                    }
-                }
-            }
-            JsScanState::TemplateExprBlockComment {
-                brace_depth,
-                js_ctx,
-            } => {
-                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    i += 2;
-                    JsScanState::TemplateExpr {
-                        brace_depth,
-                        js_ctx,
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::TemplateExprBlockComment {
-                        brace_depth,
-                        js_ctx,
-                    }
-                }
-            }
-            JsScanState::LineComment {
-                js_ctx,
-                preserve_body: _,
-                keep_terminator: _,
-            } => {
-                if bytes[i] == b'\n' || bytes[i] == b'\r' {
-                    i += 1;
-                    JsScanState::Expr { js_ctx }
-                } else if i + 2 < bytes.len() && bytes[i] == 0xE2 {
-                    let is_2028 = bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8;
-                    if is_2028 || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9) {
-                        i += 3;
-                        JsScanState::Expr { js_ctx }
-                    } else {
-                        i += 1;
-                        JsScanState::LineComment {
-                            js_ctx,
-                            preserve_body: true,
-                            keep_terminator: true,
-                        }
-                    }
-                } else {
-                    i += 1;
-                    JsScanState::LineComment {
-                        js_ctx,
-                        preserve_body: true,
-                        keep_terminator: true,
-                    }
-                }
-            }
-            JsScanState::BlockComment { js_ctx } => {
-                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    i += 2;
-                    JsScanState::Expr { js_ctx }
-                } else {
-                    i += 1;
-                    JsScanState::BlockComment { js_ctx }
-                }
-            }
-        };
-    }
-
-    None
+    scan_js_state_until(
+        content,
+        start,
+        JsScanState::Expr {
+            js_ctx: JsContext::RegExp,
+        },
+        true,
+    )
+    .1
 }
-
 fn find_style_close_tag(content: &str, start: usize) -> Option<usize> {
     find_style_close_tag_with_state(content, start, CssScanState::Expr)
 }
@@ -11545,105 +11336,8 @@ fn find_style_close_tag_with_state(
     start: usize,
     initial_state: CssScanState,
 ) -> Option<usize> {
-    let bytes = content.as_bytes();
-    if start >= bytes.len() {
-        return None;
-    }
-
-    let mut state = initial_state;
-    let mut i = start;
-
-    while i < bytes.len() {
-        state = match state {
-            CssScanState::Expr => {
-                if is_html_close_tag(bytes, i, b"style") {
-                    return Some(i);
-                }
-
-                match bytes[i] {
-                    b'"' => {
-                        i += 1;
-                        CssScanState::DoubleQuote {
-                            is_url: false,
-                            url_part: UrlPartContext::Path,
-                        }
-                    }
-                    b'\'' => {
-                        i += 1;
-                        CssScanState::SingleQuote {
-                            is_url: false,
-                            url_part: UrlPartContext::Path,
-                        }
-                    }
-                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                        i += 2;
-                        CssScanState::LineComment
-                    }
-                    b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                        i += 2;
-                        CssScanState::BlockComment
-                    }
-                    _ => {
-                        i += 1;
-                        CssScanState::Expr
-                    }
-                }
-            }
-            CssScanState::SingleQuote { is_url, url_part } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    CssScanState::SingleQuote { is_url, url_part }
-                } else if bytes[i] == b'\'' {
-                    i += 1;
-                    CssScanState::Expr
-                } else {
-                    i += 1;
-                    CssScanState::SingleQuote { is_url, url_part }
-                }
-            }
-            CssScanState::DoubleQuote { is_url, url_part } => {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                    CssScanState::DoubleQuote { is_url, url_part }
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    CssScanState::Expr
-                } else {
-                    i += 1;
-                    CssScanState::DoubleQuote { is_url, url_part }
-                }
-            }
-            CssScanState::LineComment => {
-                if bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\x0c' {
-                    i += 1;
-                    CssScanState::Expr
-                } else if bytes[i] == 0xE2
-                    && i + 2 < bytes.len()
-                    && ((bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8)
-                        || (bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA9))
-                {
-                    i += 3;
-                    CssScanState::Expr
-                } else {
-                    i += 1;
-                    CssScanState::LineComment
-                }
-            }
-            CssScanState::BlockComment => {
-                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    i += 2;
-                    CssScanState::Expr
-                } else {
-                    i += 1;
-                    CssScanState::BlockComment
-                }
-            }
-        };
-    }
-
-    None
+    scan_css_state_until(content, start, initial_state, true).1
 }
-
 fn is_html_close_tag(bytes: &[u8], i: usize, tag: &[u8]) -> bool {
     if i + 2 + tag.len() > bytes.len() {
         return false;
@@ -11677,23 +11371,6 @@ fn is_script_tag_close_in_regexp(bytes: &[u8], i: usize) -> bool {
         .iter()
         .zip(tag.iter())
         .all(|(lhs, rhs)| lhs.to_ascii_lowercase() == rhs.to_ascii_lowercase())
-}
-
-fn ensure_filtered_prefix<'a>(
-    filtered_prefix: &'a mut Option<String>,
-    prefix: &str,
-    output_so_far: &str,
-    remaining_len: usize,
-) -> &'a mut String {
-    if filtered_prefix.is_none() {
-        let mut value = String::with_capacity(prefix.len() + output_so_far.len() + remaining_len);
-        value.push_str(prefix);
-        value.push_str(output_so_far);
-        *filtered_prefix = Some(value);
-    }
-    filtered_prefix
-        .as_mut()
-        .expect("filtered prefix must exist")
 }
 
 fn contains_open_script_or_style_tag(text: &str) -> bool {
@@ -11898,8 +11575,16 @@ fn precompute_text_chunks_for_script_style(
 
 fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     let mut output = String::new();
+    let mut script_scan_state = None;
     let mut section = if let Some(script_tag) = current_unclosed_script_tag(prefix) {
         if is_script_type_javascript(script_tag) {
+            script_scan_state = Some(
+                current_unclosed_tag_content(prefix, "script")
+                    .map(current_js_scan_state)
+                    .unwrap_or(JsScanState::Expr {
+                        js_ctx: JsContext::RegExp,
+                    }),
+            );
             HtmlSection::Script
         } else {
             HtmlSection::Html
@@ -11921,13 +11606,6 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     }
 
     let mut cursor = 0usize;
-    let mut filtered_prefix = if matches!(section, HtmlSection::Script) {
-        let mut value = String::with_capacity(prefix.len() + text.len());
-        value.push_str(prefix);
-        Some(value)
-    } else {
-        None
-    };
 
     while cursor < text.len() {
         match section {
@@ -11945,6 +11623,9 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                     if let Some(end) = html_tag_end(text, next) {
                         if let Some(script_tag) = text.get(next..end) {
                             if is_script_type_javascript(script_tag) {
+                                script_scan_state = Some(JsScanState::Expr {
+                                    js_ctx: JsContext::RegExp,
+                                });
                                 HtmlSection::Script
                             } else {
                                 HtmlSection::Html
@@ -11974,26 +11655,19 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
 
                 let segment = &text[cursor..tag_end];
                 output.push_str(segment);
-                if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                    filtered_prefix.push_str(segment);
-                }
                 cursor = tag_end;
                 section = target;
             }
             HtmlSection::Script => {
+                let scan_state = script_scan_state.unwrap_or(JsScanState::Expr {
+                    js_ctx: JsContext::RegExp,
+                });
                 let close = find_close_tag(text, cursor, b"script");
                 if let Some(close_start) = close {
                     let segment = &text[cursor..close_start];
                     if !segment.is_empty() {
-                        let filtered_prefix = ensure_filtered_prefix(
-                            &mut filtered_prefix,
-                            prefix,
-                            &output,
-                            text.len().saturating_sub(cursor),
-                        );
-                        let filtered = filter_script_text(filtered_prefix, segment);
+                        let filtered = filter_script_text_with_state(scan_state, segment);
                         output.push_str(&filtered);
-                        filtered_prefix.push_str(&filtered);
                     }
                     let close_end = match html_tag_end(text, close_start) {
                         Some(end) => end,
@@ -12004,22 +11678,13 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                     };
                     let close_tag = &text[close_start..close_end];
                     output.push_str(close_tag);
-                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                        filtered_prefix.push_str(close_tag);
-                    }
                     cursor = close_end;
                     section = HtmlSection::Html;
+                    script_scan_state = None;
                 } else {
                     let segment = &text[cursor..];
-                    let filtered_prefix = ensure_filtered_prefix(
-                        &mut filtered_prefix,
-                        prefix,
-                        &output,
-                        text.len().saturating_sub(cursor),
-                    );
-                    let filtered = filter_script_text(filtered_prefix, segment);
+                    let filtered = filter_script_text_with_state(scan_state, segment);
                     output.push_str(&filtered);
-                    filtered_prefix.push_str(&filtered);
                     break;
                 }
             }
@@ -12028,31 +11693,20 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                 if let Some(close_start) = close {
                     let segment = &text[cursor..close_start];
                     output.push_str(segment);
-                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                        filtered_prefix.push_str(segment);
-                    }
                     let close_end = match html_tag_end(text, close_start) {
                         Some(end) => end,
                         None => {
-                            if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                                filtered_prefix.push_str(&text[close_start..]);
-                            }
+                            output.push_str(&text[close_start..]);
                             break;
                         }
                     };
                     let close_tag = &text[close_start..close_end];
                     output.push_str(close_tag);
-                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                        filtered_prefix.push_str(close_tag);
-                    }
                     cursor = close_end;
                     section = HtmlSection::Html;
                 } else {
                     let tail = &text[cursor..];
                     output.push_str(tail);
-                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
-                        filtered_prefix.push_str(tail);
-                    }
                     break;
                 }
             }
@@ -12062,13 +11716,13 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     output
 }
 
-fn next_js_ctx(prefix: &str, preceding: JsContext) -> JsContext {
-    let prefix = prefix.trim_end_matches(js_whitespace);
-    if prefix.is_empty() {
+fn next_js_ctx_bytes(prefix: &[u8], preceding: JsContext) -> JsContext {
+    let end = trim_js_trailing_whitespace(prefix);
+    if end == 0 {
         return preceding;
     }
 
-    let bytes = prefix.as_bytes();
+    let bytes = &prefix[..end];
     let n = bytes.len();
     let c = bytes[n - 1];
     match c {
@@ -12098,7 +11752,7 @@ fn next_js_ctx(prefix: &str, preceding: JsContext) -> JsContext {
             while j > 0 && is_js_ident_part_byte(bytes[j - 1]) {
                 j -= 1;
             }
-            if is_js_ident_keyword(&prefix[j..]) {
+            if is_js_ident_keyword_bytes(&bytes[j..]) {
                 JsContext::RegExp
             } else {
                 JsContext::DivOp
@@ -12107,59 +11761,67 @@ fn next_js_ctx(prefix: &str, preceding: JsContext) -> JsContext {
     }
 }
 
+#[cfg(test)]
+fn next_js_ctx(prefix: &str, preceding: JsContext) -> JsContext {
+    next_js_ctx_bytes(prefix.as_bytes(), preceding)
+}
+
 fn is_js_ident_part_byte(byte: u8) -> bool {
     matches!(byte, b'$' | b'_' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
 }
 
-fn is_js_ident_keyword(keyword: &str) -> bool {
-    matches!(
-        keyword,
-        "break"
-            | "case"
-            | "continue"
-            | "delete"
-            | "do"
-            | "else"
-            | "finally"
-            | "in"
-            | "instanceof"
-            | "return"
-            | "throw"
-            | "try"
-            | "typeof"
-            | "void"
-    )
+fn is_js_ident_keyword_bytes(keyword: &[u8]) -> bool {
+    match keyword.len() {
+        2 => keyword == b"do" || keyword == b"in",
+        3 => keyword == b"try",
+        4 => keyword == b"case" || keyword == b"else" || keyword == b"void",
+        5 => keyword == b"break" || keyword == b"throw",
+        6 => keyword == b"delete" || keyword == b"return" || keyword == b"typeof",
+        7 => keyword == b"finally",
+        8 => keyword == b"continue",
+        10 => keyword == b"instanceof",
+        _ => false,
+    }
 }
 
-fn js_whitespace(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{000C}'
-            | '\u{000A}'
-            | '\u{000D}'
-            | '\u{0009}'
-            | '\u{000B}'
-            | '\u{0020}'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'
-            | '\u{2001}'
-            | '\u{2002}'
-            | '\u{2003}'
-            | '\u{2004}'
-            | '\u{2005}'
-            | '\u{2006}'
-            | '\u{2007}'
-            | '\u{2008}'
-            | '\u{2009}'
-            | '\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
+fn trim_js_trailing_whitespace(bytes: &[u8]) -> usize {
+    let mut end = bytes.len();
+    while end > 0 {
+        let byte = bytes[end - 1];
+        if matches!(byte, b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C' | b' ') {
+            end -= 1;
+            continue;
+        }
+
+        if end >= 2 && bytes[end - 2] == 0xC2 && byte == 0xA0 {
+            // U+00A0
+            end -= 2;
+            continue;
+        }
+
+        if end >= 3 {
+            let a = bytes[end - 3];
+            let b = bytes[end - 2];
+            let c = bytes[end - 1];
+
+            let is_js_unicode_space = (a == 0xE1 && b == 0x9A && c == 0x80) // U+1680
+                || (a == 0xE2 && b == 0x80 && (0x80..=0x8A).contains(&c)) // U+2000..U+200A
+                || (a == 0xE2 && b == 0x80 && c == 0xA8) // U+2028
+                || (a == 0xE2 && b == 0x80 && c == 0xA9) // U+2029
+                || (a == 0xE2 && b == 0x80 && c == 0xAF) // U+202F
+                || (a == 0xE2 && b == 0x81 && c == 0x9F) // U+205F
+                || (a == 0xE3 && b == 0x80 && c == 0x80) // U+3000
+                || (a == 0xEF && b == 0xBB && c == 0xBF); // U+FEFF
+
+            if is_js_unicode_space {
+                end -= 3;
+                continue;
+            }
+        }
+
+        break;
+    }
+    end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -12185,6 +11847,10 @@ fn current_css_mode(content: &str) -> EscapeMode {
         CssScanState::LineComment => EscapeMode::StyleLineComment,
         CssScanState::BlockComment => EscapeMode::StyleBlockComment,
     }
+}
+
+fn is_html_space_char(ch: char) -> bool {
+    matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' ')
 }
 
 #[cfg(test)]
@@ -12234,10 +11900,6 @@ fn is_css_nmchar(codepoint: u32) -> bool {
         return false;
     }
     true
-}
-
-fn is_html_space_char(ch: char) -> bool {
-    matches!(ch, '\t' | '\n' | '\x0c' | '\r' | ' ')
 }
 
 fn is_css_space_byte(byte: u8) -> bool {
@@ -12443,18 +12105,30 @@ fn update_url_part_with_byte(url_part: &mut UrlPartContext, byte: u8) {
     }
 }
 
-fn advance_css_scan_state(content: &str, initial_state: CssScanState) -> CssScanState {
+fn scan_css_state_until(
+    content: &str,
+    start: usize,
+    initial_state: CssScanState,
+    stop_on_style_close: bool,
+) -> (CssScanState, Option<usize>) {
     let bytes = content.as_bytes();
+    if start >= bytes.len() {
+        return (initial_state, None);
+    }
+
     let mut state = initial_state;
-    let mut i = 0usize;
+    let mut i = start;
 
     while i < bytes.len() {
         state = match state {
             CssScanState::Expr => {
-                let ch = bytes[i];
-                match ch {
+                if stop_on_style_close && is_html_close_tag(bytes, i, b"style") {
+                    return (CssScanState::Expr, Some(i));
+                }
+
+                match bytes[i] {
                     b'"' => {
-                        let is_url = ends_with_css_url_start(&content[..i]);
+                        let is_url = ends_with_css_url_start_bytes(bytes, i);
                         i += 1;
                         CssScanState::DoubleQuote {
                             is_url,
@@ -12462,7 +12136,7 @@ fn advance_css_scan_state(content: &str, initial_state: CssScanState) -> CssScan
                         }
                     }
                     b'\'' => {
-                        let is_url = ends_with_css_url_start(&content[..i]);
+                        let is_url = ends_with_css_url_start_bytes(bytes, i);
                         i += 1;
                         CssScanState::SingleQuote {
                             is_url,
@@ -12553,7 +12227,11 @@ fn advance_css_scan_state(content: &str, initial_state: CssScanState) -> CssScan
         };
     }
 
-    state
+    (state, None)
+}
+
+fn advance_css_scan_state(content: &str, initial_state: CssScanState) -> CssScanState {
+    scan_css_state_until(content, 0, initial_state, false).0
 }
 
 fn current_css_scan_state(content: &str) -> CssScanState {
