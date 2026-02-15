@@ -1099,28 +1099,13 @@ impl Template {
     ) -> Result<RenderFlow> {
         for node in nodes {
             match node {
-                Node::Text(text) => {
-                    let mode = tracker.mode();
-                    if matches!(mode, EscapeMode::ScriptExpr) {
-                        let filtered = if let Some(scan_state) = tracker.js_scan_state {
-                            filter_script_text_with_state(scan_state, text)
-                        } else {
-                            filter_script_text(&tracker.rendered, text)
-                        };
-                        output.push_str(&filtered);
-                        tracker.append_text(&filtered);
-                    } else if matches!(mode, EscapeMode::Html) {
-                        if text.as_bytes().contains(&b'<') {
-                            let filtered = filter_html_text_sections(&tracker.rendered, text);
-                            output.push_str(&filtered);
-                            tracker.append_text(&filtered);
-                        } else {
-                            output.push_str(text);
-                            tracker.append_text(text);
-                        }
+                Node::Text(text_node) => {
+                    if let Some(prepared) = text_node.prepared.as_ref()
+                        && tracker.state == prepared.start_state
+                    {
+                        self.render_prepared_text_chunks(prepared, output, tracker);
                     } else {
-                        output.push_str(text);
-                        tracker.append_text(text);
+                        self.render_text_segment(&text_node.raw, output, tracker);
                     }
                 }
                 Node::Expr { expr, mode } => {
@@ -1570,6 +1555,73 @@ impl Template {
         }
 
         Ok(RenderFlow::Normal)
+    }
+
+    fn render_text_segment(&self, text: &str, output: &mut String, tracker: &mut ContextTracker) {
+        let mode = tracker.mode();
+        if matches!(mode, EscapeMode::ScriptExpr) {
+            let filtered = if let Some(scan_state) = tracker.js_scan_state {
+                filter_script_text_with_state(scan_state, text)
+            } else {
+                filter_script_text(&tracker.rendered, text)
+            };
+            output.push_str(&filtered);
+            tracker.append_text(&filtered);
+        } else if matches!(mode, EscapeMode::Html) {
+            if text.as_bytes().contains(&b'<') {
+                let filtered = filter_html_text_sections(&tracker.rendered, text);
+                output.push_str(&filtered);
+                tracker.append_text(&filtered);
+            } else {
+                output.push_str(text);
+                tracker.append_text(text);
+            }
+        } else {
+            output.push_str(text);
+            tracker.append_text(text);
+        }
+    }
+
+    fn render_prepared_text_chunks(
+        &self,
+        prepared: &PreparedTextPlan,
+        output: &mut String,
+        tracker: &mut ContextTracker,
+    ) {
+        let mut index = 0usize;
+        while index < prepared.chunks.len() {
+            match &prepared.chunks[index] {
+                PreparedTextChunk::Emit(text) => {
+                    output.push_str(text);
+                    tracker.append_text(text);
+                    index += 1;
+                }
+                PreparedTextChunk::ScriptCloseTag(tag) => {
+                    if let Some(PreparedTextChunk::Emit(suffix)) = prepared.chunks.get(index + 1) {
+                        output.push_str(tag);
+                        output.push_str(suffix);
+                        tracker.append_known_script_close_tag_with_suffix(tag, suffix);
+                        index += 2;
+                    } else {
+                        output.push_str(tag);
+                        tracker.append_known_script_close_tag(tag);
+                        index += 1;
+                    }
+                }
+                PreparedTextChunk::StyleCloseTag(tag) => {
+                    if let Some(PreparedTextChunk::Emit(suffix)) = prepared.chunks.get(index + 1) {
+                        output.push_str(tag);
+                        output.push_str(suffix);
+                        tracker.append_known_style_close_tag_with_suffix(tag, suffix);
+                        index += 2;
+                    } else {
+                        output.push_str(tag);
+                        tracker.append_known_style_close_tag(tag);
+                        index += 1;
+                    }
+                }
+            }
+        }
     }
 
     fn eval_expr(
@@ -2047,7 +2099,7 @@ pub fn IsTrue(value: &Value) -> (bool, bool) {
 
 #[derive(Clone, Debug)]
 enum Node {
-    Text(String),
+    Text(TextNode),
     Expr {
         expr: Expr,
         mode: EscapeMode,
@@ -2089,6 +2141,41 @@ enum Node {
     },
     Break,
     Continue,
+}
+
+#[derive(Clone, Debug)]
+struct TextNode {
+    raw: String,
+    prepared: Option<PreparedTextPlan>,
+}
+
+impl TextNode {
+    fn new(raw: String) -> Self {
+        Self {
+            raw,
+            prepared: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTextPlan {
+    start_state: ContextState,
+    chunks: Vec<PreparedTextChunk>,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedTextChunk {
+    Emit(String),
+    ScriptCloseTag(String),
+    StyleCloseTag(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedSection {
+    Html,
+    Script { scan_state: JsScanState },
+    Style { scan_state: CssScanState },
 }
 
 #[derive(Clone, Debug)]
@@ -2235,6 +2322,50 @@ impl ContextTracker {
     fn append_text(&mut self, text: &str) {
         self.rendered.push_str(text);
         self.refresh_cached_state_with_delta(text);
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
+        }
+    }
+
+    fn append_known_script_close_tag(&mut self, close_tag: &str) {
+        self.append_known_script_close_tag_with_suffix(close_tag, "");
+    }
+
+    fn append_known_script_close_tag_with_suffix(&mut self, close_tag: &str, suffix: &str) {
+        self.rendered.push_str(close_tag);
+        self.state = ContextState::html_text();
+        self.url_part = None;
+        self.js_scan_state = None;
+        self.css_scan_state = None;
+        self.script_json = false;
+        if !suffix.is_empty() {
+            self.rendered.push_str(suffix);
+            self.state = ContextState::from_rendered(suffix);
+            self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
+            self.sync_incremental_scan_state_from_rendered(suffix);
+        }
+        if should_normalize_tracker_state(&self.state) {
+            self.normalize_from_cached_state();
+        }
+    }
+
+    fn append_known_style_close_tag(&mut self, close_tag: &str) {
+        self.append_known_style_close_tag_with_suffix(close_tag, "");
+    }
+
+    fn append_known_style_close_tag_with_suffix(&mut self, close_tag: &str, suffix: &str) {
+        self.rendered.push_str(close_tag);
+        self.state = ContextState::html_text();
+        self.url_part = None;
+        self.js_scan_state = None;
+        self.css_scan_state = None;
+        self.script_json = false;
+        if !suffix.is_empty() {
+            self.rendered.push_str(suffix);
+            self.state = ContextState::from_rendered(suffix);
+            self.url_part = url_part_from_mode_and_rendered(self.state.mode, suffix);
+            self.sync_incremental_scan_state_from_rendered(suffix);
+        }
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
@@ -2715,8 +2846,8 @@ impl<'a> ParseContextAnalyzer<'a> {
         let mut flows = vec![AnalysisFlow::normal(start_tracker)];
 
         for node in nodes {
-            if let Node::Text(text) = node {
-                if text_starts_with_js_slash(text) && has_slash_ambiguity(flows.iter()) {
+            if let Node::Text(text_node) = node {
+                if text_starts_with_js_slash(&text_node.raw) && has_slash_ambiguity(flows.iter()) {
                     return Err(TemplateError::Parse(
                         "'/' could start a division or regexp".to_string(),
                     ));
@@ -2766,8 +2897,15 @@ impl<'a> ParseContextAnalyzer<'a> {
         in_range: bool,
     ) -> Result<Vec<AnalysisFlow>> {
         match node {
-            Node::Text(text) => {
-                tracker.append_text(text);
+            Node::Text(text_node) => {
+                if text_node.prepared.is_none() {
+                    text_node.prepared = prepare_text_plan_for_script_style(
+                        &tracker.state,
+                        &tracker,
+                        &text_node.raw,
+                    );
+                }
+                tracker.append_text(&text_node.raw);
                 Ok(vec![AnalysisFlow::normal(tracker)])
             }
             Node::Expr { expr: _, mode, .. } => {
@@ -3098,7 +3236,7 @@ fn placeholder_advances_parse_context(tracker: &ContextTracker, mode: EscapeMode
 
 fn is_empty_template_body(nodes: &[Node]) -> bool {
     nodes.iter().all(|node| match node {
-        Node::Text(text) => text.trim().is_empty(),
+        Node::Text(text_node) => text_node.raw.trim().is_empty(),
         _ => false,
     })
 }
@@ -4432,7 +4570,7 @@ fn range_static_text_body(body: &[Node]) -> Option<String> {
     let mut combined = String::new();
     for node in body {
         match node {
-            Node::Text(text) => combined.push_str(text),
+            Node::Text(text_node) => combined.push_str(&text_node.raw),
             _ => return None,
         }
     }
@@ -4880,7 +5018,7 @@ fn parse_nodes(
     while *index < tokens.len() {
         match &tokens[*index] {
             Token::Text(text) => {
-                nodes.push(Node::Text(text.clone()));
+                nodes.push(Node::Text(TextNode::new(text.clone())));
                 *index += 1;
             }
             Token::Action(raw_action) => {
@@ -9398,6 +9536,183 @@ fn ensure_filtered_prefix<'a>(
         .expect("filtered prefix must exist")
 }
 
+fn prepare_text_plan_for_script_style(
+    start_state: &ContextState,
+    tracker: &ContextTracker,
+    text: &str,
+) -> Option<PreparedTextPlan> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let has_script_style_marker = contains_ascii_case_insensitive(text, b"<script")
+        || contains_ascii_case_insensitive(text, b"</script")
+        || contains_ascii_case_insensitive(text, b"<style")
+        || contains_ascii_case_insensitive(text, b"</style");
+
+    if !start_state.is_script_tag_context()
+        && !start_state.is_style_tag_context()
+        && !has_script_style_marker
+    {
+        return None;
+    }
+
+    let start_section = if start_state.is_script_tag_context() {
+        PreparedSection::Script {
+            scan_state: tracker.js_scan_state?,
+        }
+    } else if start_state.is_style_tag_context() {
+        PreparedSection::Style {
+            scan_state: tracker.css_scan_state?,
+        }
+    } else {
+        PreparedSection::Html
+    };
+
+    let chunks = precompute_text_chunks_for_script_style(text, start_section)?;
+    Some(PreparedTextPlan {
+        start_state: start_state.clone(),
+        chunks,
+    })
+}
+
+fn push_prepared_emit(chunks: &mut Vec<PreparedTextChunk>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(PreparedTextChunk::Emit(existing)) = chunks.last_mut() {
+        existing.push_str(text);
+    } else {
+        chunks.push(PreparedTextChunk::Emit(text.to_string()));
+    }
+}
+
+fn push_prepared_emit_owned(chunks: &mut Vec<PreparedTextChunk>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(PreparedTextChunk::Emit(existing)) = chunks.last_mut() {
+        existing.push_str(&text);
+    } else {
+        chunks.push(PreparedTextChunk::Emit(text));
+    }
+}
+
+fn precompute_text_chunks_for_script_style(
+    text: &str,
+    start_section: PreparedSection,
+) -> Option<Vec<PreparedTextChunk>> {
+    let mut chunks = Vec::new();
+    let mut section = start_section;
+    let mut cursor = 0usize;
+
+    while cursor < text.len() {
+        match section {
+            PreparedSection::Html => {
+                let next_script = find_open_tag(text, cursor, b"script");
+                let next_style = find_open_tag(text, cursor, b"style");
+                let (next, target) = match (next_script, next_style) {
+                    (Some(a), Some(b)) if a <= b => (
+                        a,
+                        PreparedSection::Script {
+                            scan_state: JsScanState::Expr {
+                                js_ctx: JsContext::RegExp,
+                            },
+                        },
+                    ),
+                    (Some(_), Some(b)) => (
+                        b,
+                        PreparedSection::Style {
+                            scan_state: CssScanState::Expr,
+                        },
+                    ),
+                    (Some(a), None) => (
+                        a,
+                        PreparedSection::Script {
+                            scan_state: JsScanState::Expr {
+                                js_ctx: JsContext::RegExp,
+                            },
+                        },
+                    ),
+                    (None, Some(b)) => (
+                        b,
+                        PreparedSection::Style {
+                            scan_state: CssScanState::Expr,
+                        },
+                    ),
+                    (None, None) => (usize::MAX, PreparedSection::Html),
+                };
+
+                if next == usize::MAX {
+                    push_prepared_emit(&mut chunks, &text[cursor..]);
+                    break;
+                }
+
+                let tag_end = html_tag_end(text, next)?;
+                let segment = &text[cursor..tag_end];
+                push_prepared_emit(&mut chunks, segment);
+
+                section = match target {
+                    PreparedSection::Script { scan_state } => {
+                        let script_tag = text.get(next..tag_end)?;
+                        if is_script_type_javascript(script_tag) {
+                            PreparedSection::Script { scan_state }
+                        } else {
+                            PreparedSection::Html
+                        }
+                    }
+                    PreparedSection::Style { scan_state } => PreparedSection::Style { scan_state },
+                    PreparedSection::Html => PreparedSection::Html,
+                };
+                cursor = tag_end;
+            }
+            PreparedSection::Script { scan_state } => {
+                if matches!(scan_state, JsScanState::Expr { .. })
+                    && let Some(close_start) = find_close_tag(text, cursor, b"script")
+                {
+                    let script_segment = &text[cursor..close_start];
+                    if !script_segment.is_empty() {
+                        let filtered = filter_script_text_with_state(scan_state, script_segment);
+                        push_prepared_emit_owned(&mut chunks, filtered);
+                    }
+                    let close_end = html_tag_end(text, close_start)?;
+                    chunks.push(PreparedTextChunk::ScriptCloseTag(
+                        text[close_start..close_end].to_string(),
+                    ));
+                    cursor = close_end;
+                    section = PreparedSection::Html;
+                    continue;
+                }
+
+                let script_segment = &text[cursor..];
+                if !script_segment.is_empty() {
+                    let filtered = filter_script_text_with_state(scan_state, script_segment);
+                    push_prepared_emit_owned(&mut chunks, filtered);
+                }
+                break;
+            }
+            PreparedSection::Style { scan_state } => {
+                if let Some(close_start) = find_style_close_tag_with_state(text, cursor, scan_state)
+                {
+                    let style_segment = &text[cursor..close_start];
+                    push_prepared_emit(&mut chunks, style_segment);
+                    let close_end = html_tag_end(text, close_start)?;
+                    chunks.push(PreparedTextChunk::StyleCloseTag(
+                        text[close_start..close_end].to_string(),
+                    ));
+                    cursor = close_end;
+                    section = PreparedSection::Html;
+                } else {
+                    push_prepared_emit(&mut chunks, &text[cursor..]);
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(chunks)
+}
+
 fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     let mut output = String::new();
     let mut section = if let Some(script_tag) = current_unclosed_script_tag(prefix) {
@@ -12276,9 +12591,9 @@ mod tests {
             let mut tracker = ContextTracker::from_state(ContextState::html_text());
             for node in &nodes {
                 match node {
-                    Node::Text(text) => {
+                    Node::Text(text_node) => {
                         let before = tracker.state().mode;
-                        tracker.append_text(text);
+                        tracker.append_text(&text_node.raw);
                         println!(
                             "quotes raw text before={before:?} after={:?}",
                             tracker.state().mode
@@ -12563,6 +12878,64 @@ mod tests {
                 "unexpected css url part after chunk: {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_prepares_script_text_chunks_with_close_tag_segments() {
+        let template = Template::new("prepared-script")
+            .parse("<script>const x={{.X}};</script><script>const y={{.Y}};</script>")
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get("prepared-script")
+            .expect("template nodes should exist");
+
+        let mut has_script_close_chunk = false;
+        for node in nodes {
+            if let Node::Text(text_node) = node
+                && let Some(prepared) = text_node.prepared.as_ref()
+            {
+                has_script_close_chunk = prepared
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, PreparedTextChunk::ScriptCloseTag(_)));
+                if has_script_close_chunk {
+                    break;
+                }
+            }
+        }
+
+        assert!(has_script_close_chunk);
+    }
+
+    #[test]
+    fn parse_prepares_style_text_chunks_with_close_tag_segments() {
+        let template = Template::new("prepared-style")
+            .parse("<style>.x{content:\"{{.X}}\";}</style><style>.y{color:red;}</style>")
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates
+            .get("prepared-style")
+            .expect("template nodes should exist");
+
+        let mut has_style_close_chunk = false;
+        for node in nodes {
+            if let Node::Text(text_node) = node
+                && let Some(prepared) = text_node.prepared.as_ref()
+            {
+                has_style_close_chunk = prepared
+                    .chunks
+                    .iter()
+                    .any(|chunk| matches!(chunk, PreparedTextChunk::StyleCloseTag(_)));
+                if has_style_close_chunk {
+                    break;
+                }
+            }
+        }
+
+        assert!(has_style_close_chunk);
     }
 
     #[test]
