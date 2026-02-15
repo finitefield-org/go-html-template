@@ -1195,18 +1195,10 @@ impl Template {
                         tracker.css_url_part_hint(),
                     )?;
                     output.push_str(&escaped);
-                    let skip_tracker_update = !*runtime_mode
-                        && matches!(
-                            mode,
-                            EscapeMode::AttrQuoted {
-                                kind: AttrKind::Normal,
-                                ..
-                            } | EscapeMode::AttrUnquoted {
-                                kind: AttrKind::Normal
-                            }
-                        );
-                    if !skip_tracker_update {
+                    if *runtime_mode {
                         tracker.append_text(&escaped);
+                    } else if placeholder_advances_parse_context(tracker, mode) {
+                        tracker.append_expr_placeholder(mode);
                     }
                 }
                 Node::SetVar {

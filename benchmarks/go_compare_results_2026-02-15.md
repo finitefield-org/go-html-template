@@ -424,3 +424,44 @@ Additional optimization applied:
 | static_200k | 20 | 1101 | 525 | -52.3% | 586 | 481 | -17.9% | true |
 | attr_20k | 10 | 16315 | 16519 | +1.2% | 12823 | 12648 | -1.4% | true |
 | url_20k | 10 | 21920 | 15184 | -30.7% | 25164 | 25428 | +1.0% | true |
+
+## Fixed-mode Expr Runtime Tracker Reduction (Go-style execution closer)
+
+Optimization applied:
+- In execute, fixed-mode expressions (`runtime_mode = false`) no longer append full escaped text to the runtime `ContextTracker`.
+- Instead:
+  - if parse-time rules require context progress (`placeholder_advances_parse_context`), append only parse-equivalent placeholder;
+  - otherwise skip tracker update entirely.
+- Runtime tracker full-text dependency now remains only for `runtime_mode = true` actions.
+
+Key change:
+- `/Users/kazuyoshitoshiya/Documents/GitHub/go-html-template/src/lib.rs` (`Node::Expr` execution path)
+
+### Selected before/after (same case set, same loop settings)
+
+| case | loops | before rust_execute_us | after rust_execute_us | exec change | output_match |
+|---|---:|---:|---:|---:|---|
+| script_2k | 3 | 1191 | 1106 | -7.1% | true |
+| attr_20k | 10 | 12393 | 12675 | +2.3% | true |
+| url_20k | 10 | 24117 | 15228 | -36.9% | true |
+
+### Latest full compare snapshot (after this optimization)
+
+| case | loops | rust_parse_us | go_parse_us | parse_ratio | rust_exec_us | go_exec_us | exec_ratio | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| static_200k | 20 | 513 | 57 | 9.00 | 470 | 232 | 2.03 | true |
+| expr_20k | 20 | 9105 | 9454 | 0.96 | 2161 | 13318 | 0.16 | true |
+| deep_path_20k | 20 | 17254 | 22626 | 0.76 | 2732 | 20085 | 0.14 | true |
+| func_print_20k | 20 | 13512 | 13648 | 0.99 | 4293 | 22699 | 0.19 | true |
+| range_no_vars | 30 | 15 | 5 | 3.00 | 109 | 622 | 0.18 | true |
+| range_var_decl | 30 | 15 | 7 | 2.14 | 7694 | 24117 | 0.32 | true |
+| range_var_assign | 30 | 17 | 8 | 2.12 | 7782 | 24406 | 0.32 | true |
+| if_else_20k | 20 | 38929 | 32693 | 1.19 | 6339 | 16492 | 0.38 | true |
+| template_call_range | 30 | 15 | 6 | 2.50 | 4305 | 13536 | 0.32 | true |
+| attr_20k | 10 | 15842 | 12226 | 1.30 | 12675 | 15291 | 0.83 | true |
+| url_20k | 10 | 15487 | 12541 | 1.23 | 15228 | 25553 | 0.60 | true |
+| script_2 | 30 | 16 | 5 | 3.20 | 1 | 5 | 0.20 | true |
+| script_100 | 10 | 145 | 62 | 2.34 | 58 | 89 | 0.65 | true |
+| script_2k | 3 | 2396 | 1292 | 1.85 | 1106 | 2238 | 0.49 | true |
+| style_100 | 10 | 132 | 66 | 2.00 | 47 | 117 | 0.40 | true |
+| style_2k | 3 | 2295 | 1330 | 1.73 | 1001 | 3030 | 0.33 | true |
