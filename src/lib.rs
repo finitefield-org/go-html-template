@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::RwLockReadGuard;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -462,6 +463,8 @@ struct TemplateNameSpace {
     templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
     text_only_candidates: Arc<RwLock<HashSet<String>>>,
     text_only_outputs: Arc<RwLock<HashMap<String, String>>>,
+    context_analysis_ready: Arc<AtomicBool>,
+    context_analysis_lock: Arc<Mutex<()>>,
     funcs: Arc<RwLock<FuncMap>>,
     methods: Arc<RwLock<MethodMap>>,
     missing_key_mode: Arc<RwLock<MissingKeyMode>>,
@@ -476,6 +479,8 @@ impl TemplateNameSpace {
             templates: Arc::new(RwLock::new(HashMap::new())),
             text_only_candidates: Arc::new(RwLock::new(HashSet::new())),
             text_only_outputs: Arc::new(RwLock::new(HashMap::new())),
+            context_analysis_ready: Arc::new(AtomicBool::new(true)),
+            context_analysis_lock: Arc::new(Mutex::new(())),
             funcs: Arc::new(RwLock::new(builtin_funcs())),
             methods: Arc::new(RwLock::new(HashMap::new())),
             missing_key_mode: Arc::new(RwLock::new(MissingKeyMode::Default)),
@@ -585,6 +590,10 @@ impl Template {
         let templates = self.name_space.templates.read().unwrap().clone();
         let text_only_candidates = self.name_space.text_only_candidates.read().unwrap().clone();
         let text_only_outputs = self.name_space.text_only_outputs.read().unwrap().clone();
+        let context_analysis_ready = self
+            .name_space
+            .context_analysis_ready
+            .load(AtomicOrdering::SeqCst);
         let funcs = self.name_space.funcs.read().unwrap().clone();
         let methods = self.name_space.methods.read().unwrap().clone();
         let missing_key_mode = self.name_space.missing_key_mode.read().unwrap().clone();
@@ -595,6 +604,8 @@ impl Template {
                 templates: Arc::new(RwLock::new(templates)),
                 text_only_candidates: Arc::new(RwLock::new(text_only_candidates)),
                 text_only_outputs: Arc::new(RwLock::new(text_only_outputs)),
+                context_analysis_ready: Arc::new(AtomicBool::new(context_analysis_ready)),
+                context_analysis_lock: Arc::new(Mutex::new(())),
                 funcs: Arc::new(RwLock::new(funcs)),
                 methods: Arc::new(RwLock::new(methods)),
                 missing_key_mode: Arc::new(RwLock::new(missing_key_mode)),
@@ -647,7 +658,7 @@ impl Template {
         self.ensure_not_executed()?;
         let root = self.name.clone();
         self.parse_named(&root, text)?;
-        self.reanalyze_contexts()?;
+        self.finalize_contexts_after_parse()?;
         Ok(self)
     }
 
@@ -703,7 +714,7 @@ impl Template {
             let mut templates = self.name_space.templates.write().unwrap();
             self.merge_template_nodes(&mut templates, &name, tree.nodes);
         }
-        self.reanalyze_contexts()?;
+        self.finalize_contexts_after_parse()?;
         Ok(self)
     }
 
@@ -758,7 +769,7 @@ impl Template {
             ));
         }
 
-        self.reanalyze_contexts()?;
+        self.finalize_contexts_after_parse()?;
         Ok(self)
     }
 
@@ -867,9 +878,64 @@ impl Template {
         }
     }
 
+    fn all_templates_are_text_only(&self) -> bool {
+        self.name_space
+            .templates
+            .read()
+            .unwrap()
+            .values()
+            .all(|nodes| nodes.iter().all(|node| matches!(node, Node::Text(_))))
+    }
+
+    fn can_defer_text_only_context_analysis(&self) -> bool {
+        let templates = self.name_space.templates.read().unwrap();
+        templates
+            .values()
+            .all(|nodes| text_only_nodes_allow_deferred_analysis(nodes))
+    }
+
+    fn finalize_contexts_after_parse(&self) -> Result<()> {
+        if self.all_templates_are_text_only() && self.can_defer_text_only_context_analysis() {
+            return Ok(());
+        }
+        self.reanalyze_contexts()?;
+        self.name_space
+            .context_analysis_ready
+            .store(true, AtomicOrdering::SeqCst);
+        Ok(())
+    }
+
+    fn ensure_context_analysis_ready(&self) -> Result<()> {
+        if self
+            .name_space
+            .context_analysis_ready
+            .load(AtomicOrdering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        let _analysis_guard = self.name_space.context_analysis_lock.lock().unwrap();
+        if self
+            .name_space
+            .context_analysis_ready
+            .load(AtomicOrdering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        self.reanalyze_contexts()?;
+        self.name_space
+            .context_analysis_ready
+            .store(true, AtomicOrdering::SeqCst);
+        Ok(())
+    }
+
     fn clear_text_only_output_cache(&self) {
         self.name_space.text_only_candidates.write().unwrap().clear();
         self.name_space.text_only_outputs.write().unwrap().clear();
+        self.name_space
+            .context_analysis_ready
+            .store(false, AtomicOrdering::SeqCst);
     }
 
     fn text_only_template_output(&self, name: &str) -> Result<Option<String>> {
@@ -961,6 +1027,7 @@ impl Template {
 
     fn execute_template_with_root_to_string(&self, name: &str, root: &Value) -> Result<String> {
         self.name_space.executed.store(true, AtomicOrdering::SeqCst);
+        self.ensure_context_analysis_ready()?;
         if let Some(rendered) = self.text_only_template_output(name)? {
             return Ok(rendered);
         }
@@ -1106,7 +1173,7 @@ impl Template {
         validate_function_calls_in_nodes(nodes, &funcs)
     }
 
-    fn reanalyze_contexts(&mut self) -> Result<()> {
+    fn reanalyze_contexts(&self) -> Result<()> {
         let text_only_candidates = {
             let mut templates = self.name_space.templates.write().unwrap();
             if !templates.contains_key(&self.name) {
@@ -5267,6 +5334,37 @@ fn collect_text_only_nodes(nodes: &[Node]) -> Option<String> {
     Some(combined)
 }
 
+fn text_only_nodes_allow_deferred_analysis(nodes: &[Node]) -> bool {
+    let Some(text) = single_text_node_raw(nodes) else {
+        return false;
+    };
+
+    let bytes = text.as_bytes();
+    if bytes.contains(&b'=')
+        || bytes.contains(&b'"')
+        || bytes.contains(&b'\'')
+        || bytes.contains(&b'`')
+    {
+        return false;
+    }
+
+    if text.contains("<!--") || text.contains("-->") {
+        return false;
+    }
+
+    let has_s = bytes
+        .iter()
+        .any(|byte| *byte == b's' || *byte == b'S');
+    let has_t = bytes
+        .iter()
+        .any(|byte| *byte == b't' || *byte == b'T');
+    if !has_s && !has_t {
+        return true;
+    }
+
+    !contains_special_text_context_tag(text)
+}
+
 fn is_text_only_output_cacheable(text: &str) -> bool {
     !contains_script_or_style_tag(text)
 }
@@ -5369,6 +5467,51 @@ fn contains_script_or_style_tag(text: &str) -> bool {
             return true;
         }
     }
+    false
+}
+
+fn contains_special_text_context_tag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'/' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+        if !bytes[i].is_ascii_alphabetic() {
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len() && is_html_tag_name_byte(bytes[i]) {
+            i += 1;
+        }
+        if !is_html_tag_boundary(bytes.get(i).copied()) {
+            continue;
+        }
+
+        let tag = &bytes[start..i];
+        if tag.eq_ignore_ascii_case(b"script")
+            || tag.eq_ignore_ascii_case(b"style")
+            || tag.eq_ignore_ascii_case(b"title")
+            || tag.eq_ignore_ascii_case(b"textarea")
+        {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -5905,7 +6048,7 @@ where
         ));
     }
 
-    template.reanalyze_contexts()?;
+    template.finalize_contexts_after_parse()?;
     Ok(())
 }
 
