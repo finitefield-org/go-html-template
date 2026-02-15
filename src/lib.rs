@@ -446,6 +446,19 @@ pub struct ParseTree {
     nodes: Vec<Node>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct TextScanSummary {
+    has_lt: bool,
+    has_eq: bool,
+    has_single_quote: bool,
+    has_double_quote: bool,
+    has_backtick: bool,
+    has_s: bool,
+    has_t: bool,
+    has_comment_open: bool,
+    has_comment_close: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderFlow {
     Normal,
@@ -592,8 +605,12 @@ struct TemplateParseMeta {
 
 impl TemplateParseMeta {
     fn from_nodes(nodes: &[Node]) -> Self {
-        let text_only = nodes.iter().all(|node| matches!(node, Node::Text(_)));
-        if !text_only {
+        if let Some(text) = single_text_node_raw(nodes) {
+            let scan = scan_text_summary(text);
+            return Self::from_single_text_with_scan(text, &scan);
+        }
+
+        if !nodes.iter().all(|node| matches!(node, Node::Text(_))) {
             return Self {
                 text_only: false,
                 defer_text_only_context_analysis: false,
@@ -601,15 +618,18 @@ impl TemplateParseMeta {
             };
         }
 
-        let defer_text_only_context_analysis = text_only_nodes_allow_deferred_analysis(nodes);
-        let cacheable_text_only_output = single_text_node_raw(nodes)
-            .map(is_text_only_output_cacheable)
-            .unwrap_or(false);
-
         Self {
             text_only: true,
-            defer_text_only_context_analysis,
-            cacheable_text_only_output,
+            defer_text_only_context_analysis: false,
+            cacheable_text_only_output: false,
+        }
+    }
+
+    fn from_single_text_with_scan(text: &str, scan: &TextScanSummary) -> Self {
+        Self {
+            text_only: true,
+            defer_text_only_context_analysis: deferred_text_only_context_analysis(text, scan),
+            cacheable_text_only_output: cacheable_text_only_output(text, scan),
         }
     }
 }
@@ -861,7 +881,7 @@ impl Template {
         }
         {
             let mut templates = self.name_space.templates.write().unwrap();
-            self.merge_template_nodes(&mut templates, &name, tree.nodes);
+            self.merge_template_nodes(&mut templates, &name, tree.nodes, None);
         }
         self.finalize_contexts_after_parse()?;
         Ok(self)
@@ -1277,11 +1297,12 @@ impl Template {
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
         let left_delim = self.name_space.left_delim.read().unwrap().clone();
         let right_delim = self.name_space.right_delim.read().unwrap().clone();
-        let tree = self.parse_tree_with_delims(text, &left_delim, &right_delim)?;
+        let (tree, root_parse_meta_hint) =
+            self.parse_tree_with_delims_and_meta(text, &left_delim, &right_delim)?;
         self.validate_function_calls(&tree.nodes)?;
         self.clear_text_only_output_cache();
         let mut templates = self.name_space.templates.write().unwrap();
-        self.merge_template_nodes(&mut templates, name, tree.nodes);
+        self.merge_template_nodes(&mut templates, name, tree.nodes, root_parse_meta_hint);
 
         Ok(())
     }
@@ -1292,38 +1313,59 @@ impl Template {
         left_delim: &str,
         right_delim: &str,
     ) -> Result<ParseTree> {
+        let (tree, _) = self.parse_tree_with_delims_and_meta(text, left_delim, right_delim)?;
+        Ok(tree)
+    }
+
+    fn parse_tree_with_delims_and_meta(
+        &self,
+        text: &str,
+        left_delim: &str,
+        right_delim: &str,
+    ) -> Result<(ParseTree, Option<TemplateParseMeta>)> {
         if text.is_empty() {
-            return Ok(ParseTree { nodes: Vec::new() });
+            return Ok((ParseTree { nodes: Vec::new() }, None));
         }
 
         let has_left_delim = text.contains(left_delim);
         if !has_left_delim {
-            if text.as_bytes().contains(&b'=') {
-                validate_unquoted_attr_hazards(text)?;
+            let scan = scan_text_summary(text);
+            if scan.has_lt && scan.has_eq {
+                validate_unquoted_attr_hazards(text, scan.has_lt, scan.has_eq)?;
             }
 
-            if !maybe_has_html_comment_marker(text) {
-                return Ok(ParseTree {
-                    nodes: vec![Node::Text(TextNode::from_span(
-                        Arc::from(text),
-                        0,
-                        text.len(),
-                    ))],
-                });
+            if !scan.has_comment_open {
+                return Ok((
+                    ParseTree {
+                        nodes: vec![Node::Text(TextNode::from_span(
+                            Arc::from(text),
+                            0,
+                            text.len(),
+                        ))],
+                    },
+                    Some(TemplateParseMeta::from_single_text_with_scan(text, &scan)),
+                ));
             }
 
             let preprocessed = strip_html_comments(text);
             let preprocessed = preprocessed.as_ref();
             if preprocessed.is_empty() {
-                return Ok(ParseTree { nodes: Vec::new() });
+                return Ok((ParseTree { nodes: Vec::new() }, None));
             }
-            return Ok(ParseTree {
-                nodes: vec![Node::Text(TextNode::from_span(
-                    Arc::from(preprocessed),
-                    0,
-                    preprocessed.len(),
-                ))],
-            });
+            let preprocessed_scan = scan_text_summary(preprocessed);
+            return Ok((
+                ParseTree {
+                    nodes: vec![Node::Text(TextNode::from_span(
+                        Arc::from(preprocessed),
+                        0,
+                        preprocessed.len(),
+                    ))],
+                },
+                Some(TemplateParseMeta::from_single_text_with_scan(
+                    preprocessed,
+                    &preprocessed_scan,
+                )),
+            ));
         }
 
         let has_html_comment = text.as_bytes().contains(&b'!') && text.contains("<!--");
@@ -1334,17 +1376,33 @@ impl Template {
         };
         let preprocessed = preprocessed.as_ref();
         if preprocessed.is_empty() {
-            return Ok(ParseTree { nodes: Vec::new() });
+            return Ok((ParseTree { nodes: Vec::new() }, None));
         }
 
         if has_html_comment && !preprocessed.contains(left_delim) {
-            return Ok(ParseTree {
-                nodes: vec![Node::Text(TextNode::from_span(
-                    Arc::from(preprocessed),
-                    0,
-                    preprocessed.len(),
-                ))],
-            });
+            let preprocessed_scan = scan_text_summary(preprocessed);
+            if preprocessed_scan.has_lt && preprocessed_scan.has_eq {
+                validate_unquoted_attr_hazards(
+                    preprocessed,
+                    preprocessed_scan.has_lt,
+                    preprocessed_scan.has_eq,
+                )?;
+            }
+            if !preprocessed_scan.has_comment_open {
+                return Ok((
+                    ParseTree {
+                        nodes: vec![Node::Text(TextNode::from_span(
+                            Arc::from(preprocessed),
+                            0,
+                            preprocessed.len(),
+                        ))],
+                    },
+                    Some(TemplateParseMeta::from_single_text_with_scan(
+                        preprocessed,
+                        &preprocessed_scan,
+                    )),
+                ));
+            }
         }
 
         let source: Arc<str> = Arc::from(preprocessed);
@@ -1357,7 +1415,7 @@ impl Template {
                 stop.keyword
             )));
         }
-        Ok(ParseTree { nodes })
+        Ok((ParseTree { nodes }, None))
     }
 
     fn merge_template_nodes(
@@ -1365,6 +1423,7 @@ impl Template {
         templates: &mut HashMap<String, Vec<Node>>,
         name: &str,
         nodes: Vec<Node>,
+        root_parse_meta_hint: Option<TemplateParseMeta>,
     ) {
         let mut root_nodes = Vec::new();
         let mut changed_templates = Vec::new();
@@ -1404,7 +1463,8 @@ impl Template {
 
         if !root_nodes.is_empty() || !templates.contains_key(name) {
             let root_dependencies = collect_template_call_dependencies(&root_nodes);
-            let root_parse_meta = TemplateParseMeta::from_nodes(&root_nodes);
+            let root_parse_meta =
+                root_parse_meta_hint.unwrap_or_else(|| TemplateParseMeta::from_nodes(&root_nodes));
             templates.insert(name.to_string(), root_nodes);
             changed_templates.push((name.to_string(), root_dependencies, root_parse_meta));
         }
@@ -2134,7 +2194,8 @@ impl Template {
             let scan_state = tracker
                 .js_scan_state
                 .or_else(|| {
-                    current_unclosed_tag_content(&tracker.rendered, "script").map(current_js_scan_state)
+                    current_unclosed_tag_content(&tracker.rendered, "script")
+                        .map(current_js_scan_state)
                 })
                 .unwrap_or(JsScanState::Expr {
                     js_ctx: JsContext::RegExp,
@@ -2936,103 +2997,86 @@ struct RenderedContextSnapshot {
 fn rendered_snapshot_from_open_tag_fragment(fragment: &str) -> RenderedContextSnapshot {
     let tag_value_context = current_tag_value_context(fragment);
 
-    let (mode, in_css_attribute, css_attribute_quote, in_js_attribute, url_part, js_scan_state, css_scan_state) =
-        if let Some(context) = tag_value_context {
-            let kind = attr_kind(&context.attr_name);
-            match kind {
-                AttrKind::Js => {
-                    let mode = match script_attribute_mode(&context.value_prefix) {
-                        Some(EscapeMode::ScriptExpr)
-                            if context.quoted && !context.value_prefix.trim().is_empty() =>
-                        {
-                            EscapeMode::AttrQuoted {
-                                kind,
-                                quote: context.quote.unwrap_or('"'),
-                            }
-                        }
-                        Some(mode) => mode,
-                        None => EscapeMode::ScriptExpr,
-                    };
-                    let js_scan_state = if is_script_escape_mode(mode) {
-                        Some(current_js_scan_state(&context.value_prefix))
-                    } else {
-                        None
-                    };
-                    (mode, false, None, true, None, js_scan_state, None)
-                }
-                AttrKind::Css => {
-                    let mode = match style_attribute_mode(&context.value_prefix) {
-                        Some(EscapeMode::StyleExpr) | None => {
-                            if context.quoted {
-                                EscapeMode::AttrQuoted {
-                                    kind,
-                                    quote: context.quote.unwrap_or('"'),
-                                }
-                            } else {
-                                EscapeMode::AttrUnquoted { kind }
-                            }
-                        }
-                        Some(mode) => mode,
-                    };
-                    let css_scan_state = if is_style_escape_mode(mode) {
-                        Some(current_css_scan_state(&context.value_prefix))
-                    } else {
-                        None
-                    };
-                    (
-                        mode,
-                        true,
-                        context.quote,
-                        false,
-                        None,
-                        None,
-                        css_scan_state,
-                    )
-                }
-                AttrKind::Url | AttrKind::Normal | AttrKind::Srcset => {
-                    let mode = if context.quoted {
+    let (
+        mode,
+        in_css_attribute,
+        css_attribute_quote,
+        in_js_attribute,
+        url_part,
+        js_scan_state,
+        css_scan_state,
+    ) = if let Some(context) = tag_value_context {
+        let kind = attr_kind(&context.attr_name);
+        match kind {
+            AttrKind::Js => {
+                let mode = match script_attribute_mode(&context.value_prefix) {
+                    Some(EscapeMode::ScriptExpr)
+                        if context.quoted && !context.value_prefix.trim().is_empty() =>
+                    {
                         EscapeMode::AttrQuoted {
                             kind,
                             quote: context.quote.unwrap_or('"'),
                         }
-                    } else {
-                        EscapeMode::AttrUnquoted { kind }
-                    };
-                    let url_part = if matches!(kind, AttrKind::Url) {
-                        Some(if context.value_prefix.contains('#') {
-                            UrlPartContext::Fragment
-                        } else if context.value_prefix.contains('?') {
-                            UrlPartContext::Query
-                        } else {
-                            UrlPartContext::Path
-                        })
-                    } else {
-                        None
-                    };
-                    (mode, false, None, false, url_part, None, None)
-                }
+                    }
+                    Some(mode) => mode,
+                    None => EscapeMode::ScriptExpr,
+                };
+                let js_scan_state = if is_script_escape_mode(mode) {
+                    Some(current_js_scan_state(&context.value_prefix))
+                } else {
+                    None
+                };
+                (mode, false, None, true, None, js_scan_state, None)
             }
-        } else if current_attr_name_context(fragment) {
-            (
-                EscapeMode::AttrName,
-                false,
-                None,
-                false,
-                None,
-                None,
-                None,
-            )
-        } else {
-            (
-                EscapeMode::Html,
-                false,
-                None,
-                false,
-                None,
-                None,
-                None,
-            )
-        };
+            AttrKind::Css => {
+                let mode = match style_attribute_mode(&context.value_prefix) {
+                    Some(EscapeMode::StyleExpr) | None => {
+                        if context.quoted {
+                            EscapeMode::AttrQuoted {
+                                kind,
+                                quote: context.quote.unwrap_or('"'),
+                            }
+                        } else {
+                            EscapeMode::AttrUnquoted { kind }
+                        }
+                    }
+                    Some(mode) => mode,
+                };
+                let css_scan_state = if is_style_escape_mode(mode) {
+                    Some(current_css_scan_state(&context.value_prefix))
+                } else {
+                    None
+                };
+                (mode, true, context.quote, false, None, None, css_scan_state)
+            }
+            AttrKind::Url | AttrKind::Normal | AttrKind::Srcset => {
+                let mode = if context.quoted {
+                    EscapeMode::AttrQuoted {
+                        kind,
+                        quote: context.quote.unwrap_or('"'),
+                    }
+                } else {
+                    EscapeMode::AttrUnquoted { kind }
+                };
+                let url_part = if matches!(kind, AttrKind::Url) {
+                    Some(if context.value_prefix.contains('#') {
+                        UrlPartContext::Fragment
+                    } else if context.value_prefix.contains('?') {
+                        UrlPartContext::Query
+                    } else {
+                        UrlPartContext::Path
+                    })
+                } else {
+                    None
+                };
+                (mode, false, None, false, url_part, None, None)
+            }
+        }
+    } else if current_attr_name_context(fragment) {
+        (EscapeMode::AttrName, false, None, false, None, None, None)
+    } else {
+        (EscapeMode::Html, false, None, false, None, None, None)
+    };
 
     let in_open_tag = (matches!(mode, EscapeMode::Html) && is_in_unclosed_tag_context(fragment))
         || matches!(mode, EscapeMode::AttrName);
@@ -6459,48 +6503,76 @@ fn collect_text_only_nodes(nodes: &[Node]) -> Option<String> {
     Some(combined)
 }
 
-fn text_only_nodes_allow_deferred_analysis(nodes: &[Node]) -> bool {
-    let Some(text) = single_text_node_raw(nodes) else {
-        return false;
-    };
-
+fn scan_text_summary(text: &str) -> TextScanSummary {
     let bytes = text.as_bytes();
-    let mut has_s = false;
-    let mut has_t = false;
+    let mut summary = TextScanSummary::default();
+
     let mut i = 0usize;
     while i < bytes.len() {
         let byte = bytes[i];
         match byte {
-            b'=' | b'"' | b'\'' | b'`' => return false,
-            b's' | b'S' => has_s = true,
-            b't' | b'T' => has_t = true,
-            _ => {}
-        }
-
-        if byte == b'<' && i + 3 < bytes.len() {
-            if bytes[i + 1] == b'!' && bytes[i + 2] == b'-' && bytes[i + 3] == b'-' {
-                return false;
+            b'<' => {
+                summary.has_lt = true;
+                if i + 3 < bytes.len()
+                    && bytes[i + 1] == b'!'
+                    && bytes[i + 2] == b'-'
+                    && bytes[i + 3] == b'-'
+                {
+                    summary.has_comment_open = true;
+                }
             }
-        } else if byte == b'-'
-            && i + 2 < bytes.len()
-            && bytes[i + 1] == b'-'
-            && bytes[i + 2] == b'>'
-        {
-            return false;
+            b'=' => summary.has_eq = true,
+            b'\'' => summary.has_single_quote = true,
+            b'"' => summary.has_double_quote = true,
+            b'`' => summary.has_backtick = true,
+            b's' | b'S' => summary.has_s = true,
+            b't' | b'T' => summary.has_t = true,
+            b'-' => {
+                if i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] == b'>' {
+                    summary.has_comment_close = true;
+                }
+            }
+            _ => {}
         }
 
         i += 1;
     }
 
-    if !has_s && !has_t {
+    summary
+}
+
+fn deferred_text_only_context_analysis(text: &str, scan: &TextScanSummary) -> bool {
+    if scan.has_eq
+        || scan.has_single_quote
+        || scan.has_double_quote
+        || scan.has_backtick
+        || scan.has_comment_open
+        || scan.has_comment_close
+    {
+        return false;
+    }
+
+    if !scan.has_lt {
+        return true;
+    }
+
+    if !scan.has_s && !scan.has_t {
         return true;
     }
 
     !contains_special_text_context_tag(text)
 }
 
-fn is_text_only_output_cacheable(text: &str) -> bool {
+fn cacheable_text_only_output(text: &str, scan: &TextScanSummary) -> bool {
+    if !scan.has_lt {
+        return true;
+    }
     !contains_script_or_style_tag(text)
+}
+
+fn is_text_only_output_cacheable(text: &str) -> bool {
+    let scan = scan_text_summary(text);
+    cacheable_text_only_output(text, &scan)
 }
 
 fn is_simple_static_html_text_context(text: &str) -> bool {
@@ -6881,9 +6953,8 @@ fn lookup_object_key(value: &Value, name: &str) -> Option<Value> {
     }
 }
 
-fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
-    let bytes = source.as_bytes();
-    if !bytes.contains(&b'<') || !bytes.contains(&b'=') {
+fn validate_unquoted_attr_hazards(source: &str, has_lt: bool, has_eq: bool) -> Result<()> {
+    if !has_lt || !has_eq {
         return Ok(());
     }
 
@@ -6990,14 +7061,6 @@ fn validate_unquoted_attr_hazards(source: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn maybe_has_html_comment_marker(source: &str) -> bool {
-    let bytes = source.as_bytes();
-    if !bytes.contains(&b'<') || !bytes.contains(&b'!') || !bytes.contains(&b'-') {
-        return false;
-    }
-    source.contains("<!--")
 }
 
 fn strip_html_comments(source: &str) -> Cow<'_, str> {
