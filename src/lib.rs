@@ -1110,9 +1110,14 @@ impl Template {
                         output.push_str(&filtered);
                         tracker.append_text(&filtered);
                     } else if matches!(mode, EscapeMode::Html) {
-                        let filtered = filter_html_text_sections(&tracker.rendered, text);
-                        output.push_str(&filtered);
-                        tracker.append_text(&filtered);
+                        if text.as_bytes().contains(&b'<') {
+                            let filtered = filter_html_text_sections(&tracker.rendered, text);
+                            output.push_str(&filtered);
+                            tracker.append_text(&filtered);
+                        } else {
+                            output.push_str(text);
+                            tracker.append_text(text);
+                        }
                     } else {
                         output.push_str(text);
                         tracker.append_text(text);
@@ -1205,20 +1210,24 @@ impl Template {
                     match &iterable_value {
                         Value::Json(JsonValue::Array(items)) if !items.is_empty() => {
                             if vars_len == 0 {
+                                push_scope(scopes);
                                 for value in items {
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
                                     let item = Value::Json(value.clone());
-                                    push_scope(scopes);
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
                                         depth,
                                     )?;
-                                    pop_scope(scopes);
                                     match flow {
                                         RenderFlow::Normal => {}
                                         RenderFlow::Continue => continue,
                                         RenderFlow::Break => break,
                                     }
                                 }
+                                pop_scope(scopes);
                             } else {
                                 let assign_targets = if *declare_vars {
                                     None
@@ -1269,22 +1278,26 @@ impl Template {
                             let mut keys = items.keys().map(String::as_str).collect::<Vec<_>>();
                             keys.sort_unstable();
                             if vars_len == 0 {
+                                push_scope(scopes);
                                 for key in keys {
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
                                     let item = Value::Json(
                                         items.get(key).expect("key collected from map").clone(),
                                     );
-                                    push_scope(scopes);
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
                                         depth,
                                     )?;
-                                    pop_scope(scopes);
                                     match flow {
                                         RenderFlow::Normal => {}
                                         RenderFlow::Continue => continue,
                                         RenderFlow::Break => break,
                                     }
                                 }
+                                pop_scope(scopes);
                             } else {
                                 let assign_targets = if *declare_vars {
                                     None
@@ -1335,20 +1348,24 @@ impl Template {
                         }
                         Value::Json(JsonValue::String(value)) if !value.is_empty() => {
                             if vars_len == 0 {
+                                push_scope(scopes);
                                 for ch in value.chars() {
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
                                     let item = Value::Json(JsonValue::String(ch.to_string()));
-                                    push_scope(scopes);
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
                                         depth,
                                     )?;
-                                    pop_scope(scopes);
                                     match flow {
                                         RenderFlow::Normal => {}
                                         RenderFlow::Continue => continue,
                                         RenderFlow::Break => break,
                                     }
                                 }
+                                pop_scope(scopes);
                             } else {
                                 let assign_targets = if *declare_vars {
                                     None
@@ -9062,6 +9079,23 @@ fn is_script_tag_close_in_regexp(bytes: &[u8], i: usize) -> bool {
         .all(|(lhs, rhs)| lhs.to_ascii_lowercase() == rhs.to_ascii_lowercase())
 }
 
+fn ensure_filtered_prefix<'a>(
+    filtered_prefix: &'a mut Option<String>,
+    prefix: &str,
+    output_so_far: &str,
+    remaining_len: usize,
+) -> &'a mut String {
+    if filtered_prefix.is_none() {
+        let mut value = String::with_capacity(prefix.len() + output_so_far.len() + remaining_len);
+        value.push_str(prefix);
+        value.push_str(output_so_far);
+        *filtered_prefix = Some(value);
+    }
+    filtered_prefix
+        .as_mut()
+        .expect("filtered prefix must exist")
+}
+
 fn filter_html_text_sections(prefix: &str, text: &str) -> String {
     let mut output = String::new();
     let mut section = if let Some(script_tag) = current_unclosed_script_tag(prefix) {
@@ -9076,8 +9110,25 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
         HtmlSection::Html
     };
 
+    if matches!(section, HtmlSection::Html)
+        && !contains_ascii_case_insensitive(text, b"<script")
+        && !contains_ascii_case_insensitive(text, b"<style")
+    {
+        return text.to_string();
+    }
+    if matches!(section, HtmlSection::Style) && !contains_ascii_case_insensitive(text, b"</style")
+    {
+        return text.to_string();
+    }
+
     let mut cursor = 0usize;
-    let mut filtered_prefix = prefix.to_string();
+    let mut filtered_prefix = if matches!(section, HtmlSection::Script) {
+        let mut value = String::with_capacity(prefix.len() + text.len());
+        value.push_str(prefix);
+        Some(value)
+    } else {
+        None
+    };
 
     while cursor < text.len() {
         match section {
@@ -9122,9 +9173,12 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                     }
                 };
 
-                output.push_str(&text[cursor..tag_end]);
+                let segment = &text[cursor..tag_end];
+                output.push_str(segment);
+                if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                    filtered_prefix.push_str(segment);
+                }
                 cursor = tag_end;
-                filtered_prefix = format!("{}{}", prefix, output);
                 section = target;
             }
             HtmlSection::Script => {
@@ -9132,7 +9186,13 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                 if let Some(close_start) = close {
                     let segment = &text[cursor..close_start];
                     if !segment.is_empty() {
-                        let filtered = filter_script_text(&filtered_prefix, segment);
+                        let filtered_prefix = ensure_filtered_prefix(
+                            &mut filtered_prefix,
+                            prefix,
+                            &output,
+                            text.len().saturating_sub(cursor),
+                        );
+                        let filtered = filter_script_text(filtered_prefix, segment);
                         output.push_str(&filtered);
                         filtered_prefix.push_str(&filtered);
                     }
@@ -9145,12 +9205,20 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
                     };
                     let close_tag = &text[close_start..close_end];
                     output.push_str(close_tag);
-                    filtered_prefix.push_str(close_tag);
+                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                        filtered_prefix.push_str(close_tag);
+                    }
                     cursor = close_end;
                     section = HtmlSection::Html;
                 } else {
                     let segment = &text[cursor..];
-                    let filtered = filter_script_text(&filtered_prefix, segment);
+                    let filtered_prefix = ensure_filtered_prefix(
+                        &mut filtered_prefix,
+                        prefix,
+                        &output,
+                        text.len().saturating_sub(cursor),
+                    );
+                    let filtered = filter_script_text(filtered_prefix, segment);
                     output.push_str(&filtered);
                     filtered_prefix.push_str(&filtered);
                     break;
@@ -9159,21 +9227,33 @@ fn filter_html_text_sections(prefix: &str, text: &str) -> String {
             HtmlSection::Style => {
                 let close = find_close_tag(text, cursor, b"style");
                 if let Some(close_start) = close {
-                    output.push_str(&text[cursor..close_start]);
+                    let segment = &text[cursor..close_start];
+                    output.push_str(segment);
+                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                        filtered_prefix.push_str(segment);
+                    }
                     let close_end = match html_tag_end(text, close_start) {
                         Some(end) => end,
                         None => {
-                            filtered_prefix.push_str(&text[close_start..]);
+                            if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                                filtered_prefix.push_str(&text[close_start..]);
+                            }
                             break;
                         }
                     };
                     let close_tag = &text[close_start..close_end];
                     output.push_str(close_tag);
-                    filtered_prefix.push_str(close_tag);
+                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                        filtered_prefix.push_str(close_tag);
+                    }
                     cursor = close_end;
                     section = HtmlSection::Html;
                 } else {
-                    output.push_str(&text[cursor..]);
+                    let tail = &text[cursor..];
+                    output.push_str(tail);
+                    if let Some(filtered_prefix) = filtered_prefix.as_mut() {
+                        filtered_prefix.push_str(tail);
+                    }
                     break;
                 }
             }
@@ -13025,6 +13105,36 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn range_no_vars_iteration_scope_does_not_leak_declared_variables() {
+        let template = Template::new("range-no-vars-scope")
+            .parse("{{range .Items}}{{if eq . 1}}{{$x := \"one\"}}{{end}}{{$x}}{{end}}")
+            .expect("parse should succeed");
+
+        let error = template
+            .execute_to_string(&json!({"Items": [1, 2]}))
+            .expect_err("second iteration should fail because `$x` is not declared");
+
+        assert!(
+            error
+                .to_string()
+                .contains("variable `$x` could not be resolved")
+        );
+    }
+
+    #[test]
+    fn range_no_vars_can_assign_outer_variable_across_iterations() {
+        let template = Template::new("range-no-vars-assign")
+            .parse("{{$out := \"\"}}{{range .Items}}{{$out = printf \"%s%s\" $out .}}{{end}}{{$out}}")
+            .expect("parse should succeed");
+
+        let output = template
+            .execute_to_string(&json!({"Items": ["a", "b", "c"]}))
+            .expect("execute should succeed");
+
+        assert_eq!(output, "abc");
     }
 
     #[test]

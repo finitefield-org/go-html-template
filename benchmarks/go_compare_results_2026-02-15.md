@@ -105,6 +105,19 @@ Optimizations applied:
 | parse_tree_html_mix | 8353 | 8446 | +1.1% |
 | parse_html_mix | 20633 | 19012 | -7.9% |
 
+## Range No-Vars Runtime Hotpath Optimization
+
+Optimizations applied:
+- `range` no-vars branch now reuses one scope (`clear()` each iteration) instead of push/pop per item.
+- `Node::Text` in HTML mode skips `filter_html_text_sections` when text has no `<`.
+- `filter_html_text_sections` now early-returns when no `<script`/`<style`, and removes `format!("{prefix}{output}")` rebuilds.
+
+### Before/After (range_no_vars, compare tool)
+
+| benchmark | loops | before rust_execute_us | after rust_execute_us | change | output_match |
+|---|---:|---:|---:|---:|---|
+| range_no_vars | 60 | 3871 | 3443 | -11.1% | true |
+
 ## Template/Data Files Saved
 
 - Directory: `benchmarks/go_compare_cases`
