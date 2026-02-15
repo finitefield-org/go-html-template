@@ -2432,6 +2432,8 @@ struct ContextTracker {
     js_scan_state: Option<JsScanState>,
     css_scan_state: Option<CssScanState>,
     script_json: bool,
+    attr_name_dynamic_pending: bool,
+    attr_value_from_dynamic_attr: bool,
 }
 
 impl ContextTracker {
@@ -2445,6 +2447,8 @@ impl ContextTracker {
             js_scan_state: None,
             css_scan_state: None,
             script_json: false,
+            attr_name_dynamic_pending: false,
+            attr_value_from_dynamic_attr: false,
         };
         tracker.sync_incremental_scan_state();
         tracker
@@ -2475,8 +2479,10 @@ impl ContextTracker {
     }
 
     fn append_text(&mut self, text: &str) {
+        let previous_mode = self.state.mode;
         self.rendered.push_str(text);
         self.refresh_cached_state_with_delta(text);
+        self.refresh_dynamic_attr_runtime_flag(previous_mode);
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
@@ -2493,6 +2499,8 @@ impl ContextTracker {
         self.js_scan_state = None;
         self.css_scan_state = None;
         self.script_json = false;
+        self.attr_name_dynamic_pending = false;
+        self.attr_value_from_dynamic_attr = false;
         if !suffix.is_empty() {
             self.rendered.push_str(suffix);
             self.state = ContextState::from_rendered(suffix);
@@ -2515,6 +2523,8 @@ impl ContextTracker {
         self.js_scan_state = None;
         self.css_scan_state = None;
         self.script_json = false;
+        self.attr_name_dynamic_pending = false;
+        self.attr_value_from_dynamic_attr = false;
         if !suffix.is_empty() {
             self.rendered.push_str(suffix);
             self.state = ContextState::from_rendered(suffix);
@@ -2527,11 +2537,34 @@ impl ContextTracker {
     }
 
     fn append_expr_placeholder(&mut self, mode: EscapeMode) {
+        let previous_mode = self.state.mode;
         let placeholder = placeholder_for_mode(mode);
         self.rendered.push_str(placeholder);
         self.refresh_cached_state_with_delta(placeholder);
+        if matches!(mode, EscapeMode::AttrName) {
+            self.attr_name_dynamic_pending = true;
+        }
+        self.refresh_dynamic_attr_runtime_flag(previous_mode);
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
+        }
+    }
+
+    fn refresh_dynamic_attr_runtime_flag(&mut self, previous_mode: EscapeMode) {
+        let current_mode = self.state.mode;
+        let was_attr_value = is_attr_value_mode(previous_mode);
+        let is_attr_value = is_attr_value_mode(current_mode);
+
+        if matches!(previous_mode, EscapeMode::AttrName) && is_attr_value {
+            self.attr_value_from_dynamic_attr = self.attr_name_dynamic_pending;
+            self.attr_name_dynamic_pending = false;
+        } else if was_attr_value && !is_attr_value {
+            self.attr_value_from_dynamic_attr = false;
+        }
+
+        if !is_tag_open_related_mode(current_mode) {
+            self.attr_name_dynamic_pending = false;
+            self.attr_value_from_dynamic_attr = false;
         }
     }
 
@@ -3562,7 +3595,7 @@ fn should_validate_action_context(tracker: &ContextTracker) -> bool {
 }
 
 fn should_resolve_expr_mode_at_runtime(mode: EscapeMode, tracker: &ContextTracker) -> bool {
-    if !matches!(
+    matches!(
         mode,
         EscapeMode::AttrQuoted {
             kind: AttrKind::Normal,
@@ -3570,13 +3603,21 @@ fn should_resolve_expr_mode_at_runtime(mode: EscapeMode, tracker: &ContextTracke
         } | EscapeMode::AttrUnquoted {
             kind: AttrKind::Normal
         }
-    ) {
-        return false;
-    }
+    ) && tracker.attr_value_from_dynamic_attr
+}
 
-    current_tag_value_context(&tracker.rendered)
-        .as_ref()
-        .is_some_and(|context| context.attr_name.ends_with('x'))
+fn is_attr_value_mode(mode: EscapeMode) -> bool {
+    matches!(
+        mode,
+        EscapeMode::AttrQuoted { .. } | EscapeMode::AttrUnquoted { .. }
+    )
+}
+
+fn is_tag_open_related_mode(mode: EscapeMode) -> bool {
+    matches!(
+        mode,
+        EscapeMode::AttrName | EscapeMode::AttrQuoted { .. } | EscapeMode::AttrUnquoted { .. }
+    )
 }
 
 fn placeholder_advances_parse_context(tracker: &ContextTracker, mode: EscapeMode) -> bool {
@@ -12758,6 +12799,71 @@ mod tests {
             .expect("execute should succeed");
 
         assert_eq!(output, "<input ZgotmplZ=\"doEvil()\">");
+    }
+
+    #[test]
+    fn parse_marks_dynamic_attribute_value_expr_as_runtime_mode() {
+        let template = Template::new("attrs")
+            .parse("<input {{.Name}}=\"{{.Value}}\">")
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates.get("attrs").expect("template nodes should exist");
+
+        let expr_nodes: Vec<(EscapeMode, bool)> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Expr {
+                    mode, runtime_mode, ..
+                } => Some((*mode, *runtime_mode)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(expr_nodes.len(), 2);
+        assert_eq!(expr_nodes[0], (EscapeMode::AttrName, false));
+        assert_eq!(
+            expr_nodes[1],
+            (
+                EscapeMode::AttrQuoted {
+                    kind: AttrKind::Normal,
+                    quote: '"',
+                },
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn parse_keeps_static_attribute_value_expr_fixed_mode() {
+        let template = Template::new("attrs")
+            .parse("<input title=\"{{.Value}}\">")
+            .expect("parse should succeed");
+
+        let templates = template.name_space.templates.read().unwrap();
+        let nodes = templates.get("attrs").expect("template nodes should exist");
+
+        let expr_nodes: Vec<(EscapeMode, bool)> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Expr {
+                    mode, runtime_mode, ..
+                } => Some((*mode, *runtime_mode)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(expr_nodes.len(), 1);
+        assert_eq!(
+            expr_nodes[0],
+            (
+                EscapeMode::AttrQuoted {
+                    kind: AttrKind::Normal,
+                    quote: '"',
+                },
+                false
+            )
+        );
     }
 
     #[test]

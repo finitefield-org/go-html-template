@@ -357,3 +357,22 @@ cargo run --release --quiet --bin compare_go_html_template -- \
 
 - Parse slower: `static_200k`, `func_print_20k` (near tie), `if_else_20k`, `attr_20k`, `url_20k`, `script_100`, `script_2k`, `style_100`, `style_2k`.
 - Execute slower: `static_200k`, `style_100` (small).
+
+## Dynamic Attr Runtime-Mode Flag (Parse-time decision tightening)
+
+Optimization applied:
+- Removed `current_tag_value_context(&tracker.rendered)` scan from `should_resolve_expr_mode_at_runtime`.
+- Added incremental tracking in `ContextTracker`:
+  - `attr_name_dynamic_pending`
+  - `attr_value_from_dynamic_attr`
+- Runtime mode is now enabled only when the current attribute value originated from a dynamic attribute name action.
+- Added regression tests to guarantee correctness:
+  - `parse_marks_dynamic_attribute_value_expr_as_runtime_mode`
+  - `parse_keeps_static_attribute_value_expr_fixed_mode`
+
+### Selected before/after (same compare command pattern)
+
+| case | loops | before rust_parse_us | after rust_parse_us | parse change | before rust_exec_us | after rust_exec_us | exec change | output_match |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| attr_20k | 10 | 26997 | 25968 | -3.8% | 12760 | 12131 | -4.9% | true |
+| url_20k | 10 | 29162 | 28894 | -0.9% | 24156 | 24388 | +1.0% | true |
