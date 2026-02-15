@@ -2998,10 +2998,14 @@ impl ContextTracker {
             return;
         }
 
+        let skip_rendered_tail_if_incremental =
+            self.should_skip_rendered_tail_update_for_parse_text(text);
         let previous_mode = self.state.mode;
-        self.refresh_cached_state_with_delta_for_parse(text);
+        let used_incremental = self.refresh_cached_state_with_delta_for_parse(text);
         self.refresh_dynamic_attr_runtime_flag(previous_mode);
-        self.update_rendered_tail_for_parse(text);
+        if !(skip_rendered_tail_if_incremental && used_incremental) {
+            self.update_rendered_tail_for_parse(text);
+        }
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
@@ -3072,7 +3076,7 @@ impl ContextTracker {
     fn append_expr_placeholder_for_parse(&mut self, mode: EscapeMode) {
         let previous_mode = self.state.mode;
         let placeholder = placeholder_for_mode(mode);
-        self.refresh_cached_state_with_delta_for_parse(placeholder);
+        let _ = self.refresh_cached_state_with_delta_for_parse(placeholder);
         if matches!(mode, EscapeMode::AttrName) {
             self.attr_name_dynamic_pending = true;
         }
@@ -3111,12 +3115,12 @@ impl ContextTracker {
         self.refresh_cached_state_full();
     }
 
-    fn refresh_cached_state_with_delta_for_parse(&mut self, delta: &str) {
+    fn refresh_cached_state_with_delta_for_parse(&mut self, delta: &str) -> bool {
         if delta.is_empty() {
-            return;
+            return false;
         }
         if self.try_refresh_cached_state_incremental(delta) {
-            return;
+            return true;
         }
         if self.state.in_open_tag
             || matches!(self.state.mode, EscapeMode::AttrName)
@@ -3128,6 +3132,7 @@ impl ContextTracker {
         } else {
             self.refresh_cached_state_seeded_delta(delta);
         }
+        false
     }
 
     fn refresh_cached_state_full(&mut self) {
@@ -3455,6 +3460,29 @@ impl ContextTracker {
 
         self.rendered.push_str(delta);
         truncate_to_char_boundary_tail(&mut self.rendered, PARSE_TRACKER_RENDERED_TAIL_MAX);
+    }
+
+    fn should_skip_rendered_tail_update_for_parse_text(&self, delta: &str) -> bool {
+        if delta.is_empty() || delta.as_bytes().contains(&b'\\') {
+            return false;
+        }
+        if has_unfinished_escape_suffix(&self.rendered) {
+            return false;
+        }
+        if self.state.is_script_tag_context()
+            && matches!(self.js_scan_state, Some(JsScanState::Expr { .. }))
+            && !contains_ascii_case_insensitive(delta, b"</script")
+        {
+            return true;
+        }
+        if self.state.is_style_tag_context()
+            && matches!(self.css_scan_state, Some(CssScanState::Expr))
+            && !contains_ascii_case_insensitive(delta, b"</style")
+        {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -14758,6 +14786,19 @@ mod tests {
         let tracker = ContextTracker::from_state(ContextState::from_rendered("<script>\""));
         let key = text_transition_cache_key(&tracker, "</script>");
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn parse_text_tail_skip_condition_matches_script_style_expr_safety() {
+        let script_tracker = ContextTracker::from_state(ContextState::from_rendered("<script>"));
+        assert!(script_tracker.should_skip_rendered_tail_update_for_parse_text("const x="));
+        assert!(!script_tracker.should_skip_rendered_tail_update_for_parse_text("</script>"));
+        assert!(!script_tracker.should_skip_rendered_tail_update_for_parse_text("const x=\\"));
+
+        let style_tracker = ContextTracker::from_state(ContextState::from_rendered("<style>"));
+        assert!(style_tracker.should_skip_rendered_tail_update_for_parse_text(".x{color:red;}"));
+        assert!(!style_tracker.should_skip_rendered_tail_update_for_parse_text("</style>"));
+        assert!(!style_tracker.should_skip_rendered_tail_update_for_parse_text(".x{content:\\"));
     }
 
     #[test]
