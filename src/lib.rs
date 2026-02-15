@@ -460,6 +460,8 @@ pub enum MissingKeyMode {
 #[derive(Clone)]
 struct TemplateNameSpace {
     templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
+    text_only_candidates: Arc<RwLock<HashSet<String>>>,
+    text_only_outputs: Arc<RwLock<HashMap<String, String>>>,
     funcs: Arc<RwLock<FuncMap>>,
     methods: Arc<RwLock<MethodMap>>,
     missing_key_mode: Arc<RwLock<MissingKeyMode>>,
@@ -472,6 +474,8 @@ impl TemplateNameSpace {
     fn new() -> Self {
         Self {
             templates: Arc::new(RwLock::new(HashMap::new())),
+            text_only_candidates: Arc::new(RwLock::new(HashSet::new())),
+            text_only_outputs: Arc::new(RwLock::new(HashMap::new())),
             funcs: Arc::new(RwLock::new(builtin_funcs())),
             methods: Arc::new(RwLock::new(HashMap::new())),
             missing_key_mode: Arc::new(RwLock::new(MissingKeyMode::Default)),
@@ -579,6 +583,8 @@ impl Template {
         }
         self.ensure_not_executed()?;
         let templates = self.name_space.templates.read().unwrap().clone();
+        let text_only_candidates = self.name_space.text_only_candidates.read().unwrap().clone();
+        let text_only_outputs = self.name_space.text_only_outputs.read().unwrap().clone();
         let funcs = self.name_space.funcs.read().unwrap().clone();
         let methods = self.name_space.methods.read().unwrap().clone();
         let missing_key_mode = self.name_space.missing_key_mode.read().unwrap().clone();
@@ -587,6 +593,8 @@ impl Template {
             name: self.name.clone(),
             name_space: TemplateNameSpace {
                 templates: Arc::new(RwLock::new(templates)),
+                text_only_candidates: Arc::new(RwLock::new(text_only_candidates)),
+                text_only_outputs: Arc::new(RwLock::new(text_only_outputs)),
                 funcs: Arc::new(RwLock::new(funcs)),
                 methods: Arc::new(RwLock::new(methods)),
                 missing_key_mode: Arc::new(RwLock::new(missing_key_mode)),
@@ -681,6 +689,7 @@ impl Template {
         self.ensure_not_executed()?;
         let name = name.into();
         self.validate_function_calls(&tree.nodes)?;
+        self.clear_text_only_output_cache();
         if !self
             .name_space
             .templates
@@ -858,12 +867,48 @@ impl Template {
         }
     }
 
+    fn clear_text_only_output_cache(&self) {
+        self.name_space.text_only_candidates.write().unwrap().clear();
+        self.name_space.text_only_outputs.write().unwrap().clear();
+    }
+
     fn text_only_template_output(&self, name: &str) -> Result<Option<String>> {
+        if let Some(rendered) = self.name_space.text_only_outputs.read().unwrap().get(name) {
+            return Ok(Some(rendered.clone()));
+        }
+
+        let is_candidate = self
+            .name_space
+            .text_only_candidates
+            .read()
+            .unwrap()
+            .contains(name);
+        if is_candidate {
+            let rendered = {
+                let templates = self.name_space.templates.read().unwrap();
+                let nodes = templates.get(name).ok_or_else(|| {
+                    TemplateError::Render(format!("template `{name}` is not defined"))
+                })?;
+                collect_text_only_nodes(nodes)
+            };
+            if let Some(rendered) = rendered {
+                self.name_space
+                    .text_only_outputs
+                    .write()
+                    .unwrap()
+                    .insert(name.to_string(), rendered.clone());
+                return Ok(Some(rendered));
+            }
+        }
+
         let templates = self.name_space.templates.read().unwrap();
-        let nodes = templates
-            .get(name)
-            .ok_or_else(|| TemplateError::Render(format!("template `{name}` is not defined")))?;
-        Ok(collect_text_only_template_output(nodes))
+        if templates.contains_key(name) {
+            Ok(None)
+        } else {
+            Err(TemplateError::Render(format!(
+                "template `{name}` is not defined"
+            )))
+        }
     }
 
     pub fn execute<T: Serialize, W: Write>(&self, writer: &mut W, data: &T) -> Result<()> {
@@ -996,9 +1041,12 @@ impl Template {
     }
 
     fn parse_named(&mut self, name: &str, text: &str) -> Result<()> {
-        validate_template_hazards(text)?;
+        if text.as_bytes().contains(&b'=') {
+            validate_template_hazards(text)?;
+        }
         let tree = self.parse_tree(text)?;
         self.validate_function_calls(&tree.nodes)?;
+        self.clear_text_only_output_cache();
         let mut templates = self.name_space.templates.write().unwrap();
         self.merge_template_nodes(&mut templates, name, tree.nodes);
 
@@ -1059,66 +1107,70 @@ impl Template {
     }
 
     fn reanalyze_contexts(&mut self) -> Result<()> {
-        let mut templates = self.name_space.templates.write().unwrap();
-        if !templates.contains_key(&self.name) {
-            return Err(TemplateError::Parse(format!(
-                "template `{}` is not defined",
-                self.name
-            )));
-        }
-
-        if templates
-            .values()
-            .all(|nodes| nodes.iter().all(|node| matches!(node, Node::Text(_))))
-        {
-            let mut root_end_state = None;
-            for (name, nodes) in templates.iter() {
-                let mut tracker = ContextTracker::from_state(ContextState::html_text());
-                for node in nodes {
-                    if let Node::Text(text_node) = node {
-                        tracker.append_text(&text_node.raw);
-                    }
-                }
-                if should_validate_action_context(&tracker) {
-                    validate_action_context_before_insertion(&tracker)?;
-                }
-                if name == &self.name {
-                    root_end_state = Some(tracker.state());
-                }
-            }
-
-            let root_end = root_end_state.unwrap_or_else(ContextState::html_text);
-            if !root_end.is_text_context() {
+        let text_only_candidates = {
+            let mut templates = self.name_space.templates.write().unwrap();
+            if !templates.contains_key(&self.name) {
                 return Err(TemplateError::Parse(format!(
-                    "template `{}` ends in a non-text context",
+                    "template `{}` is not defined",
                     self.name
                 )));
             }
 
-            return Ok(());
-        }
+            if templates
+                .values()
+                .all(|nodes| nodes.iter().all(|node| matches!(node, Node::Text(_))))
+            {
+                let mut root_end_state = None;
+                let mut text_only_candidates = HashSet::new();
+                for (name, nodes) in templates.iter() {
+                    let (tracker, cacheable_output) = analyze_text_only_template_nodes(nodes);
+                    if should_validate_action_context(&tracker) {
+                        validate_action_context_before_insertion(&tracker)?;
+                    }
+                    if name == &self.name {
+                        root_end_state = Some(tracker.state());
+                    }
+                    if cacheable_output {
+                        text_only_candidates.insert(name.clone());
+                    }
+                }
 
-        let mut names = templates.keys().cloned().collect::<Vec<_>>();
-        names.sort();
+                let root_end = root_end_state.unwrap_or_else(ContextState::html_text);
+                if !root_end.is_text_context() {
+                    return Err(TemplateError::Parse(format!(
+                        "template `{}` ends in a non-text context",
+                        self.name
+                    )));
+                }
 
-        let mut analyzer = ParseContextAnalyzer::new(&mut templates);
-        let root_start = ContextState::html_text();
-        let root_end = analyzer.analyze_template(&self.name, root_start)?;
-        if !root_end.is_text_context() {
-            return Err(TemplateError::Parse(format!(
-                "template `{}` ends in a non-text context",
-                self.name
-            )));
-        }
+                text_only_candidates
+            } else {
+                let mut names = templates.keys().cloned().collect::<Vec<_>>();
+                names.sort();
 
-        // Analyze unreferenced templates with HTML start context so
-        // execute_template(name, ...) has stable precomputed escaping.
-        for name in names.iter() {
-            if !analyzer.has_analysis(name.as_str()) {
-                let _ = analyzer.analyze_template(name.as_str(), ContextState::html_text())?;
+                let mut analyzer = ParseContextAnalyzer::new(&mut templates);
+                let root_start = ContextState::html_text();
+                let root_end = analyzer.analyze_template(&self.name, root_start)?;
+                if !root_end.is_text_context() {
+                    return Err(TemplateError::Parse(format!(
+                        "template `{}` ends in a non-text context",
+                        self.name
+                    )));
+                }
+
+                // Analyze unreferenced templates with HTML start context so
+                // execute_template(name, ...) has stable precomputed escaping.
+                for name in names.iter() {
+                    if !analyzer.has_analysis(name.as_str()) {
+                        let _ = analyzer.analyze_template(name.as_str(), ContextState::html_text())?;
+                    }
+                }
+
+                HashSet::new()
             }
-        }
-
+        };
+        *self.name_space.text_only_candidates.write().unwrap() = text_only_candidates;
+        self.name_space.text_only_outputs.write().unwrap().clear();
         Ok(())
     }
 
@@ -5165,7 +5217,45 @@ fn range_iteration_count(value: &Value) -> usize {
     }
 }
 
-fn collect_text_only_template_output(nodes: &[Node]) -> Option<String> {
+fn analyze_text_only_template_nodes(nodes: &[Node]) -> (ContextTracker, bool) {
+    if let Some(text) = single_text_node_raw(nodes) {
+        return analyze_text_only_segment(text);
+    }
+
+    let mut combined = String::new();
+    for node in nodes {
+        if let Node::Text(text_node) = node {
+            combined.push_str(&text_node.raw);
+        }
+    }
+    analyze_text_only_segment(&combined)
+}
+
+fn analyze_text_only_segment(text: &str) -> (ContextTracker, bool) {
+    let cacheable_output = is_text_only_output_cacheable(text);
+
+    if is_simple_static_html_text_context(text) {
+        let tracker = ContextTracker::from_state(ContextState::html_text());
+        return (tracker, cacheable_output);
+    }
+
+    let mut tracker = ContextTracker::from_state(ContextState::html_text());
+    tracker.append_text(text);
+    (tracker, cacheable_output)
+}
+
+fn single_text_node_raw(nodes: &[Node]) -> Option<&str> {
+    if nodes.len() != 1 {
+        return None;
+    }
+
+    match &nodes[0] {
+        Node::Text(text_node) => Some(text_node.raw.as_str()),
+        _ => None,
+    }
+}
+
+fn collect_text_only_nodes(nodes: &[Node]) -> Option<String> {
     let mut combined = String::new();
     for node in nodes {
         if let Node::Text(text_node) = node {
@@ -5174,14 +5264,112 @@ fn collect_text_only_template_output(nodes: &[Node]) -> Option<String> {
             return None;
         }
     }
-    if contains_ascii_case_insensitive(&combined, b"<script")
-        || contains_ascii_case_insensitive(&combined, b"</script")
-        || contains_ascii_case_insensitive(&combined, b"<style")
-        || contains_ascii_case_insensitive(&combined, b"</style")
-    {
-        return None;
-    }
     Some(combined)
+}
+
+fn is_text_only_output_cacheable(text: &str) -> bool {
+    !contains_script_or_style_tag(text)
+}
+
+fn is_simple_static_html_text_context(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            return false;
+        }
+
+        if matches!(bytes[i], b'!' | b'?') {
+            return false;
+        }
+
+        let closing = if bytes[i] == b'/' {
+            i += 1;
+            true
+        } else {
+            false
+        };
+
+        if i >= bytes.len() || !bytes[i].is_ascii_alphabetic() {
+            return false;
+        }
+
+        let tag_start = i;
+        i += 1;
+        while i < bytes.len() && is_html_tag_name_byte(bytes[i]) {
+            i += 1;
+        }
+        let tag_name = &bytes[tag_start..i];
+        if tag_name.eq_ignore_ascii_case(b"script")
+            || tag_name.eq_ignore_ascii_case(b"style")
+            || tag_name.eq_ignore_ascii_case(b"title")
+            || tag_name.eq_ignore_ascii_case(b"textarea")
+        {
+            return false;
+        }
+
+        while i < bytes.len() && is_html_space(bytes[i]) {
+            i += 1;
+        }
+        if !closing && i < bytes.len() && bytes[i] == b'/' {
+            i += 1;
+            while i < bytes.len() && is_html_space(bytes[i]) {
+                i += 1;
+            }
+        }
+        if i >= bytes.len() || bytes[i] != b'>' {
+            return false;
+        }
+        i += 1;
+    }
+
+    true
+}
+
+fn contains_script_or_style_tag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'/' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+        if !bytes[i].is_ascii_alphabetic() {
+            continue;
+        }
+
+        let start = i;
+        i += 1;
+        while i < bytes.len() && is_html_tag_name_byte(bytes[i]) {
+            i += 1;
+        }
+
+        let name = &bytes[start..i];
+        if !is_html_tag_boundary(bytes.get(i).copied()) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"script") || name.eq_ignore_ascii_case(b"style") {
+            return true;
+        }
+    }
+    false
 }
 
 fn term_may_reference_dot(term: &Term) -> bool {
@@ -19128,5 +19316,33 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
             output,
             "<script>/* attacker controlled */<a href=\"#ZgotmplZ\">go</a>"
         );
+    }
+
+    #[test]
+    fn parse_text_only_unclosed_attr_still_errors() {
+        let error = match Template::new("plain-unclosed").parse("<a href='") {
+            Ok(_) => panic!("parse should fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("non-text context"));
+    }
+
+    #[test]
+    fn execute_text_only_template_is_stable_across_calls() {
+        let source = "<ul>".to_string() + &"<li>x</li>".repeat(100) + "</ul>";
+        let template = Template::new("static")
+            .parse(&source)
+            .expect("parse should succeed");
+
+        let first = template
+            .execute_to_string(&json!({}))
+            .expect("first execute should succeed");
+        let second = template
+            .execute_to_string(&json!({}))
+            .expect("second execute should succeed");
+
+        assert_eq!(first, source);
+        assert_eq!(second, source);
     }
 }
