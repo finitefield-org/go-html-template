@@ -6808,6 +6808,11 @@ fn scan_text_summary(text: &str) -> TextScanSummary {
 
 fn scan_text_summary_if_no_default_delim(text: &str) -> Option<TextScanSummary> {
     let bytes = text.as_bytes();
+
+    if !bytes.contains(&b'{') {
+        return Some(scan_text_summary_without_open_brace(text, bytes));
+    }
+
     let mut summary = TextScanSummary::default();
 
     let mut i = 0usize;
@@ -6846,6 +6851,36 @@ fn scan_text_summary_if_no_default_delim(text: &str) -> Option<TextScanSummary> 
     }
 
     Some(summary)
+}
+
+fn scan_text_summary_without_open_brace(text: &str, bytes: &[u8]) -> TextScanSummary {
+    let mut summary = TextScanSummary::default();
+    let mut has_bang = false;
+    let mut has_dash = false;
+
+    for &byte in bytes {
+        match byte {
+            b'<' => summary.has_lt = true,
+            b'=' => summary.has_eq = true,
+            b'\'' => summary.has_single_quote = true,
+            b'"' => summary.has_double_quote = true,
+            b'`' => summary.has_backtick = true,
+            b's' | b'S' => summary.has_s = true,
+            b't' | b'T' => summary.has_t = true,
+            b'!' => has_bang = true,
+            b'-' => has_dash = true,
+            _ => {}
+        }
+    }
+
+    if has_bang && text.contains("<!--") {
+        summary.has_comment_open = true;
+    }
+    if has_dash && text.contains("-->") {
+        summary.has_comment_close = true;
+    }
+
+    summary
 }
 
 fn deferred_text_only_context_analysis(text: &str, scan: &TextScanSummary) -> bool {
