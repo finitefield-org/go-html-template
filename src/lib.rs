@@ -6682,6 +6682,89 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
         ));
     }
 
+    if left_delim == "{{" && right_delim == "}}" {
+        return tokenize_default_delims(source);
+    }
+
+    tokenize_with_delims_generic(source, left_delim, right_delim)
+}
+
+fn tokenize_default_delims(source: &str) -> Result<Vec<Token>> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start) = find_byte_pair(bytes, cursor, b'{', b'{') {
+        if start > cursor {
+            tokens.push(Token::Text {
+                start: cursor,
+                end: start,
+            });
+        }
+
+        let mut action_start = start + 2;
+        if bytes.get(action_start) == Some(&b'-') {
+            let should_treat_as_unary_minus = matches!(
+                bytes.get(action_start + 1),
+                Some(next) if next.is_ascii_digit() || *next == b'.'
+            );
+            if !should_treat_as_unary_minus {
+                action_start += 1;
+                trim_last_text_whitespace(&mut tokens, source);
+            }
+        }
+
+        let end = find_byte_pair(bytes, action_start, b'}', b'}')
+            .ok_or_else(|| TemplateError::Parse("unclosed action (missing `}}`)".to_string()))?;
+
+        let mut action_start_trimmed = trim_start_whitespace(source, action_start, end);
+        let mut action_end_trimmed = trim_end_whitespace(source, action_start_trimmed, end);
+        let trim_right = action_start_trimmed < action_end_trimmed
+            && source[action_start_trimmed..action_end_trimmed].ends_with('-');
+        if trim_right {
+            action_end_trimmed =
+                previous_char_boundary(source, action_start_trimmed, action_end_trimmed);
+            action_end_trimmed =
+                trim_end_whitespace(source, action_start_trimmed, action_end_trimmed);
+        }
+
+        action_start_trimmed =
+            trim_start_whitespace(source, action_start_trimmed, action_end_trimmed);
+        tokens.push(Token::Action {
+            start: action_start_trimmed,
+            end: action_end_trimmed,
+        });
+        cursor = end + 2;
+
+        if trim_right {
+            while cursor < source.len() {
+                let ch = source[cursor..].chars().next().ok_or_else(|| {
+                    TemplateError::Parse("invalid UTF-8 boundary while trimming".to_string())
+                })?;
+                if ch.is_whitespace() {
+                    cursor += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    if cursor < source.len() {
+        tokens.push(Token::Text {
+            start: cursor,
+            end: source.len(),
+        });
+    }
+
+    Ok(tokens)
+}
+
+fn tokenize_with_delims_generic(
+    source: &str,
+    left_delim: &str,
+    right_delim: &str,
+) -> Result<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut cursor = 0usize;
 
@@ -6755,6 +6838,22 @@ fn tokenize(source: &str, left_delim: &str, right_delim: &str) -> Result<Vec<Tok
     }
 
     Ok(tokens)
+}
+
+fn find_byte_pair(bytes: &[u8], start: usize, first: u8, second: u8) -> Option<usize> {
+    if start + 1 >= bytes.len() {
+        return None;
+    }
+
+    let mut cursor = start;
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor] == first && bytes[cursor + 1] == second {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+
+    None
 }
 
 fn trim_start_whitespace(source: &str, mut start: usize, end: usize) -> usize {
@@ -20096,6 +20195,36 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
     #[test]
     fn go_test_numbers_matches_go() {
         parse_numbers_supports_go_style_numeric_literals();
+    }
+
+    #[test]
+    fn tokenize_default_delims_preserves_unary_minus_literals() {
+        let source = "{{-1}}|{{-.5}}";
+        let tokens = tokenize(source, "{{", "}}").expect("tokenize should succeed");
+        let actions = tokens
+            .iter()
+            .filter_map(|token| match token {
+                Token::Action { start, end } => Some(&source[*start..*end]),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actions, vec!["-1", "-.5"]);
+    }
+
+    #[test]
+    fn tokenize_default_delims_keeps_trim_marker_behavior() {
+        let source = "x {{- .A -}} y";
+        let tokens = tokenize(source, "{{", "}}").expect("tokenize should succeed");
+        let pieces = tokens
+            .iter()
+            .map(|token| match token {
+                Token::Text { start, end } => format!("T:{}", &source[*start..*end]),
+                Token::Action { start, end } => format!("A:{}", &source[*start..*end]),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(pieces, vec!["T:x", "A:.A", "T:y"]);
     }
 
     #[test]
