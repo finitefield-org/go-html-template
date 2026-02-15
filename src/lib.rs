@@ -1199,103 +1199,168 @@ impl Template {
                     let vars_len = vars.len();
                     match &iterable_value {
                         Value::Json(JsonValue::Array(items)) if !items.is_empty() => {
-                            for (index, value) in items.iter().enumerate() {
-                                let item = Value::Json(value.clone());
+                            if vars_len == 0 {
+                                for value in items {
+                                    let item = Value::Json(value.clone());
+                                    push_scope(scopes);
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    pop_scope(scopes);
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
+                                    }
+                                }
+                            } else {
                                 push_scope(scopes);
-                                if vars_len == 1 {
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], item.clone())?;
+                                for (index, value) in items.iter().enumerate() {
+                                    let item = Value::Json(value.clone());
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
+                                    if vars_len == 1 {
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], item.clone())?;
+                                        }
+                                    } else if vars_len == 2 {
+                                        let key = Value::from(index as u64);
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], key);
+                                            declare_variable(scopes, &vars[1], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], key)?;
+                                            assign_variable(scopes, &vars[1], item.clone())?;
+                                        }
                                     }
-                                } else if vars_len == 2 {
-                                    let key = Value::from(index as u64);
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], key);
-                                        declare_variable(scopes, &vars[1], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], key)?;
-                                        assign_variable(scopes, &vars[1], item.clone())?;
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
                                     }
                                 }
-                                let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, runtime, true,
-                                    depth,
-                                )?;
                                 pop_scope(scopes);
-                                match flow {
-                                    RenderFlow::Normal => {}
-                                    RenderFlow::Continue => continue,
-                                    RenderFlow::Break => break,
-                                }
                             }
                         }
                         Value::Json(JsonValue::Object(items)) if !items.is_empty() => {
                             let mut keys = items.keys().map(String::as_str).collect::<Vec<_>>();
                             keys.sort_unstable();
-                            for key in keys {
-                                let item = Value::Json(
-                                    items.get(key).expect("key collected from map").clone(),
-                                );
+                            if vars_len == 0 {
+                                for key in keys {
+                                    let item = Value::Json(
+                                        items.get(key).expect("key collected from map").clone(),
+                                    );
+                                    push_scope(scopes);
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    pop_scope(scopes);
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
+                                    }
+                                }
+                            } else {
                                 push_scope(scopes);
-                                if vars_len == 1 {
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], item.clone())?;
+                                for key in keys {
+                                    let item = Value::Json(
+                                        items.get(key).expect("key collected from map").clone(),
+                                    );
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
+                                    if vars_len == 1 {
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], item.clone())?;
+                                        }
+                                    } else if vars_len == 2 {
+                                        let key = Value::from(key);
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], key);
+                                            declare_variable(scopes, &vars[1], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], key)?;
+                                            assign_variable(scopes, &vars[1], item.clone())?;
+                                        }
                                     }
-                                } else if vars_len == 2 {
-                                    let key = Value::from(key);
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], key);
-                                        declare_variable(scopes, &vars[1], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], key)?;
-                                        assign_variable(scopes, &vars[1], item.clone())?;
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
                                     }
                                 }
-                                let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, runtime, true,
-                                    depth,
-                                )?;
                                 pop_scope(scopes);
-                                match flow {
-                                    RenderFlow::Normal => {}
-                                    RenderFlow::Continue => continue,
-                                    RenderFlow::Break => break,
-                                }
                             }
                         }
                         Value::Json(JsonValue::String(value)) if !value.is_empty() => {
-                            for (index, ch) in value.chars().enumerate() {
-                                let item = Value::Json(JsonValue::String(ch.to_string()));
+                            if vars_len == 0 {
+                                for ch in value.chars() {
+                                    let item = Value::Json(JsonValue::String(ch.to_string()));
+                                    push_scope(scopes);
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    pop_scope(scopes);
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
+                                    }
+                                }
+                            } else {
                                 push_scope(scopes);
-                                if vars_len == 1 {
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], item.clone())?;
+                                for (index, ch) in value.chars().enumerate() {
+                                    let item = Value::Json(JsonValue::String(ch.to_string()));
+                                    scopes
+                                        .last_mut()
+                                        .expect("range scope pushed before iteration")
+                                        .clear();
+                                    if vars_len == 1 {
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], item.clone())?;
+                                        }
+                                    } else if vars_len == 2 {
+                                        let key = Value::from(index as u64);
+                                        if *declare_vars {
+                                            declare_variable(scopes, &vars[0], key);
+                                            declare_variable(scopes, &vars[1], item.clone());
+                                        } else {
+                                            assign_variable(scopes, &vars[0], key)?;
+                                            assign_variable(scopes, &vars[1], item.clone())?;
+                                        }
                                     }
-                                } else if vars_len == 2 {
-                                    let key = Value::from(index as u64);
-                                    if *declare_vars {
-                                        declare_variable(scopes, &vars[0], key);
-                                        declare_variable(scopes, &vars[1], item.clone());
-                                    } else {
-                                        assign_variable(scopes, &vars[0], key)?;
-                                        assign_variable(scopes, &vars[1], item.clone())?;
+                                    let flow = self.render_nodes(
+                                        body, root, &item, scopes, output, tracker, runtime, true,
+                                        depth,
+                                    )?;
+                                    match flow {
+                                        RenderFlow::Normal => {}
+                                        RenderFlow::Continue => continue,
+                                        RenderFlow::Break => break,
                                     }
                                 }
-                                let flow = self.render_nodes(
-                                    body, root, &item, scopes, output, tracker, runtime, true,
-                                    depth,
-                                )?;
                                 pop_scope(scopes);
-                                match flow {
-                                    RenderFlow::Normal => {}
-                                    RenderFlow::Continue => continue,
-                                    RenderFlow::Break => break,
-                                }
                             }
                         }
                         _ => {
