@@ -1216,28 +1216,37 @@ impl Template {
                                     }
                                 }
                             } else {
+                                let assign_targets = if *declare_vars {
+                                    None
+                                } else {
+                                    Some(resolve_range_assign_targets(scopes, vars)?)
+                                };
                                 push_scope(scopes);
                                 for (index, value) in items.iter().enumerate() {
                                     let item = Value::Json(value.clone());
-                                    scopes
-                                        .last_mut()
-                                        .expect("range scope pushed before iteration")
-                                        .clear();
-                                    if vars_len == 1 {
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], item.clone())?;
-                                        }
-                                    } else if vars_len == 2 {
-                                        let key = Value::from(index as u64);
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], key);
-                                            declare_variable(scopes, &vars[1], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], key)?;
-                                            assign_variable(scopes, &vars[1], item.clone())?;
-                                        }
+                                    let key = (vars_len >= 2).then(|| Value::from(index as u64));
+                                    if *declare_vars {
+                                        let range_scope = scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration");
+                                        declare_range_variables(
+                                            range_scope,
+                                            vars,
+                                            key,
+                                            item.clone(),
+                                        );
+                                    } else {
+                                        scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration")
+                                            .clear();
+                                        assign_range_variables(
+                                            scopes,
+                                            vars,
+                                            assign_targets.expect("assign targets resolved"),
+                                            key,
+                                            item.clone(),
+                                        )?;
                                     }
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
@@ -1273,30 +1282,39 @@ impl Template {
                                     }
                                 }
                             } else {
+                                let assign_targets = if *declare_vars {
+                                    None
+                                } else {
+                                    Some(resolve_range_assign_targets(scopes, vars)?)
+                                };
                                 push_scope(scopes);
                                 for key in keys {
                                     let item = Value::Json(
                                         items.get(key).expect("key collected from map").clone(),
                                     );
-                                    scopes
-                                        .last_mut()
-                                        .expect("range scope pushed before iteration")
-                                        .clear();
-                                    if vars_len == 1 {
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], item.clone())?;
-                                        }
-                                    } else if vars_len == 2 {
-                                        let key = Value::from(key);
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], key);
-                                            declare_variable(scopes, &vars[1], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], key)?;
-                                            assign_variable(scopes, &vars[1], item.clone())?;
-                                        }
+                                    let key = (vars_len >= 2).then(|| Value::from(key));
+                                    if *declare_vars {
+                                        let range_scope = scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration");
+                                        declare_range_variables(
+                                            range_scope,
+                                            vars,
+                                            key,
+                                            item.clone(),
+                                        );
+                                    } else {
+                                        scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration")
+                                            .clear();
+                                        assign_range_variables(
+                                            scopes,
+                                            vars,
+                                            assign_targets.expect("assign targets resolved"),
+                                            key,
+                                            item.clone(),
+                                        )?;
                                     }
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
@@ -1328,28 +1346,37 @@ impl Template {
                                     }
                                 }
                             } else {
+                                let assign_targets = if *declare_vars {
+                                    None
+                                } else {
+                                    Some(resolve_range_assign_targets(scopes, vars)?)
+                                };
                                 push_scope(scopes);
                                 for (index, ch) in value.chars().enumerate() {
                                     let item = Value::Json(JsonValue::String(ch.to_string()));
-                                    scopes
-                                        .last_mut()
-                                        .expect("range scope pushed before iteration")
-                                        .clear();
-                                    if vars_len == 1 {
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], item.clone())?;
-                                        }
-                                    } else if vars_len == 2 {
-                                        let key = Value::from(index as u64);
-                                        if *declare_vars {
-                                            declare_variable(scopes, &vars[0], key);
-                                            declare_variable(scopes, &vars[1], item.clone());
-                                        } else {
-                                            assign_variable(scopes, &vars[0], key)?;
-                                            assign_variable(scopes, &vars[1], item.clone())?;
-                                        }
+                                    let key = (vars_len >= 2).then(|| Value::from(index as u64));
+                                    if *declare_vars {
+                                        let range_scope = scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration");
+                                        declare_range_variables(
+                                            range_scope,
+                                            vars,
+                                            key,
+                                            item.clone(),
+                                        );
+                                    } else {
+                                        scopes
+                                            .last_mut()
+                                            .expect("range scope pushed before iteration")
+                                            .clear();
+                                        assign_range_variables(
+                                            scopes,
+                                            vars,
+                                            assign_targets.expect("assign targets resolved"),
+                                            key,
+                                            item.clone(),
+                                        )?;
                                     }
                                     let flow = self.render_nodes(
                                         body, root, &item, scopes, output, tracker, runtime, true,
@@ -3852,8 +3879,8 @@ fn declare_variable(scopes: &mut ScopeStack, name: &str, value: Value) {
 
 fn assign_variable(scopes: &mut ScopeStack, name: &str, value: Value) -> Result<()> {
     for scope in scopes.iter_mut().rev() {
-        if scope.contains_key(name) {
-            scope.insert(name.to_string(), value);
+        if let Some(slot) = scope.get_mut(name) {
+            *slot = value;
             return Ok(());
         }
     }
@@ -3861,6 +3888,116 @@ fn assign_variable(scopes: &mut ScopeStack, name: &str, value: Value) -> Result<
     Err(TemplateError::Render(format!(
         "variable `${name}` is not declared"
     )))
+}
+
+#[derive(Clone, Copy)]
+struct RangeAssignTargets {
+    first_scope: usize,
+    second_scope: Option<usize>,
+}
+
+fn find_variable_scope_index(scopes: &ScopeStack, name: &str) -> Option<usize> {
+    for index in (0..scopes.len()).rev() {
+        if scopes[index].contains_key(name) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn resolve_range_assign_targets(
+    scopes: &ScopeStack,
+    vars: &[String],
+) -> Result<RangeAssignTargets> {
+    let first_scope = find_variable_scope_index(scopes, &vars[0])
+        .ok_or_else(|| TemplateError::Render(format!("variable `${}` is not declared", vars[0])))?;
+    let second_scope = if vars.len() >= 2 {
+        Some(find_variable_scope_index(scopes, &vars[1]).ok_or_else(|| {
+            TemplateError::Render(format!("variable `${}` is not declared", vars[1]))
+        })?)
+    } else {
+        None
+    };
+    Ok(RangeAssignTargets {
+        first_scope,
+        second_scope,
+    })
+}
+
+fn assign_variable_in_scope(
+    scopes: &mut ScopeStack,
+    scope_index: usize,
+    name: &str,
+    value: Value,
+) -> Result<()> {
+    if let Some(scope) = scopes.get_mut(scope_index)
+        && let Some(slot) = scope.get_mut(name)
+    {
+        *slot = value;
+        return Ok(());
+    }
+    Err(TemplateError::Render(format!(
+        "variable `${name}` is not declared"
+    )))
+}
+
+fn upsert_scope_variable(scope: &mut HashMap<String, Value>, name: &str, value: Value) {
+    if let Some(slot) = scope.get_mut(name) {
+        *slot = value;
+    } else {
+        scope.insert(name.to_string(), value);
+    }
+}
+
+fn retain_range_scope_vars(scope: &mut HashMap<String, Value>, vars: &[String]) {
+    if scope.len() <= vars.len() {
+        return;
+    }
+    let first = vars[0].as_str();
+    let second = vars.get(1).map(String::as_str);
+    scope.retain(|name, _| name == first || second.is_some_and(|other| name == other));
+}
+
+fn declare_range_variables(
+    scope: &mut HashMap<String, Value>,
+    vars: &[String],
+    key: Option<Value>,
+    item: Value,
+) {
+    retain_range_scope_vars(scope, vars);
+    if vars.len() == 1 {
+        upsert_scope_variable(scope, &vars[0], item);
+    } else if vars.len() >= 2 {
+        upsert_scope_variable(
+            scope,
+            &vars[0],
+            key.unwrap_or_else(|| Value::Json(JsonValue::Null)),
+        );
+        upsert_scope_variable(scope, &vars[1], item);
+    }
+}
+
+fn assign_range_variables(
+    scopes: &mut ScopeStack,
+    vars: &[String],
+    targets: RangeAssignTargets,
+    key: Option<Value>,
+    item: Value,
+) -> Result<()> {
+    if vars.len() == 1 {
+        assign_variable_in_scope(scopes, targets.first_scope, &vars[0], item)?;
+    } else if vars.len() >= 2 {
+        assign_variable_in_scope(
+            scopes,
+            targets.first_scope,
+            &vars[0],
+            key.unwrap_or_else(|| Value::Json(JsonValue::Null)),
+        )?;
+        if let Some(second_scope) = targets.second_scope {
+            assign_variable_in_scope(scopes, second_scope, &vars[1], item)?;
+        }
+    }
+    Ok(())
 }
 
 fn push_scope(scopes: &mut ScopeStack) {
