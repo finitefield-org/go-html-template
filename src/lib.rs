@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 #[cfg(not(feature = "web-rust"))]
 use std::fs;
 use std::io::Write;
@@ -459,9 +460,133 @@ pub enum MissingKeyMode {
     Error,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TemplateDependencyGraph {
+    forward: HashMap<String, HashSet<String>>,
+    reverse: HashMap<String, HashSet<String>>,
+    dirty: HashSet<String>,
+}
+
+impl TemplateDependencyGraph {
+    fn update_template_calls(&mut self, name: &str, calls: HashSet<String>) {
+        let template_name = name.to_string();
+        let old_calls = self
+            .forward
+            .insert(template_name.clone(), calls.clone())
+            .unwrap_or_default();
+
+        for removed in old_calls.difference(&calls) {
+            if let Some(callers) = self.reverse.get_mut(removed) {
+                callers.remove(&template_name);
+                if callers.is_empty() {
+                    self.reverse.remove(removed);
+                }
+            }
+        }
+
+        for added in calls {
+            self.reverse
+                .entry(added)
+                .or_default()
+                .insert(template_name.clone());
+        }
+
+        self.dirty.insert(template_name);
+    }
+
+    fn affected_templates_for_reanalysis(
+        &self,
+        root_name: &str,
+        templates: &HashMap<String, Vec<Node>>,
+    ) -> HashSet<String> {
+        if templates.is_empty() {
+            return HashSet::new();
+        }
+
+        if self.dirty.is_empty() {
+            if templates.contains_key(root_name) {
+                return HashSet::from([root_name.to_string()]);
+            }
+            return templates.keys().cloned().collect();
+        }
+
+        let mut impacted_callers = HashSet::new();
+        let mut reverse_queue = VecDeque::new();
+        for dirty_name in &self.dirty {
+            if templates.contains_key(dirty_name) {
+                reverse_queue.push_back(dirty_name.clone());
+            }
+        }
+
+        if reverse_queue.is_empty() {
+            return templates.keys().cloned().collect();
+        }
+
+        while let Some(name) = reverse_queue.pop_front() {
+            if !impacted_callers.insert(name.clone()) {
+                continue;
+            }
+
+            if let Some(callers) = self.reverse.get(&name) {
+                for caller in callers {
+                    if templates.contains_key(caller) {
+                        reverse_queue.push_back(caller.clone());
+                    }
+                }
+            }
+        }
+
+        let mut affected = impacted_callers.clone();
+        let mut forward_queue = VecDeque::new();
+        for name in impacted_callers {
+            forward_queue.push_back(name);
+        }
+
+        while let Some(name) = forward_queue.pop_front() {
+            if let Some(callees) = self.forward.get(&name) {
+                for callee in callees {
+                    if templates.contains_key(callee) && affected.insert(callee.clone()) {
+                        forward_queue.push_back(callee.clone());
+                    }
+                }
+            }
+        }
+
+        affected
+    }
+
+    fn reanalysis_roots(&self, affected: &HashSet<String>) -> Vec<String> {
+        let mut roots = affected
+            .iter()
+            .filter(|name| {
+                self.reverse
+                    .get(*name)
+                    .map_or(true, |callers| {
+                        !callers.iter().any(|caller| affected.contains(caller))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if roots.is_empty() {
+            roots.extend(affected.iter().cloned());
+        }
+
+        roots.sort();
+        roots
+    }
+
+    fn clear_dirty(&mut self, names: &HashSet<String>) {
+        for name in names {
+            self.dirty.remove(name);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TemplateNameSpace {
     templates: Arc<RwLock<HashMap<String, Vec<Node>>>>,
+    template_dependency_graph: Arc<RwLock<TemplateDependencyGraph>>,
     text_only_candidates: Arc<RwLock<HashSet<String>>>,
     text_only_outputs: Arc<RwLock<HashMap<String, String>>>,
     context_analysis_ready: Arc<AtomicBool>,
@@ -478,6 +603,7 @@ impl TemplateNameSpace {
     fn new() -> Self {
         Self {
             templates: Arc::new(RwLock::new(HashMap::new())),
+            template_dependency_graph: Arc::new(RwLock::new(TemplateDependencyGraph::default())),
             text_only_candidates: Arc::new(RwLock::new(HashSet::new())),
             text_only_outputs: Arc::new(RwLock::new(HashMap::new())),
             context_analysis_ready: Arc::new(AtomicBool::new(true)),
@@ -589,6 +715,12 @@ impl Template {
         }
         self.ensure_not_executed()?;
         let templates = self.name_space.templates.read().unwrap().clone();
+        let template_dependency_graph = self
+            .name_space
+            .template_dependency_graph
+            .read()
+            .unwrap()
+            .clone();
         let text_only_candidates = self.name_space.text_only_candidates.read().unwrap().clone();
         let text_only_outputs = self.name_space.text_only_outputs.read().unwrap().clone();
         let context_analysis_ready = self
@@ -603,6 +735,7 @@ impl Template {
             name: self.name.clone(),
             name_space: TemplateNameSpace {
                 templates: Arc::new(RwLock::new(templates)),
+                template_dependency_graph: Arc::new(RwLock::new(template_dependency_graph)),
                 text_only_candidates: Arc::new(RwLock::new(text_only_candidates)),
                 text_only_outputs: Arc::new(RwLock::new(text_only_outputs)),
                 context_analysis_ready: Arc::new(AtomicBool::new(context_analysis_ready)),
@@ -1145,6 +1278,7 @@ impl Template {
         nodes: Vec<Node>,
     ) {
         let mut root_nodes = Vec::new();
+        let mut changed_templates = Vec::new();
         for node in nodes {
             match node {
                 Node::Define {
@@ -1152,7 +1286,10 @@ impl Template {
                     body,
                 } => {
                     if !is_empty_template_body(&body) || !templates.contains_key(&defined_name) {
-                        templates.insert(defined_name, body);
+                        let template_name = defined_name.clone();
+                        let dependencies = collect_template_call_dependencies(&body);
+                        templates.insert(template_name.clone(), body);
+                        changed_templates.push((template_name, dependencies));
                     }
                 }
                 Node::Block {
@@ -1160,9 +1297,11 @@ impl Template {
                     data,
                     body,
                 } => {
-                    templates
-                        .entry(block_name.clone())
-                        .or_insert_with(|| body.clone());
+                    if !templates.contains_key(&block_name) {
+                        let dependencies = collect_template_call_dependencies(&body);
+                        templates.insert(block_name.clone(), body.clone());
+                        changed_templates.push((block_name.clone(), dependencies));
+                    }
                     root_nodes.push(Node::TemplateCall {
                         name: block_name,
                         data,
@@ -1173,7 +1312,16 @@ impl Template {
         }
 
         if !root_nodes.is_empty() || !templates.contains_key(name) {
+            let root_dependencies = collect_template_call_dependencies(&root_nodes);
             templates.insert(name.to_string(), root_nodes);
+            changed_templates.push((name.to_string(), root_dependencies));
+        }
+
+        if !changed_templates.is_empty() {
+            let mut dependency_graph = self.name_space.template_dependency_graph.write().unwrap();
+            for (template_name, dependencies) in changed_templates {
+                dependency_graph.update_template_calls(&template_name, dependencies);
+            }
         }
     }
 
@@ -1228,28 +1376,74 @@ impl Template {
                     )));
                 }
 
+                let known_templates = templates.keys().cloned().collect::<HashSet<_>>();
+                self.name_space
+                    .template_dependency_graph
+                    .write()
+                    .unwrap()
+                    .clear_dirty(&known_templates);
+
                 text_only_candidates
             } else {
-                let mut names = templates.keys().cloned().collect::<Vec<_>>();
-                names.sort();
+                let (affected_templates, analysis_roots) = {
+                    let dependency_graph = self.name_space.template_dependency_graph.read().unwrap();
+                    let affected =
+                        dependency_graph.affected_templates_for_reanalysis(&self.name, &templates);
+                    let roots = dependency_graph.reanalysis_roots(&affected);
+                    (affected, roots)
+                };
 
-                let mut analyzer = ParseContextAnalyzer::new(&mut templates);
-                let root_start = ContextState::html_text();
-                let root_end = analyzer.analyze_template(&self.name, root_start)?;
-                if !root_end.is_text_context() {
-                    return Err(TemplateError::Parse(format!(
-                        "template `{}` ends in a non-text context",
-                        self.name
-                    )));
-                }
+                if !affected_templates.is_empty() {
+                    let known_templates = templates.keys().cloned().collect::<HashSet<_>>();
+                    let mut analyzer = ParseContextAnalyzer::new(&mut templates);
 
-                // Analyze unreferenced templates with HTML start context so
-                // execute_template(name, ...) has stable precomputed escaping.
-                for name in names.iter() {
-                    if !analyzer.has_analysis(name.as_str()) {
-                        let _ = analyzer.analyze_template(name.as_str(), ContextState::html_text())?;
+                    for root_name in &analysis_roots {
+                        if !known_templates.contains(root_name) {
+                            continue;
+                        }
+                        let root_end =
+                            analyzer.analyze_template(root_name, ContextState::html_text())?;
+                        if root_name == &self.name && !root_end.is_text_context() {
+                            return Err(TemplateError::Parse(format!(
+                                "template `{}` ends in a non-text context",
+                                self.name
+                            )));
+                        }
+                    }
+
+                    let mut remaining = affected_templates.iter().cloned().collect::<Vec<_>>();
+                    remaining.sort();
+                    for name in remaining {
+                        if !known_templates.contains(&name) || analyzer.has_analysis(&name) {
+                            continue;
+                        }
+                        let end_state = analyzer.analyze_template(&name, ContextState::html_text())?;
+                        if name == self.name && !end_state.is_text_context() {
+                            return Err(TemplateError::Parse(format!(
+                                "template `{}` ends in a non-text context",
+                                self.name
+                            )));
+                        }
+                    }
+
+                    if affected_templates.contains(&self.name) && !analyzer.has_analysis(&self.name)
+                    {
+                        let root_end =
+                            analyzer.analyze_template(&self.name, ContextState::html_text())?;
+                        if !root_end.is_text_context() {
+                            return Err(TemplateError::Parse(format!(
+                                "template `{}` ends in a non-text context",
+                                self.name
+                            )));
+                        }
                     }
                 }
+
+                self.name_space
+                    .template_dependency_graph
+                    .write()
+                    .unwrap()
+                    .clear_dirty(&affected_templates);
 
                 HashSet::new()
             }
@@ -2178,6 +2372,50 @@ impl Template {
                 TemplateError::Render(format!("function `{name}` is not registered"))
             })?;
         function(&args[1..])
+    }
+}
+
+fn collect_template_call_dependencies(nodes: &[Node]) -> HashSet<String> {
+    let mut dependencies = HashSet::new();
+    collect_template_call_dependencies_into(nodes, &mut dependencies);
+    dependencies
+}
+
+fn collect_template_call_dependencies_into(nodes: &[Node], dependencies: &mut HashSet<String>) {
+    for node in nodes {
+        match node {
+            Node::Text(_) | Node::Expr { .. } | Node::SetVar { .. } | Node::Break | Node::Continue => {}
+            Node::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_template_call_dependencies_into(then_branch, dependencies);
+                collect_template_call_dependencies_into(else_branch, dependencies);
+            }
+            Node::Range {
+                body, else_branch, ..
+            } => {
+                collect_template_call_dependencies_into(body, dependencies);
+                collect_template_call_dependencies_into(else_branch, dependencies);
+            }
+            Node::With {
+                body, else_branch, ..
+            } => {
+                collect_template_call_dependencies_into(body, dependencies);
+                collect_template_call_dependencies_into(else_branch, dependencies);
+            }
+            Node::TemplateCall { name, .. } => {
+                dependencies.insert(name.clone());
+            }
+            Node::Block { name, body, .. } => {
+                dependencies.insert(name.clone());
+                collect_template_call_dependencies_into(body, dependencies);
+            }
+            Node::Define { body, .. } => {
+                collect_template_call_dependencies_into(body, dependencies);
+            }
+        }
     }
 }
 
