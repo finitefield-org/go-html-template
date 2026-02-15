@@ -1102,7 +1102,11 @@ impl Template {
                 Node::Text(text) => {
                     let mode = tracker.mode();
                     if matches!(mode, EscapeMode::ScriptExpr) {
-                        let filtered = filter_script_text(&tracker.rendered, text);
+                        let filtered = if let Some(scan_state) = tracker.js_scan_state {
+                            filter_script_text_with_state(scan_state, text)
+                        } else {
+                            filter_script_text(&tracker.rendered, text)
+                        };
                         output.push_str(&filtered);
                         tracker.append_text(&filtered);
                     } else if matches!(mode, EscapeMode::Html) {
@@ -2095,6 +2099,7 @@ struct ContextState {
     in_open_tag: bool,
     in_css_attribute: bool,
     css_attribute_quote: Option<char>,
+    in_js_attribute: bool,
 }
 
 impl ContextState {
@@ -2104,17 +2109,20 @@ impl ContextState {
             in_open_tag: false,
             in_css_attribute: false,
             css_attribute_quote: None,
+            in_js_attribute: false,
         }
     }
 
     fn from_rendered(rendered: &str) -> Self {
-        let mode = infer_escape_mode(rendered);
         let tag_value_context = current_tag_value_context(rendered);
-        let (in_css_attribute, css_attribute_quote) = match &tag_value_context {
-            Some(context) if attr_kind(&context.attr_name) == AttrKind::Css => {
-                (true, context.quote)
-            }
-            _ => (false, None),
+        let mode = infer_escape_mode_with_tag_context(rendered, tag_value_context.as_ref());
+        let (in_css_attribute, css_attribute_quote, in_js_attribute) = match &tag_value_context {
+            Some(context) => match attr_kind(&context.attr_name) {
+                AttrKind::Css => (true, context.quote, false),
+                AttrKind::Js => (false, None, true),
+                _ => (false, None, false),
+            },
+            None => (false, None, false),
         };
         let in_open_tag = (matches!(mode, EscapeMode::Html)
             && is_in_unclosed_tag_context(rendered))
@@ -2124,11 +2132,20 @@ impl ContextState {
             in_open_tag,
             in_css_attribute,
             css_attribute_quote,
+            in_js_attribute,
         }
     }
 
     fn is_text_context(&self) -> bool {
         matches!(self.mode, EscapeMode::Html) && !self.in_open_tag
+    }
+
+    fn is_script_tag_context(&self) -> bool {
+        is_script_escape_mode(self.mode) && !self.in_js_attribute
+    }
+
+    fn is_style_tag_context(&self) -> bool {
+        is_style_escape_mode(self.mode) && !self.in_css_attribute
     }
 }
 
@@ -2137,17 +2154,25 @@ struct ContextTracker {
     rendered: String,
     state: ContextState,
     url_part: Option<UrlPartContext>,
+    js_scan_state: Option<JsScanState>,
+    css_scan_state: Option<CssScanState>,
+    script_json: bool,
 }
 
 impl ContextTracker {
     fn from_state(state: ContextState) -> Self {
         let rendered = seed_rendered_for_state(&state);
         let url_part = url_part_from_mode_and_rendered(state.mode, &rendered);
-        Self {
+        let mut tracker = Self {
             rendered,
             state,
             url_part,
-        }
+            js_scan_state: None,
+            css_scan_state: None,
+            script_json: false,
+        };
+        tracker.sync_incremental_scan_state();
+        tracker
     }
 
     fn state(&self) -> ContextState {
@@ -2160,28 +2185,259 @@ impl ContextTracker {
 
     fn append_text(&mut self, text: &str) {
         self.rendered.push_str(text);
-        self.refresh_cached_state();
+        self.refresh_cached_state_with_delta(text);
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
     }
 
     fn append_expr_placeholder(&mut self, mode: EscapeMode) {
-        self.rendered.push_str(placeholder_for_mode(mode));
-        self.refresh_cached_state();
+        let placeholder = placeholder_for_mode(mode);
+        self.rendered.push_str(placeholder);
+        self.refresh_cached_state_with_delta(placeholder);
         if should_normalize_tracker_state(&self.state) {
             self.normalize_from_cached_state();
         }
     }
 
-    fn refresh_cached_state(&mut self) {
+    fn refresh_cached_state_with_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.try_refresh_cached_state_incremental(delta) {
+            return;
+        }
+        self.refresh_cached_state_full();
+    }
+
+    fn refresh_cached_state_full(&mut self) {
         self.state = ContextState::from_rendered(&self.rendered);
         self.url_part = url_part_from_mode_and_rendered(self.state.mode, &self.rendered);
+        self.sync_incremental_scan_state();
+    }
+
+    fn try_refresh_cached_state_incremental(&mut self, delta: &str) -> bool {
+        match self.state.mode {
+            EscapeMode::Html => {
+                if !self.state.in_open_tag && !delta.as_bytes().contains(&b'<') {
+                    self.url_part = None;
+                    return true;
+                }
+            }
+            EscapeMode::Rcdata => {
+                if !delta.as_bytes().contains(&b'<') {
+                    return true;
+                }
+            }
+            EscapeMode::AttrName => {
+                if delta.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+                    return true;
+                }
+            }
+            _ if self.state.is_script_tag_context() => {
+                if contains_ascii_case_insensitive(delta, b"</script") {
+                    return false;
+                }
+                let Some(scan_state) = self.js_scan_state else {
+                    return false;
+                };
+                let next_state = advance_js_scan_state(delta, scan_state);
+                self.js_scan_state = Some(next_state);
+                self.state.mode = js_scan_state_to_escape_mode(next_state, self.script_json);
+                self.state.in_open_tag = false;
+                self.state.in_css_attribute = false;
+                self.state.css_attribute_quote = None;
+                self.state.in_js_attribute = false;
+                self.url_part = None;
+                return true;
+            }
+            _ if self.state.is_style_tag_context() => {
+                if contains_ascii_case_insensitive(delta, b"</style") {
+                    return false;
+                }
+                let Some(scan_state) = self.css_scan_state else {
+                    return false;
+                };
+                let next_state = advance_css_scan_state(delta, scan_state);
+                self.css_scan_state = Some(next_state);
+                self.state.mode = css_scan_state_to_escape_mode(next_state);
+                self.state.in_open_tag = false;
+                self.state.in_css_attribute = false;
+                self.state.css_attribute_quote = None;
+                self.state.in_js_attribute = false;
+                self.url_part = None;
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn sync_incremental_scan_state(&mut self) {
+        self.js_scan_state = None;
+        self.css_scan_state = None;
+        self.script_json = false;
+
+        if self.state.is_script_tag_context() {
+            if let Some(content) = current_unclosed_tag_content(&self.rendered, "script") {
+                self.js_scan_state = Some(current_js_scan_state(content));
+            } else {
+                self.js_scan_state = Some(js_scan_state_for_escape_mode(self.state.mode));
+            }
+            if let Some(script_tag) = current_unclosed_script_tag(&self.rendered) {
+                self.script_json = is_script_type_json(script_tag);
+            } else {
+                self.script_json = matches!(self.state.mode, EscapeMode::ScriptJsonString { .. });
+            }
+        } else if self.state.in_js_attribute && is_script_escape_mode(self.state.mode) {
+            if let Some(context) = current_tag_value_context(&self.rendered) {
+                self.js_scan_state = Some(current_js_scan_state(&context.value_prefix));
+            } else {
+                self.js_scan_state = Some(js_scan_state_for_escape_mode(self.state.mode));
+            }
+        }
+
+        if self.state.is_style_tag_context() {
+            if let Some(content) = current_unclosed_tag_content(&self.rendered, "style") {
+                self.css_scan_state = Some(current_css_scan_state(content));
+            } else {
+                self.css_scan_state = Some(css_scan_state_for_escape_mode(self.state.mode));
+            }
+        } else if self.state.in_css_attribute && is_style_escape_mode(self.state.mode) {
+            if let Some(context) = current_tag_value_context(&self.rendered) {
+                self.css_scan_state = Some(current_css_scan_state(&context.value_prefix));
+            } else {
+                self.css_scan_state = Some(css_scan_state_for_escape_mode(self.state.mode));
+            }
+        }
     }
 
     fn normalize_from_cached_state(&mut self) {
         self.rendered = seed_rendered_for_state_with_url_part(&self.state, self.url_part);
+        self.sync_incremental_scan_state();
     }
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn js_scan_state_for_escape_mode(mode: EscapeMode) -> JsScanState {
+    match mode {
+        EscapeMode::ScriptExpr => JsScanState::Expr {
+            js_ctx: JsContext::RegExp,
+        },
+        EscapeMode::ScriptString { quote } | EscapeMode::ScriptJsonString { quote } => {
+            if quote == '\'' {
+                JsScanState::SingleQuote
+            } else {
+                JsScanState::DoubleQuote
+            }
+        }
+        EscapeMode::ScriptTemplate => JsScanState::TemplateLiteral,
+        EscapeMode::ScriptRegexp => JsScanState::RegExp {
+            in_char_class: false,
+            js_ctx: JsContext::RegExp,
+        },
+        EscapeMode::ScriptLineComment => JsScanState::LineComment {
+            js_ctx: JsContext::RegExp,
+            preserve_body: true,
+            keep_terminator: true,
+        },
+        EscapeMode::ScriptBlockComment => JsScanState::BlockComment {
+            js_ctx: JsContext::RegExp,
+        },
+        _ => JsScanState::Expr {
+            js_ctx: JsContext::RegExp,
+        },
+    }
+}
+
+fn css_scan_state_for_escape_mode(mode: EscapeMode) -> CssScanState {
+    match mode {
+        EscapeMode::StyleExpr => CssScanState::Expr,
+        EscapeMode::StyleString { quote } => {
+            if quote == '\'' {
+                CssScanState::SingleQuote
+            } else {
+                CssScanState::DoubleQuote
+            }
+        }
+        EscapeMode::StyleLineComment => CssScanState::LineComment,
+        EscapeMode::StyleBlockComment => CssScanState::BlockComment,
+        _ => CssScanState::Expr,
+    }
+}
+
+fn js_scan_state_to_escape_mode(state: JsScanState, script_json: bool) -> EscapeMode {
+    match state {
+        JsScanState::Expr { .. } => EscapeMode::ScriptExpr,
+        JsScanState::SingleQuote => {
+            if script_json {
+                EscapeMode::ScriptJsonString { quote: '\'' }
+            } else {
+                EscapeMode::ScriptString { quote: '\'' }
+            }
+        }
+        JsScanState::DoubleQuote => {
+            if script_json {
+                EscapeMode::ScriptJsonString { quote: '"' }
+            } else {
+                EscapeMode::ScriptString { quote: '"' }
+            }
+        }
+        JsScanState::RegExp { .. } => EscapeMode::ScriptRegexp,
+        JsScanState::TemplateLiteral => EscapeMode::ScriptTemplate,
+        JsScanState::TemplateExpr { .. }
+        | JsScanState::TemplateExprSingleQuote { .. }
+        | JsScanState::TemplateExprDoubleQuote { .. }
+        | JsScanState::TemplateExprRegExp { .. }
+        | JsScanState::TemplateExprTemplateLiteral { .. }
+        | JsScanState::TemplateExprLineComment { .. }
+        | JsScanState::TemplateExprBlockComment { .. } => EscapeMode::ScriptExpr,
+        JsScanState::LineComment { .. } => EscapeMode::ScriptLineComment,
+        JsScanState::BlockComment { .. } => EscapeMode::ScriptBlockComment,
+    }
+}
+
+fn css_scan_state_to_escape_mode(state: CssScanState) -> EscapeMode {
+    match state {
+        CssScanState::Expr => EscapeMode::StyleExpr,
+        CssScanState::SingleQuote => EscapeMode::StyleString { quote: '\'' },
+        CssScanState::DoubleQuote => EscapeMode::StyleString { quote: '"' },
+        CssScanState::LineComment => EscapeMode::StyleLineComment,
+        CssScanState::BlockComment => EscapeMode::StyleBlockComment,
+    }
+}
+
+fn is_script_escape_mode(mode: EscapeMode) -> bool {
+    matches!(
+        mode,
+        EscapeMode::ScriptExpr
+            | EscapeMode::ScriptTemplate
+            | EscapeMode::ScriptRegexp
+            | EscapeMode::ScriptLineComment
+            | EscapeMode::ScriptBlockComment
+            | EscapeMode::ScriptString { .. }
+            | EscapeMode::ScriptJsonString { .. }
+    )
+}
+
+fn is_style_escape_mode(mode: EscapeMode) -> bool {
+    matches!(
+        mode,
+        EscapeMode::StyleExpr
+            | EscapeMode::StyleString { .. }
+            | EscapeMode::StyleLineComment
+            | EscapeMode::StyleBlockComment
+    )
 }
 
 fn should_normalize_tracker_state(state: &ContextState) -> bool {
@@ -5834,7 +6090,10 @@ fn escape_value_for_mode(value: &Value, mode: EscapeMode, rendered_prefix: &str)
     }
 }
 
-fn infer_escape_mode(rendered: &str) -> EscapeMode {
+fn infer_escape_mode_with_tag_context(
+    rendered: &str,
+    tag_value_context: Option<&TagValueContext>,
+) -> EscapeMode {
     if current_unclosed_tag_content(rendered, "textarea").is_some()
         || current_unclosed_tag_content(rendered, "title").is_some()
     {
@@ -5849,7 +6108,12 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
         return mode;
     }
 
-    if let Some(context) = current_tag_value_context(rendered) {
+    let owned_context = if tag_value_context.is_none() {
+        current_tag_value_context(rendered)
+    } else {
+        None
+    };
+    if let Some(context) = tag_value_context.or(owned_context.as_ref()) {
         let kind = attr_kind(&context.attr_name);
         match kind {
             AttrKind::Js => {
@@ -5899,6 +6163,11 @@ fn infer_escape_mode(rendered: &str) -> EscapeMode {
     }
 
     EscapeMode::Html
+}
+
+#[cfg(test)]
+fn infer_escape_mode(rendered: &str) -> EscapeMode {
+    infer_escape_mode_with_tag_context(rendered, None)
 }
 
 fn current_tag_value_context(rendered: &str) -> Option<TagValueContext> {
@@ -6811,71 +7080,28 @@ fn is_js_type_mime(type_value: &str) -> bool {
 }
 
 fn current_unclosed_tag_content<'a>(rendered: &'a str, tag_name: &str) -> Option<&'a str> {
-    let lower = rendered.to_ascii_lowercase();
-    let open_pattern = format!("<{tag_name}");
-    let close_pattern = format!("</{tag_name}");
-
+    let tag_bytes = tag_name.as_bytes();
     let mut cursor = 0usize;
     let mut content_start: Option<usize> = None;
 
     loop {
         if content_start.is_none() {
-            let Some(relative) = lower[cursor..].find(&open_pattern) else {
-                return None;
-            };
-            let open_index = cursor + relative;
-            let after_open = open_index + open_pattern.len();
-            let next = lower[after_open..].chars().next();
-            if let Some(next) = next {
-                if !(next.is_whitespace() || next == '>' || next == '/') {
-                    cursor = after_open;
-                    continue;
-                }
-            } else {
-                return None;
-            }
-
-            let Some(close_relative) = lower[open_index..].find('>') else {
-                return None;
-            };
-            let start = open_index + close_relative + 1;
+            let open_index = find_open_tag(rendered, cursor, tag_bytes)?;
+            let start = html_tag_end(rendered, open_index)?;
             content_start = Some(start);
             cursor = start;
-        } else {
-            if tag_name == "script" {
-                let start = content_start?;
-                if let Some(close_start) = find_close_tag(rendered, start, b"script") {
-                    let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
-                    cursor = close_end;
-                    content_start = None;
-                    continue;
-                }
-
-                return Some(&rendered[start..]);
-            }
-            if tag_name == "style" {
-                let start = content_start?;
-                if let Some(close_start) = find_style_close_tag(rendered, start) {
-                    let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
-                    cursor = close_end;
-                    content_start = None;
-                    continue;
-                }
-                return Some(&rendered[start..]);
-            }
-
-            let Some(relative) = lower[cursor..].find(&close_pattern) else {
-                let start = content_start?;
-                return Some(&rendered[start..]);
-            };
-            let close_index = cursor + relative;
-            let Some(close_end_relative) = lower[close_index..].find('>') else {
-                let start = content_start?;
-                return Some(&rendered[start..]);
-            };
-            cursor = close_index + close_end_relative + 1;
-            content_start = None;
+            continue;
         }
+
+        let start = content_start?;
+        if let Some(close_start) = find_close_tag(rendered, start, tag_bytes) {
+            let close_end = html_tag_end(rendered, close_start).unwrap_or(close_start + 1);
+            cursor = close_end;
+            content_start = None;
+            continue;
+        }
+
+        return Some(&rendered[start..]);
     }
 }
 
@@ -6975,11 +7201,9 @@ fn is_utf8_line_separator(bytes: &[u8], index: usize) -> bool {
     is_utf8_line_separator_2028(bytes, index) || is_utf8_line_separator_2029(bytes, index)
 }
 
-fn current_js_scan_state(content: &str) -> JsScanState {
+fn advance_js_scan_state(content: &str, initial_state: JsScanState) -> JsScanState {
     let bytes = content.as_bytes();
-    let mut state = JsScanState::Expr {
-        js_ctx: JsContext::RegExp,
-    };
+    let mut state = initial_state;
     let mut segment_start = 0usize;
     let mut i = 0usize;
 
@@ -7477,9 +7701,18 @@ fn current_js_scan_state(content: &str) -> JsScanState {
     }
 }
 
-fn filter_script_text(prefix: &str, text: &str) -> String {
+fn current_js_scan_state(content: &str) -> JsScanState {
+    advance_js_scan_state(
+        content,
+        JsScanState::Expr {
+            js_ctx: JsContext::RegExp,
+        },
+    )
+}
+
+fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut state = current_js_scan_state(prefix);
+    let mut state = initial_state;
     let mut i = 0usize;
     let mut output = String::new();
 
@@ -8096,6 +8329,10 @@ fn filter_script_text(prefix: &str, text: &str) -> String {
     }
 
     output
+}
+
+fn filter_script_text(prefix: &str, text: &str) -> String {
+    filter_script_text_with_state(current_js_scan_state(prefix), text)
 }
 
 #[derive(Clone, Copy)]
@@ -9301,9 +9538,9 @@ fn css_escape_tail_alnum(css: &str) -> String {
     output
 }
 
-fn current_css_scan_state(content: &str) -> CssScanState {
+fn advance_css_scan_state(content: &str, initial_state: CssScanState) -> CssScanState {
     let bytes = content.as_bytes();
-    let mut state = CssScanState::Expr;
+    let mut state = initial_state;
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -9386,6 +9623,10 @@ fn current_css_scan_state(content: &str) -> CssScanState {
     }
 
     state
+}
+
+fn current_css_scan_state(content: &str) -> CssScanState {
+    advance_css_scan_state(content, CssScanState::Expr)
 }
 
 fn escape_script_value(value: &Value) -> Result<String> {
@@ -11818,6 +12059,48 @@ mod tests {
             block_states,
             vec![EscapeMode::StyleBlockComment, EscapeMode::StyleExpr]
         );
+    }
+
+    #[test]
+    fn context_tracker_incremental_refresh_matches_full_recompute() {
+        let mut tracker = ContextTracker::from_state(ContextState::html_text());
+        let chunks = [
+            "<div title=\"",
+            "hello",
+            "\">",
+            "<script>",
+            "const re = /foo\\//;",
+            "const s = `x ${1 + 2}`;",
+            "</script>",
+            "<style>",
+            "/* c */ .x { color: red; }",
+            "</style>",
+            "</div>",
+        ];
+
+        for chunk in chunks {
+            tracker.append_text(chunk);
+
+            let recomputed_state = ContextState::from_rendered(&tracker.rendered);
+            assert_eq!(
+                tracker.state, recomputed_state,
+                "state mismatch after chunk: {chunk:?}"
+            );
+
+            let recomputed_url_part =
+                url_part_from_mode_and_rendered(tracker.state.mode, &tracker.rendered);
+            assert_eq!(
+                tracker.url_part, recomputed_url_part,
+                "url part mismatch after chunk: {chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_unclosed_tag_content_finds_last_unclosed_case_insensitively() {
+        let rendered = "<SCRIPT>const a = 1;</SCRIPT><script>const b = 2;";
+        let content = current_unclosed_tag_content(rendered, "script");
+        assert_eq!(content, Some("const b = 2;"));
     }
 
     #[test]

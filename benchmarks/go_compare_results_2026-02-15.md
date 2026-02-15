@@ -67,6 +67,27 @@ After fixing duplicate `/` emission in script regexp filtering, the following ch
 | script_100 | 10 | 3317 | 64 | 51.83 | 2530 | 89 | 28.43 | true |
 | script_2k | 3 | 1163774 | 1245 | 934.76 | 905910 | 2094 | 432.62 | true |
 
+## Context Recompute Optimization (After Incremental Tracking)
+
+Optimizations applied:
+- `refresh_cached_state` moved to delta-based updates with full recompute fallback.
+- `ContextState::from_rendered` now reuses precomputed tag-value context.
+- `current_unclosed_tag_content` no longer allocates with `to_ascii_lowercase`.
+- Script text filtering now accepts cached JS scan state to avoid rescanning full prefix.
+
+### Before/After (selected)
+
+| benchmark | before (avg_us) | after (avg_us) | change |
+|---|---:|---:|---:|
+| parse_expr_20k (`perf_parse_breakdown`) | 32014 | 19232 | -39.9% |
+| parse_html_mix (`perf_parse_breakdown`) | 51930 | 31360 | -39.6% |
+| expr_20k execute (Rust, compare tool) | 13711 | 3978 | -71.0% |
+| range_no_vars execute (Rust, compare tool) | 17408 | 3871 | -77.8% |
+| script_2k parse (Rust, compare tool) | 1163774 | 882644 | -24.0% |
+| script_2k execute (Rust, compare tool) | 905910 | 563190 | -37.8% |
+| style_2k parse (Rust, compare tool) | 999527 | 656331 | -34.3% |
+| style_2k execute (Rust, compare tool) | 900969 | 551245 | -38.8% |
+
 ## Template/Data Files Saved
 
 - Directory: `benchmarks/go_compare_cases`
