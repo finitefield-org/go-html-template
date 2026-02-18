@@ -1,6 +1,7 @@
 # go-html-template
 
-A Rust crate that provides a Go `html/template`-like API and behavior.
+A pure Rust crate that provides a Go `html/template`-like API and behavior.
+No Go runtime, cgo, or FFI is required.
 
 Developed by [Finite Field, K.K.](https://finitefield.org)
 

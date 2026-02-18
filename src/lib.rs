@@ -19206,6 +19206,7 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
         assert_eq!(bar, "&lt;baz&gt;");
     }
 
+    #[cfg(not(feature = "web-rust"))]
     #[test]
     fn go_test_multi_parse_files_with_data_matches_go() {
         let template = Template::new("root")
@@ -19223,6 +19224,7 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
         assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
     }
 
+    #[cfg(not(feature = "web-rust"))]
     #[test]
     fn go_test_multi_parse_glob_with_data_matches_go() {
         let template = Template::new("root")
@@ -19790,6 +19792,7 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
         assert!(error.is_err(), "execute should fail");
     }
 
+    #[cfg(not(feature = "web-rust"))]
     #[test]
     fn go_test_parse_zip_fs_equivalent_via_custom_fs() {
         #[derive(Clone)]
