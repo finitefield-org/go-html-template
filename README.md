@@ -78,7 +78,7 @@ To use `web-rust`, enable the feature in your dependency:
 
 ```toml
 [dependencies]
-go_html_template = { version = "0.1.0", features = ["web-rust"] }
+go_html_template = { version = "0.2.0", features = ["web-rust"] }
 ```
 
 ## `web-rust` feature

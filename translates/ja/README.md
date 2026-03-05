@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-go_html_template = { version = "0.1.0", features = ["web-rust"] }
+go_html_template = { version = "0.2.0", features = ["web-rust"] }
 ```
 
 ## `web-rust` feature

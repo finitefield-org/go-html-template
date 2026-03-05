@@ -1,13 +1,13 @@
 [package]
 name = "go_html_template"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A pure Rust crate with Go html/template-like API and behavior"
 license = "MIT"
 readme = "README.md"
 documentation = "https://docs.rs/go_html_template"
-repository = "https://github.com/kazuyoshitoshiya/go-html-template"
+repository = "https://github.com/finitefield-org/go-html-template"
 keywords = ["template", "html", "go", "escape"]
 categories = ["template-engine", "web-programming"]
 include = [

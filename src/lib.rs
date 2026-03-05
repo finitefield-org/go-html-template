@@ -11061,7 +11061,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
     let bytes = text.as_bytes();
     let mut state = initial_state;
     let mut i = 0usize;
-    let mut output = String::new();
+    let mut output = Vec::with_capacity(bytes.len());
 
     while i < bytes.len() {
         state = match state {
@@ -11069,22 +11069,22 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 let ch = bytes[i];
                 match ch {
                     b'\'' => {
-                        output.push('\'');
+                        output.push(b'\'');
                         i += 1;
                         JsScanState::SingleQuote
                     }
                     b'"' => {
-                        output.push('"');
+                        output.push(b'"');
                         i += 1;
                         JsScanState::DoubleQuote
                     }
                     b'`' => {
-                        output.push('`');
+                        output.push(b'`');
                         i += 1;
                         JsScanState::TemplateLiteral
                     }
                     b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                        output.push_str("//");
+                        output.extend_from_slice(b"//");
                         i += 2;
                         JsScanState::LineComment {
                             js_ctx,
@@ -11093,7 +11093,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         }
                     }
                     b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                        output.push_str("/*");
+                        output.extend_from_slice(b"/*");
                         i += 2;
                         JsScanState::BlockComment { js_ctx }
                     }
@@ -11122,18 +11122,18 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         }
                     }
                     _ if is_utf8_line_separator_2028(bytes, i) => {
-                        output.push('\u{2028}');
+                        output.extend_from_slice("\u{2028}".as_bytes());
                         i += 3;
                         JsScanState::Expr { js_ctx }
                     }
                     _ if is_utf8_line_separator_2029(bytes, i) => {
-                        output.push('\u{2029}');
+                        output.extend_from_slice("\u{2029}".as_bytes());
                         i += 3;
                         JsScanState::Expr { js_ctx }
                     }
                     b'/' => {
                         i += 1;
-                        output.push('/');
+                        output.push(b'/');
                         let regex_state = if js_ctx == JsContext::RegExp {
                             JsScanState::RegExp {
                                 in_char_class: false,
@@ -11145,7 +11145,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         regex_state
                     }
                     _ => {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                         JsScanState::Expr { js_ctx }
                     }
@@ -11153,16 +11153,16 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             }
             JsScanState::SingleQuote => {
                 if bytes[i] == b'\\' {
-                    output.push('\\');
+                    output.push(b'\\');
                     if i + 1 < bytes.len() {
-                        output.push(bytes[i + 1] as char);
+                        output.push(bytes[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
                     }
                     JsScanState::SingleQuote
                 } else {
-                    output.push(bytes[i] as char);
+                    output.push(bytes[i]);
                     if bytes[i] == b'\'' {
                         i += 1;
                         JsScanState::Expr {
@@ -11176,16 +11176,16 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             }
             JsScanState::DoubleQuote => {
                 if bytes[i] == b'\\' {
-                    output.push('\\');
+                    output.push(b'\\');
                     if i + 1 < bytes.len() {
-                        output.push(bytes[i + 1] as char);
+                        output.push(bytes[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
                     }
                     JsScanState::DoubleQuote
                 } else {
-                    output.push(bytes[i] as char);
+                    output.push(bytes[i]);
                     if bytes[i] == b'"' {
                         i += 1;
                         JsScanState::Expr {
@@ -11201,11 +11201,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 mut in_char_class,
                 js_ctx,
             } => {
-                output.push(bytes[i] as char);
+                output.push(bytes[i]);
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                     }
                     JsScanState::RegExp {
@@ -11247,9 +11247,9 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             }
             JsScanState::TemplateLiteral => {
                 if bytes[i] == b'\\' {
-                    output.push('\\');
+                    output.push(b'\\');
                     if i + 1 < bytes.len() {
-                        output.push(bytes[i + 1] as char);
+                        output.push(bytes[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
@@ -11257,20 +11257,20 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                     JsScanState::TemplateLiteral
                 } else {
                     if bytes[i] == b'`' {
-                        output.push('`');
+                        output.push(b'`');
                         i += 1;
                         JsScanState::Expr {
                             js_ctx: JsContext::DivOp,
                         }
                     } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                         i += 2;
-                        output.push_str("${");
+                        output.extend_from_slice(b"${");
                         JsScanState::TemplateExpr {
                             brace_depth: 1,
                             js_ctx: JsContext::DivOp,
                         }
                     } else {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                         JsScanState::TemplateLiteral
                     }
@@ -11283,11 +11283,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        output.push(bytes[i - 1] as char);
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i - 1]);
+                        output.push(bytes[i]);
                         i += 1;
                     } else {
-                        output.push('\\');
+                        output.push(b'\\');
                     }
                     JsScanState::TemplateExpr {
                         brace_depth,
@@ -11295,21 +11295,21 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                     }
                 } else if bytes[i] == b'\'' {
                     i += 1;
-                    output.push('\'');
+                    output.push(b'\'');
                     JsScanState::TemplateExprSingleQuote {
                         brace_depth,
                         js_ctx,
                     }
                 } else if bytes[i] == b'"' {
                     i += 1;
-                    output.push('"');
+                    output.push(b'"');
                     JsScanState::TemplateExprDoubleQuote {
                         brace_depth,
                         js_ctx,
                     }
                 } else if bytes[i] == b'`' {
                     i += 1;
-                    output.push('`');
+                    output.push(b'`');
                     JsScanState::TemplateExprTemplateLiteral {
                         brace_depth,
                         js_ctx,
@@ -11329,14 +11329,14 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         js_ctx,
                     }
                 } else if is_utf8_line_separator_2028(bytes, i) {
-                    output.push('\u{2028}');
+                    output.extend_from_slice("\u{2028}".as_bytes());
                     i += 3;
                     JsScanState::TemplateExpr {
                         brace_depth,
                         js_ctx,
                     }
                 } else if is_utf8_line_separator_2029(bytes, i) {
-                    output.push('\u{2029}');
+                    output.extend_from_slice("\u{2029}".as_bytes());
                     i += 3;
                     JsScanState::TemplateExpr {
                         brace_depth,
@@ -11345,7 +11345,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 } else if bytes[i] == b'{' {
                     brace_depth += 1;
                     i += 1;
-                    output.push('{');
+                    output.push(b'{');
                     JsScanState::TemplateExpr {
                         brace_depth,
                         js_ctx,
@@ -11353,7 +11353,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 } else if bytes[i] == b'/' {
                     if js_ctx == JsContext::RegExp {
                         i += 1;
-                        output.push('/');
+                        output.push(b'/');
                         JsScanState::TemplateExprRegExp {
                             in_char_class: false,
                             brace_depth,
@@ -11361,7 +11361,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         }
                     } else {
                         i += 1;
-                        output.push('/');
+                        output.push(b'/');
                         JsScanState::TemplateExpr {
                             brace_depth,
                             js_ctx,
@@ -11372,7 +11372,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         brace_depth -= 1;
                     }
                     i += 1;
-                    output.push('}');
+                    output.push(b'}');
                     if bytes[i - 1] == b'}' && brace_depth == 0 {
                         JsScanState::TemplateLiteral
                     } else {
@@ -11383,7 +11383,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                     }
                 } else {
                     i += 1;
-                    output.push(bytes[i - 1] as char);
+                    output.push(bytes[i - 1]);
                     JsScanState::TemplateExpr {
                         brace_depth,
                         js_ctx,
@@ -11394,11 +11394,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 brace_depth,
                 js_ctx,
             } => {
-                output.push(bytes[i] as char);
+                output.push(bytes[i]);
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                     }
                     JsScanState::TemplateExprSingleQuote {
@@ -11423,11 +11423,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 brace_depth,
                 js_ctx,
             } => {
-                output.push(bytes[i] as char);
+                output.push(bytes[i]);
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                     }
                     JsScanState::TemplateExprDoubleQuote {
@@ -11453,11 +11453,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 brace_depth,
                 js_ctx,
             } => {
-                output.push(bytes[i] as char);
+                output.push(bytes[i]);
                 if bytes[i] == b'\\' {
                     i += 1;
                     if i < bytes.len() {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                     }
                     JsScanState::TemplateExprRegExp {
@@ -11510,9 +11510,9 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 js_ctx,
             } => {
                 if bytes[i] == b'\\' {
-                    output.push('\\');
+                    output.push(b'\\');
                     if i + 1 < bytes.len() {
-                        output.push(bytes[i + 1] as char);
+                        output.push(bytes[i + 1]);
                         i += 2;
                     } else {
                         i += 1;
@@ -11523,7 +11523,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                     }
                 } else {
                     if bytes[i] == b'`' {
-                        output.push('`');
+                        output.push(b'`');
                         i += 1;
                         JsScanState::TemplateExpr {
                             brace_depth,
@@ -11531,13 +11531,13 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         }
                     } else if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
                         i += 2;
-                        output.push_str("${");
+                        output.extend_from_slice(b"${");
                         JsScanState::TemplateExpr {
                             brace_depth,
                             js_ctx: JsContext::DivOp,
                         }
                     } else {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                         i += 1;
                         JsScanState::TemplateExprTemplateLiteral {
                             brace_depth,
@@ -11554,7 +11554,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             } => {
                 if bytes[i] == b'\n' || bytes[i] == b'\r' {
                     if keep_terminator {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                     }
                     i += 1;
                     JsScanState::TemplateExpr {
@@ -11568,9 +11568,9 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                 {
                     if keep_terminator {
                         if bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8 {
-                            output.push('\u{2028}');
+                            output.extend_from_slice("\u{2028}".as_bytes());
                         } else {
-                            output.push('\u{2029}');
+                            output.extend_from_slice("\u{2029}".as_bytes());
                         }
                     }
                     i += 3;
@@ -11579,7 +11579,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                         js_ctx,
                     }
                 } else if preserve_body {
-                    output.push(bytes[i] as char);
+                    output.push(bytes[i]);
                     i += 1;
                     JsScanState::TemplateExprLineComment {
                         brace_depth,
@@ -11614,7 +11614,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                             && bytes[i + 1] == b'*'
                             && bytes[i + 2] == b'/')
                     {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                     }
                     i += 1;
                     JsScanState::TemplateExprBlockComment {
@@ -11630,7 +11630,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             } => {
                 if bytes[i] == b'\n' || bytes[i] == b'\r' {
                     if keep_terminator {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                     }
                     i += 1;
                     JsScanState::Expr { js_ctx }
@@ -11642,16 +11642,16 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
                     let is_2028 = bytes[i + 1] == 0x80 && bytes[i + 2] == 0xA8;
                     if keep_terminator {
                         if is_2028 {
-                            output.push('\u{2028}');
+                            output.extend_from_slice("\u{2028}".as_bytes());
                         } else {
-                            output.push('\u{2029}');
+                            output.extend_from_slice("\u{2029}".as_bytes());
                         }
                     }
                     i += 3;
                     JsScanState::Expr { js_ctx }
                 } else {
                     if preserve_body {
-                        output.push(bytes[i] as char);
+                        output.push(bytes[i]);
                     }
                     i += 1;
                     JsScanState::LineComment {
@@ -11663,11 +11663,11 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
             }
             JsScanState::BlockComment { js_ctx } => {
                 if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    output.push_str("*/");
+                    output.extend_from_slice(b"*/");
                     i += 2;
                     JsScanState::Expr { js_ctx }
                 } else {
-                    output.push(bytes[i] as char);
+                    output.push(bytes[i]);
                     i += 1;
                     JsScanState::BlockComment { js_ctx }
                 }
@@ -11675,7 +11675,7 @@ fn filter_script_text_with_state(initial_state: JsScanState, text: &str) -> Stri
         };
     }
 
-    output
+    String::from_utf8(output).expect("script filter produced invalid UTF-8")
 }
 
 #[cfg(test)]
