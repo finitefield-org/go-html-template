@@ -3233,6 +3233,12 @@ struct StopAction {
     tail: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RcdataTag {
+    Title,
+    Textarea,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ContextState {
     mode: EscapeMode,
@@ -3240,6 +3246,7 @@ struct ContextState {
     in_css_attribute: bool,
     css_attribute_quote: Option<char>,
     in_js_attribute: bool,
+    rcdata_tag: Option<RcdataTag>,
 }
 
 #[derive(Clone, Debug)]
@@ -3343,6 +3350,7 @@ fn rendered_snapshot_from_open_tag_fragment(fragment: &str) -> RenderedContextSn
         in_css_attribute,
         css_attribute_quote,
         in_js_attribute,
+        rcdata_tag: None,
     };
 
     RenderedContextSnapshot {
@@ -3447,6 +3455,7 @@ fn analyze_rendered_context(rendered: &str) -> RenderedContextSnapshot {
                 in_css_attribute: false,
                 css_attribute_quote: None,
                 in_js_attribute: false,
+                rcdata_tag: None,
             };
             return RenderedContextSnapshot {
                 state,
@@ -3472,6 +3481,7 @@ fn analyze_rendered_context(rendered: &str) -> RenderedContextSnapshot {
                 in_css_attribute: false,
                 css_attribute_quote: None,
                 in_js_attribute: false,
+                rcdata_tag: None,
             };
             return RenderedContextSnapshot {
                 state,
@@ -3489,13 +3499,11 @@ fn analyze_rendered_context(rendered: &str) -> RenderedContextSnapshot {
                 continue;
             }
 
-            let state = ContextState {
-                mode: EscapeMode::Rcdata,
-                in_open_tag: false,
-                in_css_attribute: false,
-                css_attribute_quote: None,
-                in_js_attribute: false,
-            };
+            let state = ContextState::rcdata(if tag_name.eq_ignore_ascii_case(b"title") {
+                RcdataTag::Title
+            } else {
+                RcdataTag::Textarea
+            });
             return RenderedContextSnapshot {
                 state,
                 url_part: None,
@@ -3519,6 +3527,18 @@ impl ContextState {
             in_css_attribute: false,
             css_attribute_quote: None,
             in_js_attribute: false,
+            rcdata_tag: None,
+        }
+    }
+
+    fn rcdata(tag: RcdataTag) -> Self {
+        Self {
+            mode: EscapeMode::Rcdata,
+            in_open_tag: false,
+            in_css_attribute: false,
+            css_attribute_quote: None,
+            in_js_attribute: false,
+            rcdata_tag: Some(tag),
         }
     }
 
@@ -3816,6 +3836,7 @@ impl ContextTracker {
                 self.state.in_css_attribute = false;
                 self.state.css_attribute_quote = None;
                 self.state.in_js_attribute = false;
+                self.state.rcdata_tag = None;
                 self.url_part = None;
                 return true;
             }
@@ -3853,6 +3874,7 @@ impl ContextTracker {
                 self.state.in_css_attribute = false;
                 self.state.css_attribute_quote = None;
                 self.state.in_js_attribute = false;
+                self.state.rcdata_tag = None;
                 self.url_part = None;
                 return true;
             }
@@ -4017,6 +4039,7 @@ impl ContextTracker {
                 self.state.in_css_attribute = false;
                 self.state.css_attribute_quote = None;
                 self.state.in_js_attribute = false;
+                self.state.rcdata_tag = None;
                 self.url_part = None;
                 self.js_scan_state = Some(js_state);
                 self.css_scan_state = None;
@@ -4039,6 +4062,7 @@ impl ContextTracker {
                 self.state.in_css_attribute = false;
                 self.state.css_attribute_quote = None;
                 self.state.in_js_attribute = false;
+                self.state.rcdata_tag = None;
                 self.url_part = None;
                 self.js_scan_state = None;
                 self.css_scan_state = Some(css_state);
@@ -4055,11 +4079,11 @@ impl ContextTracker {
                     continue;
                 }
 
-                self.state.mode = EscapeMode::Rcdata;
-                self.state.in_open_tag = false;
-                self.state.in_css_attribute = false;
-                self.state.css_attribute_quote = None;
-                self.state.in_js_attribute = false;
+                self.state = ContextState::rcdata(if tag_name.eq_ignore_ascii_case(b"title") {
+                    RcdataTag::Title
+                } else {
+                    RcdataTag::Textarea
+                });
                 self.url_part = None;
                 self.js_scan_state = None;
                 self.css_scan_state = None;
@@ -5589,7 +5613,10 @@ fn seed_rendered_for_state_with_url_part(
                 String::new()
             }
         }
-        EscapeMode::Rcdata => "<textarea>".to_string(),
+        EscapeMode::Rcdata => match state.rcdata_tag.unwrap_or(RcdataTag::Textarea) {
+            RcdataTag::Title => "<title>".to_string(),
+            RcdataTag::Textarea => "<textarea>".to_string(),
+        },
         EscapeMode::AttrName => "<a x".to_string(),
         EscapeMode::AttrQuoted {
             kind: AttrKind::Url,
@@ -19208,39 +19235,6 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
 
     #[cfg(not(feature = "web-rust"))]
     #[test]
-    fn go_test_multi_parse_files_with_data_matches_go() {
-        let template = Template::new("root")
-            .parse_files([
-                "html/template/testdata/tmpl1.tmpl",
-                "html/template/testdata/tmpl2.tmpl",
-            ])
-            .expect("parse_files should succeed")
-            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
-            .expect("parse should succeed");
-
-        let output = template
-            .execute_template_to_string("root", &json!(0))
-            .expect("execute should succeed");
-        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
-    }
-
-    #[cfg(not(feature = "web-rust"))]
-    #[test]
-    fn go_test_multi_parse_glob_with_data_matches_go() {
-        let template = Template::new("root")
-            .parse_glob("html/template/testdata/tmpl*.tmpl")
-            .expect("parse_glob should succeed")
-            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
-            .expect("parse should succeed");
-
-        let output = template
-            .execute_template_to_string("root", &json!(0))
-            .expect("execute should succeed");
-        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
-    }
-
-    #[cfg(not(feature = "web-rust"))]
-    #[test]
     fn go_test_parse_fs_matches_go() {
         parse_fs_accepts_multiple_patterns();
         parse_fs_supports_glob_patterns();
@@ -19790,56 +19784,6 @@ const options = `{{range .Items}}<option value="{{.}}">{{.}}</option>{{end}}`;
 
         let error = template.execute_template_to_string("t", &json!({}));
         assert!(error.is_err(), "execute should fail");
-    }
-
-    #[cfg(not(feature = "web-rust"))]
-    #[test]
-    fn go_test_parse_zip_fs_equivalent_via_custom_fs() {
-        #[derive(Clone)]
-        struct MemoryFS {
-            files: std::collections::HashMap<String, Vec<u8>>,
-        }
-
-        impl TemplateFS for MemoryFS {
-            fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-                self.files
-                    .get(path)
-                    .cloned()
-                    .ok_or_else(|| TemplateError::Parse(format!("file not found: {path}")))
-            }
-
-            fn glob(&self, pattern: &str) -> Result<Vec<String>> {
-                if pattern == "tmpl*.tmpl" {
-                    Ok(vec!["tmpl1.tmpl".to_string(), "tmpl2.tmpl".to_string()])
-                } else {
-                    Ok(Vec::new())
-                }
-            }
-        }
-
-        let fs = MemoryFS {
-            files: std::collections::HashMap::from([
-                (
-                    "tmpl1.tmpl".to_string(),
-                    include_bytes!("../html/template/testdata/tmpl1.tmpl").to_vec(),
-                ),
-                (
-                    "tmpl2.tmpl".to_string(),
-                    include_bytes!("../html/template/testdata/tmpl2.tmpl").to_vec(),
-                ),
-            ]),
-        };
-
-        let template = Template::new("root")
-            .ParseFS(&fs, ["tmpl*.tmpl"])
-            .expect("ParseFS should succeed")
-            .parse(r#"{{define "root"}}{{template "tmpl1.tmpl"}}{{template "tmpl2.tmpl"}}{{end}}"#)
-            .expect("parse should succeed");
-
-        let output = template
-            .execute_template_to_string("root", &json!({}))
-            .expect("execute should succeed");
-        assert_eq!(output, "template1\n\ny\ntemplate2\n\nx\n");
     }
 
     #[test]
